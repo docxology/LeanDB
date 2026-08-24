@@ -115,27 +115,51 @@ private def dbFnPlan : PlanFor (fun (a : Stored Author) => a.val.isAdult) := by 
 private def isNonePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isNone) := by leandb_plan
 private def isSomePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isSome) := by leandb_plan
 
+private def orPlan : PlanFor (fun (a : Stored Author) =>
+    a.val.age < 30 || a.val.age > 50) := by leandb_plan
+
+private def notPlan : PlanFor (fun (a : Stored Author) => !(a.val.age ≥ 40)) := by leandb_plan
+
+private def orResidualPlan : PlanFor (fun (a : Stored Author) =>
+    a.val.age < 30 || opaquePred a) := by leandb_plan
+
+private def matchPlan : PlanFor (fun (t : Stored Todo) =>
+    match t.val.status with | .done => false | _ => true) := by leandb_plan
+
+@[db] private def Status.weight : Status → Nat
+  | .backlog => 0 | .inProgress => 1 | .done => 2
+private def weightPlan : PlanFor (fun (t : Stored Todo) => t.val.status.weight ≥ 1) := by
+  leandb_plan
+
+private def checkPlan (p : PlanFor w) (pred : PushPred) (residual : Nat) (label : String) :
+    IO Unit :=
+  unless p.plan.pred == pred && p.plan.residual == residual do
+    throw <| IO.userError s!"FAIL: {label}: got {repr p.plan}"
+
 private def testPlans : IO Unit := do
-  check (agePlan.plan.pushed == #[(0, .cmp "age" .ge (.int 40))] && agePlan.plan.residual == 0)
-    s!"age plan fully pushed, got {repr agePlan.plan}"
-  check ((capturedPlan 41).plan.pushed == #[(0, .cmp "age" .ge (.int 41))])
-    s!"captured variable becomes a bound parameter, got {repr (capturedPlan 41).plan}"
-  check (joinPlan.plan.residual == 1) s!"equi-join conjunct stays residual, got {repr joinPlan.plan}"
-  check (joinPlan.plan.pushed == #[(1, .cmp "age" .ge (.int 40)), (0, .cmp "rating" .eq .null)])
-    s!"join plan pushes per-table conjuncts, got {repr joinPlan.plan}"
-  check (somePlan.plan.pushed == #[(0, .cmp "rating" .eq (.real 4.5))])
-    s!"some-literal pushes through Option codec, got {repr somePlan.plan}"
-  check (enumPlan.plan.pushed == #[(0, .cmp "status" .eq (.text "done"))])
-    s!"closed enum pushes as its name, got {repr enumPlan.plan}"
-  check (boolPlan.plan.pushed == #[(0, .cmp "on" .eq (.int 1))])
-    s!"bare Bool column pushes as = 1, got {repr boolPlan.plan}"
-  check (residualPlan.plan.pushed.isEmpty && residualPlan.plan.residual == 1)
-    "opaque predicate is fully residual"
-  check (dbFnPlan.plan.pushed == #[(0, .cmp "age" .ge (.int 40))] && dbFnPlan.plan.residual == 0)
-    s!"@[db] def unfolds into the pushable fragment, got {repr dbFnPlan.plan}"
-  check (isNonePlan.plan.pushed == #[(0, .isNull "rating")]
-      && isSomePlan.plan.pushed == #[(0, .isNotNull "rating")])
-    s!"Option.isNone/isSome push as IS NULL tests, got {repr isNonePlan.plan} / {repr isSomePlan.plan}"
+  checkPlan agePlan (.cmp 0 "age" .ge (.int 40)) 0 "age plan fully pushed"
+  checkPlan (capturedPlan 41) (.cmp 0 "age" .ge (.int 41)) 0 "captured variable as bound param"
+  checkPlan joinPlan
+    (.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
+      (.cmp 0 "rating" .eq .null)) 0 "equi-join pushes as cmp2 + per-table conds"
+  check joinPlan.plan.pred.hasJoin "join plan routes to joined executor"
+  checkPlan somePlan (.cmp 0 "rating" .eq (.real 4.5)) 0 "some-literal via Option codec"
+  checkPlan enumPlan (.cmp 0 "status" .eq (.text "done")) 0 "closed enum pushes as its name"
+  checkPlan boolPlan (.cmp 0 "on" .eq (.int 1)) 0 "bare Bool column"
+  checkPlan residualPlan .tt 1 "opaque predicate is fully residual"
+  checkPlan dbFnPlan (.cmp 0 "age" .ge (.int 40)) 0 "@[db] def unfolds"
+  checkPlan isNonePlan (.isNull 0 "rating") 0 "isNone as IS NULL"
+  checkPlan isSomePlan (.isNotNull 0 "rating") 0 "isSome as IS NOT NULL"
+  checkPlan orPlan (.or (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "age" .gt (.int 50))) 0
+    "disjunction pushes whole"
+  checkPlan notPlan (.cmp 0 "age" .lt (.int 40)) 0 "negation is exact"
+  checkPlan orResidualPlan .tt 1 "or with unpushable side is fully residual"
+  checkPlan matchPlan
+    (.or (.cmp 0 "status" .eq (.text "backlog")) (.cmp 0 "status" .eq (.text "inProgress")))
+    0 "match on closed enum case-splits to a disjunction"
+  checkPlan weightPlan
+    (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
+    0 "enum-table function case-splits, false branches drop"
 
 /-! ## JSON, derived from the schema (M5) -/
 

@@ -147,22 +147,15 @@ def delete [Entity α] (id : Id α) : DbM Unit := do
     db.changes
   if changed == 0 then throw (.notFound table id.toInt64)
 
-/-- Rows of `α`'s table matching every pushed conjunct, in id order. -/
-def fetchFiltered (α : Type) [Entity α] (conds : Array PushCond) : DbM (Array (Stored α)) := do
-  if conds.isEmpty then return ← fetchAll α
-  let condSql := fun (c : PushCond) => match c with
-    | .cmp col op _ => s!"{quoteId col} {op.sql} ?"
-    | .isNull col => s!"{quoteId col} IS NULL"
-    | .isNotNull col => s!"{quoteId col} IS NOT NULL"
-  let whereSql := String.intercalate " AND " (conds.toList.map condSql)
+/-- Rows of `α`'s table matching a (single-table) pushed predicate, in
+    id order. -/
+def fetchFiltered (α : Type) [Entity α] (pred : PushPred) : DbM (Array (Stored α)) := do
+  if pred == .tt then return ← fetchAll α
+  let (whereSql, binds) := pred.render false
   let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} WHERE {whereSql} ORDER BY id"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
-    let mut idx : Nat := 1
-    for c in conds do
-      if let .cmp _ _ v := c then
-        bindCol stmt (Int32.ofNat idx) v
-        idx := idx + 1
+    bindCols stmt 1 binds
     let mut out := #[]
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
@@ -172,19 +165,53 @@ def fetchFiltered (α : Type) [Entity α] (conds : Array PushCond) : DbM (Array 
 /-- The live database as a row `Source`, ignoring plans. -/
 def dbSource : Source DbM := ⟨fun _ α _ => fetchAll α⟩
 
-/-- The live database narrowed by a plan's pushed conjuncts. -/
+/-- The live database narrowed by a plan's per-table pushed conjuncts. -/
 def plannedSource (plan : SelectPlan) : Source DbM :=
-  ⟨fun i α _ => fetchFiltered α (plan.forTable i)⟩
+  ⟨fun i α _ => fetchFiltered α (plan.pred.forTable i)⟩
+
+/-- Joined execution: one SQL statement over all involved tables with the
+    whole pushed predicate (join conditions included) as `WHERE`. Used
+    when the plan relates tables — the pushed joins cut the product in
+    SQL instead of materializing it client-side. -/
+def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
+    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : DbM (Array (Rows ts)) := do
+  let specs := RowsOf.specs ts
+  let froms := specs.zipIdx.map fun (spec, i) => s!"{quoteId spec.name} AS t{i}"
+  let sel := specs.zipIdx.map fun (spec, i) =>
+    String.intercalate ", " (s!"t{i}.id" :: spec.columns.toList.map fun c => s!"t{i}.{quoteId c.name}")
+  let order := specs.zipIdx.map fun (_, i) => s!"t{i}.id"
+  let (whereSql, binds) := plan.pred.render true
+  let sql := s!"SELECT {String.intercalate ", " sel} FROM {String.intercalate ", " froms} " ++
+    s!"WHERE {whereSql} ORDER BY {String.intercalate ", " order}"
+  let total := specs.foldl (fun n spec => n + 1 + spec.columns.size) 0
+  let raw ← sqlite fun db => do
+    let stmt ← db.prepare sql
+    bindCols stmt 1 binds
+    let mut out : Array (Array Col) := #[]
+    repeat
+      if ← stmt.step then
+        let mut cols : Array Col := #[]
+        for i in [0:total] do
+          cols := cols.push (← readCol stmt (Int32.ofNat i))
+        out := out.push cols
+      else break
+    return out
+  let rows ← raw.mapM fun cols => liftExcept (RowsOf.decodeFrom (ts := ts) cols 0)
+  return finishRows ts rows where' sortBy
 
 /-- The typed select. The trailing `plan` is reified from `where'` by the
-    `leandb_plan` tactic at each call site and narrows each table's fetch
-    via SQL `WHERE`; the lambda is still applied to what comes back, so the
-    reference semantics (`selectSpec` over an unfiltered source) define the
-    result and pushdown can only be an optimization. -/
+    `leandb_plan` tactic at each call site: join conditions route to the
+    joined executor, everything else narrows per-table fetches. The lambda
+    is still applied to what comes back, so the reference semantics
+    (`selectSpec` over an unfiltered source) define the result and
+    pushdown can only be an optimization. -/
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve)
     (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
-  selectSpec ts (plannedSource plan.plan) where' sortBy
+  if plan.plan.pred.hasJoin then
+    selectJoined ts plan.plan where' sortBy
+  else
+    selectSpec ts (plannedSource plan.plan) where' sortBy
 
 /-- `select` with pushdown disabled — the executable reference, for
     differential testing against the planned path. -/

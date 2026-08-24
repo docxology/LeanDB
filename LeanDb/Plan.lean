@@ -6,58 +6,139 @@ namespace LeanDb
 
 A `SelectPlan` is what the `leandb_plan` elaboration tactic (see
 `LeanDb.PlanElab`) reifies out of a `select` predicate at each call site:
-the conjuncts it recognized, per table, as SQL-pushable — column compared
-to a value (captured variables become bound parameters), and `Option`
-null tests.
+a `PushPred` tree over the involved tables — comparisons of columns
+against values (captured variables become bound parameters) or against
+other columns (equi-joins and general col/col comparisons), null tests,
+and/or/negation — plus a count of conjuncts it could not translate.
 
-Pushdown is a *fetch-narrowing prefilter*: the executor sends pushed
-conjuncts as SQL `WHERE` and still applies the original lambda to what
-comes back. The lambda remains the semantics; a pushed conjunct that
+Pushdown is a *fetch-narrowing prefilter*: the executor sends the pushed
+tree as SQL `WHERE` and still applies the original lambda to what comes
+back. The lambda remains the semantics; a pushed predicate that
 over-filters is a bug the differential tests exist to catch, and anything
-the tactic doesn't recognize is simply residual — correct, just unfetched.
+the tactic doesn't recognize is simply `tt` (no narrowing) — correct,
+just unoptimized.
 -/
 
 inductive PushOp where
   | eq | ne | lt | le | gt | ge
   deriving Repr, DecidableEq, BEq
 
+/-- `eq`/`ne` render as `IS`/`IS NOT`: null-safe, so `Option` columns
+    compare like the lambda's `==` on `Option` (`none == none` is true). -/
 def PushOp.sql : PushOp → String
-  | .eq => "IS"        -- null-safe: also covers Option columns
+  | .eq => "IS"
   | .ne => "IS NOT"
   | .lt => "<"
   | .le => "<="
   | .gt => ">"
   | .ge => ">="
 
-/-- One pushable conjunct over a single table's columns. -/
-inductive PushCond where
-  | cmp (col : String) (op : PushOp) (v : Col)
-  | isNull (col : String)
-  | isNotNull (col : String)
+def PushOp.negate : PushOp → PushOp
+  | .eq => .ne | .ne => .eq | .lt => .ge | .le => .gt | .gt => .le | .ge => .lt
+
+/-- The pushed fragment of a predicate. Columns are addressed by table
+    index (position in the `select` list) and column name. -/
+inductive PushPred where
+  | tt | ff
+  | cmp (table : Nat) (col : String) (op : PushOp) (v : Col)
+  /-- column-vs-column; across distinct tables this is a join condition. -/
+  | cmp2 (t1 : Nat) (c1 : String) (op : PushOp) (t2 : Nat) (c2 : String)
+  | isNull (table : Nat) (col : String)
+  | isNotNull (table : Nat) (col : String)
+  | and (a b : PushPred)
+  | or (a b : PushPred)
   deriving Repr, BEq
 
-def PushCond.describe : PushCond → String
-  | .cmp col op v => s!"\"{col}\" {op.sql} {v.describe}"
-  | .isNull col => s!"\"{col}\" IS NULL"
-  | .isNotNull col => s!"\"{col}\" IS NOT NULL"
+namespace PushPred
 
-/-- The reified plan for one `select` call site. `pushed` pairs a table
-    index (position in the `ts` list) with a conjunct on that table;
-    `residual` counts predicate conjuncts left to the client-side lambda. -/
+/-- Simplifying conjunction. -/
+def andS : PushPred → PushPred → PushPred
+  | .tt, b => b | .ff, _ => .ff
+  | a, .tt => a | _, .ff => .ff
+  | a, b => .and a b
+
+/-- Simplifying disjunction. -/
+def orS : PushPred → PushPred → PushPred
+  | .ff, b => b | .tt, _ => .tt
+  | a, .ff => a | _, .tt => .tt
+  | a, b => .or a b
+
+/-- Exact negation. Order comparisons only arise on non-nullable columns
+    (an `Option` column reaches SQL only through null-safe `IS`), so
+    `NOT (a < b)` ↔ `a >= b` holds on everything the tactic emits. -/
+def neg : PushPred → PushPred
+  | .tt => .ff | .ff => .tt
+  | .cmp t c op v => .cmp t c op.negate v
+  | .cmp2 t1 c1 op t2 c2 => .cmp2 t1 c1 op.negate t2 c2
+  | .isNull t c => .isNotNull t c
+  | .isNotNull t c => .isNull t c
+  | .and a b => .or a.neg b.neg
+  | .or a b => .and a.neg b.neg
+
+/-- Table indices a predicate touches. -/
+def tables : PushPred → List Nat
+  | .tt | .ff => []
+  | .cmp t .. | .isNull t .. | .isNotNull t .. => [t]
+  | .cmp2 t1 _ _ t2 _ => [t1, t2]
+  | .and a b | .or a b => (a.tables ++ b.tables).eraseDups
+
+/-- Does the predicate relate two distinct tables? -/
+def hasJoin : PushPred → Bool
+  | .cmp2 t1 _ _ t2 _ => t1 != t2
+  | .and a b | .or a b => a.hasJoin || b.hasJoin
+  | _ => false
+
+/-- Top-level conjuncts. -/
+def conjuncts : PushPred → List PushPred
+  | .and a b => a.conjuncts ++ b.conjuncts
+  | .tt => []
+  | p => [p]
+
+/-- The part of the predicate pushable onto table `i` alone: the top-level
+    conjuncts that touch only `i`. Dropping the rest only widens the fetch
+    — never wrong. -/
+def forTable (p : PushPred) (i : Nat) : PushPred :=
+  (p.conjuncts.filter fun c => c.tables == [i]).foldl andS .tt
+
+/-- Render as SQL. `alias?` qualifies columns (`t0."col"`) for the joined
+    executor; `none` leaves them bare for single-table fetches. Returns
+    the SQL and the bind values in placeholder order. -/
+def render (alias? : Bool) : PushPred → String × Array Col
+  | .tt => ("1", #[])
+  | .ff => ("0", #[])
+  | .cmp t c op v => (s!"{col alias? t c} {op.sql} ?", #[v])
+  | .cmp2 t1 c1 op t2 c2 =>
+      -- col/col comparison: `IS`/`IS NOT` are valid SQLite binary operators
+      (s!"{col alias? t1 c1} {op.sql} {col alias? t2 c2}", #[])
+  | .isNull t c => (s!"{col alias? t c} IS NULL", #[])
+  | .isNotNull t c => (s!"{col alias? t c} IS NOT NULL", #[])
+  | .and a b =>
+      let (sa, ba) := a.render alias?
+      let (sb, bb) := b.render alias?
+      (s!"({sa} AND {sb})", ba ++ bb)
+  | .or a b =>
+      let (sa, ba) := a.render alias?
+      let (sb, bb) := b.render alias?
+      (s!"({sa} OR {sb})", ba ++ bb)
+where
+  col (alias? : Bool) (t : Nat) (c : String) : String :=
+    if alias? then s!"t{t}.\"{c}\"" else s!"\"{c}\""
+
+def describe (p : PushPred) : String := (p.render true).1
+
+end PushPred
+
+/-- The reified plan for one `select` call site. -/
 structure SelectPlan where
-  pushed : Array (Nat × PushCond) := #[]
+  pred : PushPred := .tt
+  /-- Conjuncts the tactic could not translate (left to the lambda). -/
   residual : Nat := 0
   deriving Repr
 
 def SelectPlan.empty : SelectPlan := {}
 
-/-- Conjuncts pushed onto table `i`. -/
-def SelectPlan.forTable (p : SelectPlan) (i : Nat) : Array PushCond :=
-  p.pushed.filterMap fun (j, c) => if j == i then some c else none
-
 def SelectPlan.describe (p : SelectPlan) : String :=
-  let pushed := p.pushed.toList.map fun (i, c) => s!"t{i}: {c.describe}"
-  s!"pushed [{String.intercalate ", " pushed}], residual conjuncts: {p.residual}"
+  s!"pushed: {p.pred.describe}, residual conjuncts: {p.residual}"
 
 /-- Marker type carrying the predicate in its *type*, so the `leandb_plan`
     default-argument tactic can reflect the actual call-site lambda from

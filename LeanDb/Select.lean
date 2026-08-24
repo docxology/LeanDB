@@ -50,10 +50,28 @@ structure Source (m : Type → Type) where
 class RowsOf (ts : List Type) where
   gather : {m : Type → Type} → [Monad m] → (offset : Nat) → Source m → m (Array (Rows ts))
   ids : Rows ts → List Int64
+  /-- The involved tables' specs, in list order — the joined executor's
+      `FROM`/`SELECT` layout. -/
+  specs : List TableSpec
+  /-- Decode one joined result row laid out as `id, cols…` per table,
+      starting at `start`. -/
+  decodeFrom : (cols : Array Col) → (start : Nat) → Except DbError (Rows ts)
+
+/-- Decode `id, cols…` of a single entity from a slice of a joined row. -/
+private def decodeStored (α : Type) [Entity α] (cols : Array Col) (start : Nat) :
+    Except DbError (Stored α) := do
+  let n := (Entity.columns α).size
+  let id ← match cols.getD start .null with
+    | .int v => pure v
+    | c => .error (.decode (Entity.tableName α) "id" s!"expected INTEGER id, found {c.describe}")
+  let v ← Entity.decode (cols.extract (start + 1) (start + 1 + n))
+  return ⟨⟨id⟩, v⟩
 
 instance [Entity α] : RowsOf [α] where
   gather offset src := src.load offset α
   ids r := [r.id.toInt64]
+  specs := [Entity.spec α]
+  decodeFrom cols start := decodeStored α cols start
 
 instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
   gather offset src := do
@@ -61,12 +79,25 @@ instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
     let tails ← RowsOf.gather (ts := β :: ts) (offset + 1) src
     return heads.flatMap fun h => tails.map fun t => (h, t)
   ids r := r.1.id.toInt64 :: RowsOf.ids (ts := β :: ts) r.2
+  specs := Entity.spec α :: RowsOf.specs (β :: ts)
+  decodeFrom cols start := do
+    let h ← decodeStored α cols start
+    let t ← RowsOf.decodeFrom (ts := β :: ts) cols (start + 1 + (Entity.columns α).size)
+    return (h, t)
 
 private def compareIds : List Int64 → List Int64 → Ordering
   | [], [] => .eq
   | [], _ => .lt
   | _, [] => .gt
   | a :: as, b :: bs => (compare a b).then (compareIds as bs)
+
+/-- Filter and sort gathered rows: the lambda, the sort spec, and the
+    deterministic id tiebreak. -/
+def finishRows (ts : List Type) [RowsOf ts] (rows : Array (Rows ts))
+    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : Array (Rows ts) :=
+  let rows := rows.filter where'
+  rows.qsort fun a b =>
+    ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT
 
 /-- The meaning of `select`, in four lines: product, filter, sort — with
     the deterministic id tiebreak. Everything the engine does must equal
@@ -75,8 +106,6 @@ def selectSpec [Monad m] (ts : List Type) [RowsOf ts] (src : Source m)
     (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts) := .preserve) :
     m (Array (Rows ts)) := do
   let rows ← RowsOf.gather (ts := ts) 0 src
-  let rows := rows.filter where'
-  return rows.qsort fun a b =>
-    ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT
+  return finishRows ts rows where' sortBy
 
 end LeanDb
