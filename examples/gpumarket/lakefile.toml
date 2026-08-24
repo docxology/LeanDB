@@ -1,0 +1,17 @@
+name = "gpumarket"
+defaultTargets = ["gpumarket_tests"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "GpuMarket"
+
+[[lean_exe]]
+name = "gpumarket"
+root = "Main"
+
+[[lean_exe]]
+name = "gpumarket_tests"
+root = "GpuMarketTests"
