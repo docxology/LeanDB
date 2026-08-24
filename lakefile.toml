@@ -1,13 +1,16 @@
 name = "leandb"
-version = "0.1.0"
-defaultTargets = ["leandb"]
+version = "0.2.0"
+defaultTargets = ["LeanDb"]
+
+# Pinned to the last leansqlite commit on lean4 v4.31.0; bump in lockstep
+# with lean-toolchain.
+[[require]]
+name = "leansqlite"
+git = "https://github.com/leanprover/leansqlite"
+rev = "0be4df908d1a8e75b58961041e2b4973692623df"
 
 [[lean_lib]]
 name = "LeanDb"
-
-[[lean_exe]]
-name = "leandb"
-root = "Main"
 
 [[lean_exe]]
 name = "leandb_tests"

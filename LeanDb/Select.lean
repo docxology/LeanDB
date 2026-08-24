@@ -1,0 +1,80 @@
+import LeanDb.Entity
+
+namespace LeanDb
+
+/-! # The dependent select surface, and its reference semantics
+
+`Rows ts` is computed by recursion on the list of entity types, so
+`select [Ticket, User]` *forces* `where' : Stored Ticket × Stored User → Bool`
+— a predicate over the wrong tables does not typecheck.
+
+`gather`/`selectSpec` here are the executable reference semantics
+(plan-v2 M2): fetch, product, filter, sort. The SQLite executor runs this
+directly in v1; pushdown (M4) must stay observationally equal to it.
+-/
+
+/-- The row type of a multi-table select: one `Stored` per entity type,
+    as nested pairs; a single table is unwrapped. -/
+@[reducible] def Rows : List Type → Type
+  | [] => PUnit
+  | [α] => Stored α
+  | α :: rest => Stored α × Rows rest
+
+/-- Sort specification over a row type `ρ`, per plan.md §8: typed keys
+    (`.key` with any `[Ord κ]`), raw comparators, descending, lexicographic
+    composition. Results additionally carry an implicit final tiebreak on
+    primary keys (§4.3 determinism), applied by the executor. -/
+inductive SortBy (ρ : Type) where
+  | preserve
+  | key {κ : Type} [ord : Ord κ] (f : ρ → κ)
+  | cmp (f : ρ → ρ → Ordering)
+  | desc (s : SortBy ρ)
+  | andThen (a b : SortBy ρ)
+
+def SortBy.ord : SortBy ρ → ρ → ρ → Ordering
+  | .preserve, _, _ => .eq
+  | .key (ord := o) f, a, b => o.compare (f a) (f b)
+  | .cmp f, a, b => f a b
+  | .desc s, a, b => (s.ord a b).swap
+  | .andThen s t, a, b => (s.ord a b).then (t.ord a b)
+
+/-- A place rows come from: the real database, or an in-memory fixture in
+    tests. Loading is by entity, never by string. -/
+structure Source (m : Type → Type) where
+  load : (α : Type) → [Entity α] → m (Array (Stored α))
+
+/-- Typeclass computing, for a list of entity types, how to gather the
+    cartesian product of their rows and how to read off row identities. -/
+class RowsOf (ts : List Type) where
+  gather : {m : Type → Type} → [Monad m] → Source m → m (Array (Rows ts))
+  ids : Rows ts → List Int64
+
+instance [Entity α] : RowsOf [α] where
+  gather src := src.load α
+  ids r := [r.id.toInt64]
+
+instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
+  gather src := do
+    let heads ← src.load α
+    let tails ← RowsOf.gather (ts := β :: ts) src
+    return heads.flatMap fun h => tails.map fun t => (h, t)
+  ids r := r.1.id.toInt64 :: RowsOf.ids (ts := β :: ts) r.2
+
+private def compareIds : List Int64 → List Int64 → Ordering
+  | [], [] => .eq
+  | [], _ => .lt
+  | _, [] => .gt
+  | a :: as, b :: bs => (compare a b).then (compareIds as bs)
+
+/-- The meaning of `select`, in four lines: product, filter, sort — with
+    the deterministic id tiebreak. Everything the engine does must equal
+    this. -/
+def selectSpec [Monad m] (ts : List Type) [RowsOf ts] (src : Source m)
+    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts) := .preserve) :
+    m (Array (Rows ts)) := do
+  let rows ← RowsOf.gather (ts := ts) src
+  let rows := rows.filter where'
+  return rows.qsort fun a b =>
+    ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT
+
+end LeanDb

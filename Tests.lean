@@ -1,59 +1,191 @@
 import LeanDb
 
+/-! Engine tests: codecs, deriving, the dependent select against a real
+SQLite file, CAS staleness, FK restriction. Fixture types live here — the
+engine library itself imports no domain. -/
+
 open LeanDb
-open LeanDb.Examples
 
 private def check (condition : Bool) (message : String) : IO Unit :=
-  unless condition do throw <| IO.userError message
+  unless condition do throw <| IO.userError s!"FAIL: {message}"
 
-private def testValidation : IO Unit := do
-  match TextValue.create "name" "   " with
-  | .error _ => pure ()
-  | .ok _ => throw <| IO.userError "empty named text must be rejected"
-  match TextValue.create "name" "  useful  " with
-  | .ok value => check (value.raw == "useful") "named text must be trimmed"
-  | .error _ => throw <| IO.userError "valid named text was rejected"
+/-! ## Fixtures -/
 
-private structure Point where
+structure Author where
   name : String
-  cost : Nat
-  quality : Nat
+  age : Nat
+  deriving Repr, LeanDb.Entity
 
-private def pointObjectives : List (Objective Point) := [
-  ⟨"cost", .minimize, (fun point => point.cost)⟩,
-  ⟨"quality", .maximize, (fun point => point.quality)⟩
-]
+structure Book where
+  title : String
+  author : Ref Author
+  rating : Option Float
+  deriving Repr, LeanDb.Entity
 
-private def testPareto : IO Unit := do
-  let points : List Point := [⟨"cheap", 1, 4⟩, ⟨"balanced", 2, 7⟩, ⟨"premium", 3, 8⟩, ⟨"dominated", 4, 7⟩]
-  let front := paretoFront pointObjectives points
-  check (front.length == 3) "Pareto front should remove a dominated point"
-  check (!(front.any fun point => point.name == "dominated")) "dominated point leaked into front"
-  match knee? pointObjectives points with
-  | none => throw <| IO.userError "knee should exist for non-empty input"
-  | some point => check (point.name == "balanced") "normalized max-min knee chose the wrong point"
+def schema : List TableSpec := [Entity.spec Author, Entity.spec Book]
 
-private def testGpuQuery : IO Unit := do
-  let request : Gpu.Request := { minVramGb := 16, maxPriceDollars := 1000, strategy := .pareto }
-  let result := Gpu.query request
-  check (!result.isEmpty) "GPU example should return feasible rows"
-  check (result.all fun gpu => gpu.vramGb ≥ 16 && gpu.price.cents ≤ 100000) "GPU constraints were not enforced"
+/-! ## Pure tests -/
 
-private def testHotelKnee : IO Unit := do
-  let request : Hotel.Request := { maxNightlyDollars := 250, minRatingTenths := 40, strategy := .knee }
-  check ((Hotel.query request).length == 1) "knee strategy must return one hotel"
+private def roundtrip [ColCodec α] [BEq α] (a : α) : Bool :=
+  match fromCol (toCol a) with
+  | .ok b => a == b
+  | .error _ => false
 
-private def testRestaurantCuisine : IO Unit := do
-  let request : Restaurant.Request := { cuisine := some "jApAnEsE", strategy := .sorted }
-  let result := Restaurant.query request
-  check (result.length == 1) "cuisine filter should be case-insensitive"
-  check (result.head?.map (fun row => row.cuisine.value.raw) == some "Japanese") "wrong cuisine row returned"
+private def testCodecs : IO Unit := do
+  check (roundtrip (42 : Int64)) "Int64 roundtrip"
+  check (roundtrip (7 : Nat)) "Nat roundtrip"
+  check (roundtrip true && roundtrip false) "Bool roundtrip"
+  check (roundtrip "quote \" and unicode λ") "String roundtrip"
+  check (roundtrip (some (3 : Nat)) && roundtrip (none : Option Nat)) "Option roundtrip"
+  check ((fromCol (α := Nat) (.int (-1))).isOk == false) "negative Nat must fail decode"
+  check ((fromCol (α := Bool) (.int 2)).isOk == false) "Bool 2 must fail decode"
+  check ((fromCol (α := String) (.int 5)).isOk == false) "String from INTEGER must fail"
+
+private def testDerivedSpec : IO Unit := do
+  check (Entity.tableName Author == "author") "table name snake_case"
+  let cols := Entity.columns Book
+  check (cols.map (·.name) == #["title", "author", "rating"]) "Book column names"
+  check ((cols.getD 1 default).fkTable == some "author") "Ref column carries FK target"
+  check ((cols.getD 2 default).nullable == true) "Option column is nullable"
+  check ((cols.getD 0 default).nullable == false) "plain column is NOT NULL"
+  let a : Author := ⟨"Ada", 36⟩
+  let rt : Except DbError Author := Entity.decode (Entity.encode a)
+  check (rt.toOption.map (·.name) == some "Ada") "entity encode/decode roundtrip"
+  check (((Entity.decode #[.int 1] : Except DbError Author)).isOk == false)
+    "wrong column count must fail decode"
+
+private def testSortBy : IO Unit := do
+  let xs := #[(3, "c"), (1, "b"), (1, "a"), (2, "z")]
+  let byFst : SortBy (Nat × String) := .key (·.1)
+  let both : SortBy (Nat × String) := .andThen (.key (·.1)) (.desc (.key (·.2)))
+  check ((xs.qsort (fun a b => (byFst.ord a b).isLT)).map (·.1) == #[1, 1, 2, 3]) "key sort"
+  check ((xs.qsort (fun a b => (both.ord a b).isLT)) == #[(1, "b"), (1, "a"), (2, "z"), (3, "c")])
+    "andThen + desc sort"
+
+/-! ## Closed worlds -/
+
+inductive Status where
+  | backlog | inProgress | done
+  deriving Repr, DecidableEq, LeanDb.ClosedEnum
+
+structure Todo where
+  title : String
+  status : Status
+  deriving Repr, LeanDb.Entity
+
+-- Closed types are not entities: there is nothing to insert into or
+-- delete from — this must not typecheck.
+#check_failure insert Status Status.backlog
+
+private def testClosedEnum : IO Unit := do
+  check (roundtrip Status.inProgress && roundtrip Status.done) "closed enum roundtrip"
+  check ((fromCol (α := Status) (.text "cancelled")).isOk == false)
+    "unknown variant must fail decode"
+  check (ClosedEnum.variants Status == #["backlog", "inProgress", "done"]) "variant names"
+  let cols := Entity.columns Todo
+  check ((cols.getD 1 default).enum == some #["backlog", "inProgress", "done"])
+    "status column carries its closed world"
+  check (((Entity.spec Todo).ddl.splitOn "CHECK").length == 2) "DDL contains CHECK"
+
+/-! ## End-to-end against SQLite -/
+
+private def dbPath : System.FilePath := ".lake" / "leandb_test.sqlite"
+
+private def freshDb : IO Unit := do
+  if ← dbPath.pathExists then IO.FS.removeFile dbPath
+
+private def expectOk (r : Except DbError α) (context : String) : IO α :=
+  match r with
+  | .ok a => pure a
+  | .error e => throw <| IO.userError s!"FAIL: {context}: {e}"
+
+private def expectErr (r : Except DbError α) (code : String) (context : String) : IO Unit :=
+  match r with
+  | .ok _ => throw <| IO.userError s!"FAIL: {context}: expected [{code}], got success"
+  | .error e =>
+      unless e.code == code do
+        throw <| IO.userError s!"FAIL: {context}: expected [{code}], got {e}"
+
+private def seed : DbM (Stored Author × Stored Author × Stored Book) := do
+  let ada ← insert Author ⟨"Ada", 36⟩
+  let alan ← insert Author ⟨"Alan", 41⟩
+  let book ← insert Book ⟨"On Computable Numbers", alan.ref, some 4.5⟩
+  discard <| insert Book ⟨"Notes on the Analytical Engine", ada.ref, none⟩
+  return (ada, alan, book)
+
+private def testEndToEnd : IO Unit := do
+  freshDb
+  let r ← withDb dbPath schema do
+    let (ada, alan, _) ← seed
+    -- get
+    let got ← get ada.id
+    check' (got.map (·.val.name) == some "Ada") "get returns the row"
+    -- single-table select: dependent type is Stored Author
+    let adults ← select [Author] (fun a => a.val.age ≥ 40) (.key (·.val.name))
+    check' (adults.map (·.val.name) == #["Alan"]) "typed where' filters"
+    -- join: Rows [Book, Author] = Stored Book × Stored Author
+    let byAuthor ← select [Book, Author]
+      (fun (b, a) => b.val.author == a.ref)
+      (.key fun (b, _) => b.val.title)
+    check' (byAuthor.map (fun (b, a) => ((b.val.title.take 5).toString, a.val.name))
+      == #[("Notes", "Ada"), ("On Co", "Alan")]) "equi-join via Ref equality"
+    -- CAS update
+    let alan' ← update alan { alan.val with age := 42 }
+    check' (alan'.val.age == 42) "update applies"
+    return (ada, alan)
+  let (ada, alan) ← expectOk r "seed + queries"
+  -- stale CAS: 'alan' still holds age 41 but the row now says 42
+  expectErr (← withDb dbPath schema do discard <| update alan { alan.val with name := "A." })
+    "stale" "CAS with stale snapshot"
+  -- FK RESTRICT: alan is referenced by a book
+  expectErr (← withDb dbPath schema do delete alan.id) "restricted" "delete referenced author"
+  -- delete of unreferenced row after removing its book, then notFound on re-delete
+  let r ← withDb dbPath schema do
+    let books ← select [Book] (fun b => b.val.author == ada.ref)
+    for b in books do delete b.id
+    delete ada.id
+  discard <| expectOk r "cascade-by-hand delete"
+  expectErr (← withDb dbPath schema do delete ada.id) "not_found" "double delete"
+  -- reopen: fingerprint accepted, data persisted
+  let names ← withDb dbPath schema do
+    return (← select [Author] (fun _ => true) (.key (·.val.name))).map (·.val.name)
+  check ((← expectOk names "reopen") == #["Alan"]) "persistence across open"
+  -- fingerprint mismatch: same file, different schema
+  expectErr (← withDb dbPath [Entity.spec Author] (pure ())) "schema_mismatch"
+    "drifted schema must refuse to open"
+where
+  check' (condition : Bool) (message : String) : DbM Unit :=
+    unless condition do throw (.sqlite s!"FAIL: {message}")
+
+private def taskDbPath : System.FilePath := ".lake" / "leandb_test_tasks.sqlite"
+
+private def testClosedEndToEnd : IO Unit := do
+  if ← taskDbPath.pathExists then IO.FS.removeFile taskDbPath
+  let r ← withDb taskDbPath [Entity.spec Todo] do
+    discard <| insert Todo ⟨"write plan", .done⟩
+    discard <| insert Todo ⟨"build engine", .inProgress⟩
+    discard <| insert Todo ⟨"ship", .backlog⟩
+    select [Todo] (fun t => t.val.status == .inProgress)
+  let active ← expectOk r "closed-enum filter"
+  check (active.map (·.val.title) == #["build engine"]) "match on closed world filters"
+  -- the file itself refuses vocabulary violations (CHECK), even via raw SQL
+  let db ← SQLite.open taskDbPath
+  let raw : IO Unit := db.exec "INSERT INTO todo (title, status) VALUES ('rogue', 'cancelled')"
+  match ← raw.toBaseIO with
+  | .ok _ => throw <| IO.userError "FAIL: CHECK should reject unknown variant"
+  | .error e =>
+      match e with
+      | .otherError 19 details =>
+          check ((details.toLower.splitOn "check constraint").length == 2)
+            s!"raw insert rejected by CHECK, got: {details}"
+      | e => throw <| IO.userError s!"FAIL: expected constraint error 19, got: {e}"
 
 def main : IO UInt32 := do
-  testValidation
-  testPareto
-  testGpuQuery
-  testHotelKnee
-  testRestaurantCuisine
-  IO.println "{\"ok\":true,\"tests\":5}"
-  pure 0
+  testCodecs
+  testDerivedSpec
+  testSortBy
+  testClosedEnum
+  testEndToEnd
+  testClosedEndToEnd
+  IO.println "all engine tests passed"
+  return 0

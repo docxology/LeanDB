@@ -1,6 +1,5 @@
 import LeanDb.Core
-import LeanDb.Query
-import LeanDb.Examples.Gpu
-import LeanDb.Examples.Hotel
-import LeanDb.Examples.Restaurant
-import LeanDb.Api
+import LeanDb.Entity
+import LeanDb.Derive
+import LeanDb.Select
+import LeanDb.Db
