@@ -137,6 +137,31 @@ private def testPlans : IO Unit := do
       && isSomePlan.plan.pushed == #[(0, .isNotNull "rating")])
     s!"Option.isNone/isSome push as IS NULL tests, got {repr isNonePlan.plan} / {repr isSomePlan.plan}"
 
+/-! ## JSON, derived from the schema (M5) -/
+
+private def parseJ (str : String) : IO Lean.Json :=
+  match Lean.Json.parse str with
+  | .ok j => pure j
+  | .error e => throw <| IO.userError s!"FAIL: json parse: {e}"
+
+private def testJson : IO Unit := do
+  let b : Stored Book := ⟨⟨7⟩, ⟨"T", ⟨3⟩, none⟩⟩
+  check ((rowJson Book b).compress == "{\"author\":3,\"id\":7,\"rating\":null,\"title\":\"T\"}")
+    s!"row JSON shape, got {(rowJson Book b).compress}"
+  let j ← parseJ "{\"title\":\"T2\",\"author\":3}"
+  let full := rowOfJson Book j
+  check (full.toOption.map (fun bk => bk.title == "T2" && bk.rating == none) == some true)
+    "rowOfJson decodes with missing nullable as none"
+  let merged := rowMergeJson Book b.val j
+  check (merged.toOption.map (fun bk => bk.title == "T2" && bk.author == b.val.author) == some true)
+    "rowMergeJson overlays only present fields"
+  check ((rowOfJson Book (← parseJ "{\"author\":3}")).isOk == false)
+    "missing required field must fail"
+  let bogus := rowMergeJson Todo ⟨"x", .backlog⟩ (← parseJ "{\"status\":\"bogus\"}")
+  match bogus with
+  | .error (.decode "todo" "status" _) => pure ()
+  | _ => throw <| IO.userError "FAIL: closed world must reject bogus via JSON"
+
 /-! ## End-to-end against SQLite -/
 
 private def dbPath : System.FilePath := ".lake" / "leandb_test.sqlite"
@@ -244,6 +269,7 @@ def main : IO UInt32 := do
   testSortBy
   testPlans
   testClosedEnum
+  testJson
   testEndToEnd
   testClosedEndToEnd
   IO.println "all engine tests passed"

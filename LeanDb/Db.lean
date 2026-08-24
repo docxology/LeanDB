@@ -66,8 +66,11 @@ private def readStored (α : Type) [Entity α] (stmt : SQLite.Stmt) :
     cols := cols.push (← readCol stmt (Int32.ofNat (i + 1)))
   return (Entity.decode cols).map (⟨⟨id⟩, ·⟩)
 
-private def liftExcept (r : Except DbError α) : DbM α :=
+/-- Lift a typed result into `DbM`. -/
+def DbM.ofExcept (r : Except DbError α) : DbM α :=
   fun _ => ExceptT.mk (pure r)
+
+private def liftExcept (r : Except DbError α) : DbM α := DbM.ofExcept r
 
 private def quoteId (s : String) : String := "\"" ++ s ++ "\""
 

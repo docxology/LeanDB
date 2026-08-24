@@ -12,3 +12,7 @@ name = "Tickets"
 [[lean_exe]]
 name = "tickets_tests"
 root = "TicketsTests"
+
+[[lean_exe]]
+name = "tickets"
+root = "Main"

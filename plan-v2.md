@@ -132,7 +132,7 @@ Exit test: differential — every query in the tickets base runs both through
 `select.spec` and through the emitter, results byte-equal; golden SQL tests
 for the pushed fragment.
 
-## M5 — Surface: derived CLI + schema output
+## M5 — Surface: derived CLI + schema output ✅ core (2026-08-23; type-derived query flags deferred)
 
 - `schema` command emits JSON *derived from the catalog* (walk the env
   extension → `Lean.Json`). Deleting a field changes the output with no other

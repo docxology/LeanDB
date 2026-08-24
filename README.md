@@ -61,7 +61,11 @@ LeanDb/Core.lean     Id/Ref/Stored, Col, ColCodec, ClosedEnum, ColumnSpec, DbErr
 LeanDb/Entity.lean   Entity class, TableSpec, DDL generation, fingerprint
 LeanDb/Derive.lean   deriving LeanDb.Entity / LeanDb.ClosedEnum (metaprogram)
 LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (reference semantics)
+LeanDb/Plan.lean     SelectPlan IR (pushed conjuncts, residual count)
+LeanDb/PlanElab.lean leandb_plan reification tactic, @[db], leandb.explain
 LeanDb/Db.lean       Conn/DbM, the four verbs, open (fingerprint + drift checks)
+LeanDb/Json.lean     schema/row/error JSON derived from Entity; merge decode
+LeanDb/Cli.lean      generic CLI driver over a base's entities and queries
 Tests.lean           engine tests: codecs, deriving, e2e, closed worlds, negatives
 examples/tickets/    the first base: scalars, enums, entities, queries, seed, tests
 ```
@@ -79,9 +83,12 @@ but never change results (differential-tested). Set
 ## Status
 
 Tracked in [`plan-v2.md`](plan-v2.md). Done: M1 (typed core + deriving),
-M2 (the four verbs, e2e), M3 core (closed worlds), M4 core (reified
-plans + pushdown; equi-join and match→CASE pushdown deferred). Next: M5
-(derived CLI/schema surface).
+M2 (the four verbs, e2e), M3 core (closed worlds), M4 core (reified plans
++ pushdown; equi-join and match→CASE pushdown deferred), M5 core (derived
+CLI: schema/insert/get/update/delete/rows from Entity instances, JSON
+through the smart constructors, named queries; type-derived query flags
+deferred). Try it: `cd examples/tickets && lake build tickets &&
+.lake/build/bin/tickets query seed && .lake/build/bin/tickets query open`.
 Deliberately deferred: migrations synthesis, SQL import, serve/MCP, query
 log — see plan-v2 "Deferred".
 
