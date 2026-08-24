@@ -1,0 +1,14 @@
+name = "legacy"
+version = "0.1.0"
+defaultTargets = ["legacy"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "Legacy"
+
+[[lean_exe]]
+name = "legacy"
+root = "Main"

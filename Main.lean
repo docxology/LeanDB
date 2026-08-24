@@ -1,0 +1,119 @@
+import LeanDb
+import LeanDb.Import
+
+/-! # The `leandb` engine CLI
+
+`leandb import-sqlite <file.db> --name <base-name> --out <dir>` generates a
+complete typed base package from an existing SQLite file (plan.md §5).
+Machine-first: usage on stdout as JSON; errors as JSON on stderr with the
+exit codes of `LeanDb/Cli.lean` (0 ok, 2 operational error, 3 usage).
+-/
+
+open Lean (Json)
+open LeanDb.Import
+
+def usageJson : Json :=
+  Json.mkObj [
+    ("ok", Json.bool true),
+    ("tool", Json.str "leandb"),
+    ("usage", Json.arr #[
+      Json.str "import-sqlite <file.db> --name <base-name> --out <dir> [--require-path <path-to-leandb>] [--db-path <path>]",
+      Json.str "--help"]),
+    ("defaults", Json.mkObj [
+      ("require-path", Json.str "../.."),
+      ("db-path", Json.str "data/<file.db basename>")])]
+
+def errJson (code msg : String) : Json :=
+  Json.mkObj [("ok", Json.bool false), ("code", Json.str code),
+    ("message", Json.str msg)]
+
+def usageErr (msg : String) : IO UInt32 := do
+  IO.eprintln (errJson "usage" msg).compress
+  return 3
+
+def opErr (code msg : String) : IO UInt32 := do
+  IO.eprintln (errJson code msg).compress
+  return 2
+
+structure ImportArgs where
+  file : Option String := none
+  name : Option String := none
+  out : Option String := none
+  requirePath : String := "../.."
+  dbPath : Option String := none
+
+partial def parseImportArgs (args : List String) (acc : ImportArgs := {}) :
+    Except String ImportArgs :=
+  match args with
+  | [] => .ok acc
+  | "--name" :: v :: rest => parseImportArgs rest { acc with name := some v }
+  | "--out" :: v :: rest => parseImportArgs rest { acc with out := some v }
+  | "--require-path" :: v :: rest => parseImportArgs rest { acc with requirePath := v }
+  | "--db-path" :: v :: rest => parseImportArgs rest { acc with dbPath := some v }
+  | a :: rest =>
+      if a.startsWith "--" then .error s!"unknown or valueless option {String.quote a}"
+      else match acc.file with
+        | none => parseImportArgs rest { acc with file := some a }
+        | some _ => .error s!"unexpected extra argument {String.quote a}"
+
+/-- Base names are lowercase snake_case so the module name round-trips. -/
+def validBaseName (s : String) : Bool :=
+  !s.isEmpty &&
+  (s.foldl (init := (true, true)) fun (ok, first) c =>
+    (ok && (if first then c.isLower && c.isAlpha
+            else (c.isAlpha && c.isLower) || c.isDigit || c == '_'), false)).1
+
+def toolchain : String := "leanprover/lean4:v4.31.0"
+
+def runImport (a : ImportArgs) : IO UInt32 := do
+  let some file := a.file | return ← usageErr "import-sqlite: missing <file.db>"
+  let some name := a.name | return ← usageErr "import-sqlite: missing --name <base-name>"
+  let some out := a.out | return ← usageErr "import-sqlite: missing --out <dir>"
+  unless validBaseName name do
+    return ← usageErr s!"import-sqlite: base name {String.quote name} must be lowercase snake_case ([a-z][a-z0-9_]*)"
+  let some moduleName := LeanDb.Import.structNameFor name |>.toOption
+    | return ← usageErr s!"import-sqlite: base name {String.quote name} does not mangle to a Lean module name"
+  let filePath : System.FilePath := System.FilePath.mk file
+  unless (← filePath.pathExists) do
+    return ← opErr "not_found" s!"no such file: {file}"
+  let dbPath := a.dbPath.getD ("data/" ++ (filePath.fileName.getD "imported.db"))
+  try
+    let raw ← introspect filePath
+    let plan := planOf name moduleName raw
+    let files := renderFiles plan a.requirePath dbPath file toolchain
+    let outPath := System.FilePath.mk out
+    for (rel, contents) in files do
+      let p := outPath / System.FilePath.mk rel
+      if let some parent := p.parent then
+        IO.FS.createDirAll parent
+      IO.FS.writeFile p contents
+    -- Make the adoption spot exist so `cp <file> <out>/<dbPath>` just works.
+    if !System.FilePath.isAbsolute (System.FilePath.mk dbPath) then
+      if let some dataDir := (outPath / System.FilePath.mk dbPath).parent then
+        IO.FS.createDirAll dataDir
+    IO.println (Json.mkObj [
+      ("ok", Json.bool true),
+      ("base", Json.str name),
+      ("out", Json.str out),
+      ("source", Json.str file),
+      ("dbPath", Json.str dbPath),
+      ("imported", Json.arr (plan.tables.map (Json.str ·.table))),
+      ("skipped", Json.arr (plan.skippedTables.map fun (t, r) =>
+        Json.mkObj [("table", Json.str t), ("reason", Json.str r)])),
+      ("files", Json.arr (files.map (Json.str ·.1))),
+      ("report", Json.str "IMPORT.md")]).compress
+    return (0 : UInt32)
+  catch e =>
+    opErr "sqlite" (toString e)
+
+def main (args : List String) : IO UInt32 := do
+  match args with
+  | [] | ["help"] | ["--help"] =>
+      IO.println usageJson.compress
+      return 0
+  | "import-sqlite" :: rest =>
+      match parseImportArgs rest with
+      | .error msg => usageErr s!"import-sqlite: {msg}"
+      | .ok a => runImport a
+  | cmd :: _ =>
+      usageErr s!"unrecognized command {String.quote cmd}"

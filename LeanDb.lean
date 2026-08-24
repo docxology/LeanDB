@@ -9,3 +9,4 @@ import LeanDb.Json
 import LeanDb.Migrate
 import LeanDb.Cli
 import LeanDb.CliQuery
+import LeanDb.Import

@@ -65,7 +65,9 @@ LeanDb/Plan.lean     SelectPlan IR (pushed conjuncts, residual count)
 LeanDb/PlanElab.lean leandb_plan reification tactic, @[db], leandb.explain
 LeanDb/Db.lean       Conn/DbM, the four verbs, open (fingerprint + drift checks)
 LeanDb/Json.lean     schema/row/error JSON derived from Entity; merge decode
-LeanDb/Cli.lean      generic CLI driver over a base's entities and queries
+LeanDb/Migrate.lean  schema diff → steps; additive auto-apply, rebuilds, refusals
+LeanDb/Cli.lean      generic CLI driver: row verbs, log, migrate, serve (JSONL)
+LeanDb/CliQuery.lean query% — CLI queries derived from def signatures
 Tests.lean           engine tests: codecs, deriving, e2e, closed worlds, negatives
 examples/tickets/    the first base: scalars, enums, entities, queries, seed, tests
 ```
@@ -83,14 +85,37 @@ but never change results (differential-tested). Set
 ## Status
 
 Tracked in [`plan-v2.md`](plan-v2.md). Done: M1 (typed core + deriving),
-M2 (the four verbs, e2e), M3 core (closed worlds), M4 core (reified plans
-+ pushdown; equi-join and match→CASE pushdown deferred), M5 core (derived
-CLI: schema/insert/get/update/delete/rows from Entity instances, JSON
-through the smart constructors, named queries; type-derived query flags
-deferred). Try it: `cd examples/tickets && lake build tickets &&
-.lake/build/bin/tickets query seed && .lake/build/bin/tickets query open`.
-Deliberately deferred: migrations synthesis, SQL import, serve/MCP, query
-log — see plan-v2 "Deferred".
+M2 (the four verbs, e2e), M3 (closed worlds), M4 full (reified `PushPred`
+plans: equi-join pushdown via a joined executor, `||`/`!`, and match→CASE
+by closed-world case-splitting — `Chip.vendor c == .amd` compiles to
+`chip IS 'mi300x' OR chip IS 'mi325x'`), M5 (derived CLI + `query%`
+type-derived query args), M6 (migrations v1 — additive auto-apply, table
+rebuilds, destructive gated; `_leandb_log` query log storing each select's
+reified plan; `serve` JSON-lines mode on one connection).
+
+Four example bases, each a separate package with tests and a CLI
+transcript: `examples/tickets`, `examples/crm`, `examples/shop`,
+`examples/gpus`. Try one:
+
+```bash
+cd examples/tickets && lake build tickets
+.lake/build/bin/tickets query seed
+.lake/build/bin/tickets query slaBreached 1700000000
+.lake/build/bin/tickets log 3        # see the reified plans it pushed
+.lake/build/bin/tickets migrate status
+```
+
+SQL import is in: `lake build leandb && .lake/build/bin/leandb
+import-sqlite legacy.db --name legacy --out ./legacy` generates a full
+typed base from an existing SQLite file — every TEXT column becomes a
+named identity newtype ("import loose, tighten forever"), FKs become
+`Ref`s, and everything not carried (views, triggers, composite-pk tables,
+BLOBs) is listed by name in `IMPORT.md`/`import-report.json`, never
+dropped silently. See `examples/import-fixture` + generated
+`examples/legacy`.
+
+Still deferred: MCP/HTTP serve (JSONL `serve` exists), log replay,
+migration source-file synthesis (v1 diffs live schema as data instead).
 
 `plan.md` is the standing interface spec; `claude-discussion.md` holds the
 original design discussion; v0.1 (discarded, reviewed in plan-v2 appendix)

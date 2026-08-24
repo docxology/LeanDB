@@ -15,3 +15,7 @@ name = "LeanDb"
 [[lean_exe]]
 name = "leandb_tests"
 root = "Tests"
+
+[[lean_exe]]
+name = "leandb"
+root = "Main"

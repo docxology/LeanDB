@@ -116,7 +116,7 @@ Exit test: tickets `Status`/`Priority`/`Label` as closed enums; a
 `#guard_msgs` negative test showing that inserting into a closed world does
 not typecheck.
 
-## M4 — Pushdown as an optimization ✅ core (2026-08-23; equi-join & CASE pushdown deferred)
+## M4 — Pushdown as an optimization ✅ full (2026-08-24: PushPred tree, equi-join executor, or/not, match→CASE case-split)
 
 Only now, with differential tests ready on both sides:
 - `select` becomes an elaborator that *reflects* the elaborated `where'` term.
@@ -132,7 +132,7 @@ Exit test: differential — every query in the tickets base runs both through
 `select.spec` and through the emitter, results byte-equal; golden SQL tests
 for the pushed fragment.
 
-## M5 — Surface: derived CLI + schema output ✅ core (2026-08-23; type-derived query flags deferred)
+## M5 — Surface: derived CLI + schema output ✅ full (2026-08-24: query% type-derived args, CliArg/QueryOut)
 
 - `schema` command emits JSON *derived from the catalog* (walk the env
   extension → `Lean.Json`). Deleting a field changes the output with no other
@@ -142,6 +142,15 @@ for the pushed fragment.
   (`insert/get/update/delete` from JSON through smart constructors) per
   plan.md §4.1.
 - Exit codes and typed-error JSON per plan.md §4.5.
+
+## M6 — Post-plan block ✅ (2026-08-24)
+
+Migrations v1 (schema-as-data diff, additive auto-apply, rebuilds with
+CHECK-guarded world shrink, destructive gated behind a flag), the query
+log (reified plans included), serve (JSON-lines, persistent connection),
+three more example bases (crm, shop, gpus), and SQL import
+(`leandb import-sqlite`) generating typed bases from existing files with
+full not-carried reporting (examples/legacy).
 
 ## Deferred, deliberately (revisit only after M5)
 
