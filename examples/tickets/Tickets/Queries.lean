@@ -14,7 +14,7 @@ open LeanDb
 private def triage : SortBy (Stored Ticket) :=
   .andThen (.key (·.val.priority)) (.key (·.val.createdAt))
 
-private def isOpen (t : Stored Ticket) : Bool :=
+@[db] private def isOpen (t : Stored Ticket) : Bool :=
   !(t.val.status == Status.done)
 
 /-- Every ticket not yet done, in triage order. -/

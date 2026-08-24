@@ -87,6 +87,56 @@ private def testClosedEnum : IO Unit := do
     "status column carries its closed world"
   check (((Entity.spec Todo).ddl.splitOn "CHECK").length == 2) "DDL contains CHECK"
 
+/-! ## Plan reflection (M4: pushdown as fetch narrowing) -/
+
+private def agePlan : PlanFor (fun (a : Stored Author) => a.val.age ≥ 40) := by leandb_plan
+
+private def capturedPlan (n : Nat) : PlanFor (fun (a : Stored Author) => a.val.age ≥ n) := by
+  leandb_plan
+
+private def joinPlan : PlanFor (fun (r : Stored Book × Stored Author) =>
+    r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating == none) := by leandb_plan
+
+private def somePlan : PlanFor (fun (b : Stored Book) => b.val.rating == some 4.5) := by
+  leandb_plan
+
+private def enumPlan : PlanFor (fun (t : Stored Todo) => t.val.status == Status.done) := by
+  leandb_plan
+
+private structure Flag where on : Bool
+private def boolPlan : PlanFor (fun (f : Stored Flag) => f.val.on) := by leandb_plan
+
+private def opaquePred (a : Stored Author) : Bool := a.val.age % 2 == 0
+private def residualPlan : PlanFor opaquePred := by leandb_plan
+
+@[db] private def Author.isAdult (a : Author) : Bool := a.age ≥ 40
+private def dbFnPlan : PlanFor (fun (a : Stored Author) => a.val.isAdult) := by leandb_plan
+
+private def isNonePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isNone) := by leandb_plan
+private def isSomePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isSome) := by leandb_plan
+
+private def testPlans : IO Unit := do
+  check (agePlan.plan.pushed == #[(0, .cmp "age" .ge (.int 40))] && agePlan.plan.residual == 0)
+    s!"age plan fully pushed, got {repr agePlan.plan}"
+  check ((capturedPlan 41).plan.pushed == #[(0, .cmp "age" .ge (.int 41))])
+    s!"captured variable becomes a bound parameter, got {repr (capturedPlan 41).plan}"
+  check (joinPlan.plan.residual == 1) s!"equi-join conjunct stays residual, got {repr joinPlan.plan}"
+  check (joinPlan.plan.pushed == #[(1, .cmp "age" .ge (.int 40)), (0, .cmp "rating" .eq .null)])
+    s!"join plan pushes per-table conjuncts, got {repr joinPlan.plan}"
+  check (somePlan.plan.pushed == #[(0, .cmp "rating" .eq (.real 4.5))])
+    s!"some-literal pushes through Option codec, got {repr somePlan.plan}"
+  check (enumPlan.plan.pushed == #[(0, .cmp "status" .eq (.text "done"))])
+    s!"closed enum pushes as its name, got {repr enumPlan.plan}"
+  check (boolPlan.plan.pushed == #[(0, .cmp "on" .eq (.int 1))])
+    s!"bare Bool column pushes as = 1, got {repr boolPlan.plan}"
+  check (residualPlan.plan.pushed.isEmpty && residualPlan.plan.residual == 1)
+    "opaque predicate is fully residual"
+  check (dbFnPlan.plan.pushed == #[(0, .cmp "age" .ge (.int 40))] && dbFnPlan.plan.residual == 0)
+    s!"@[db] def unfolds into the pushable fragment, got {repr dbFnPlan.plan}"
+  check (isNonePlan.plan.pushed == #[(0, .isNull "rating")]
+      && isSomePlan.plan.pushed == #[(0, .isNotNull "rating")])
+    s!"Option.isNone/isSome push as IS NULL tests, got {repr isNonePlan.plan} / {repr isSomePlan.plan}"
+
 /-! ## End-to-end against SQLite -/
 
 private def dbPath : System.FilePath := ".lake" / "leandb_test.sqlite"
@@ -129,6 +179,14 @@ private def testEndToEnd : IO Unit := do
       (.key fun (b, _) => b.val.title)
     check' (byAuthor.map (fun (b, a) => ((b.val.title.take 5).toString, a.val.name))
       == #[("Notes", "Ada"), ("On Co", "Alan")]) "equi-join via Ref equality"
+    -- differential: the planned path must equal the unplanned reference
+    let key := fun (r : Stored Book × Stored Author) => (r.1.id.toInt64, r.2.id.toInt64)
+    let pred := fun (r : Stored Book × Stored Author) =>
+      r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating != none
+    let planned ← select [Book, Author] pred (.key fun (b, _) => b.val.title)
+    let unplanned ← selectUnplanned [Book, Author] pred (.key fun (b, _) => b.val.title)
+    check' (planned.map key == unplanned.map key && planned.size == 1)
+      "differential: planned select equals the reference"
     -- CAS update
     let alan' ← update alan { alan.val with age := 42 }
     check' (alan'.val.age == 42) "update applies"
@@ -184,6 +242,7 @@ def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
   testSortBy
+  testPlans
   testClosedEnum
   testEndToEnd
   testClosedEndToEnd

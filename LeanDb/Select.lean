@@ -39,24 +39,26 @@ def SortBy.ord : SortBy ρ → ρ → ρ → Ordering
   | .andThen s t, a, b => (s.ord a b).then (t.ord a b)
 
 /-- A place rows come from: the real database, or an in-memory fixture in
-    tests. Loading is by entity, never by string. -/
+    tests. Loading is by entity, never by string; the index says which
+    position in the `select` table list is being loaded, so a plan's
+    pushed conjuncts can narrow that table's fetch. -/
 structure Source (m : Type → Type) where
-  load : (α : Type) → [Entity α] → m (Array (Stored α))
+  load : (i : Nat) → (α : Type) → [Entity α] → m (Array (Stored α))
 
 /-- Typeclass computing, for a list of entity types, how to gather the
     cartesian product of their rows and how to read off row identities. -/
 class RowsOf (ts : List Type) where
-  gather : {m : Type → Type} → [Monad m] → Source m → m (Array (Rows ts))
+  gather : {m : Type → Type} → [Monad m] → (offset : Nat) → Source m → m (Array (Rows ts))
   ids : Rows ts → List Int64
 
 instance [Entity α] : RowsOf [α] where
-  gather src := src.load α
+  gather offset src := src.load offset α
   ids r := [r.id.toInt64]
 
 instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
-  gather src := do
-    let heads ← src.load α
-    let tails ← RowsOf.gather (ts := β :: ts) src
+  gather offset src := do
+    let heads ← src.load offset α
+    let tails ← RowsOf.gather (ts := β :: ts) (offset + 1) src
     return heads.flatMap fun h => tails.map fun t => (h, t)
   ids r := r.1.id.toInt64 :: RowsOf.ids (ts := β :: ts) r.2
 
@@ -72,7 +74,7 @@ private def compareIds : List Int64 → List Int64 → Ordering
 def selectSpec [Monad m] (ts : List Type) [RowsOf ts] (src : Source m)
     (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts) := .preserve) :
     m (Array (Rows ts)) := do
-  let rows ← RowsOf.gather (ts := ts) src
+  let rows ← RowsOf.gather (ts := ts) 0 src
   let rows := rows.filter where'
   return rows.qsort fun a b =>
     ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT

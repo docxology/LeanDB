@@ -1,5 +1,6 @@
 import SQLite
 import LeanDb.Select
+import LeanDb.PlanElab
 
 namespace LeanDb
 
@@ -143,13 +144,48 @@ def delete [Entity α] (id : Id α) : DbM Unit := do
     db.changes
   if changed == 0 then throw (.notFound table id.toInt64)
 
-/-- The live database as a row `Source`. -/
-def dbSource : Source DbM := ⟨fun α _ => fetchAll α⟩
+/-- Rows of `α`'s table matching every pushed conjunct, in id order. -/
+def fetchFiltered (α : Type) [Entity α] (conds : Array PushCond) : DbM (Array (Stored α)) := do
+  if conds.isEmpty then return ← fetchAll α
+  let condSql := fun (c : PushCond) => match c with
+    | .cmp col op _ => s!"{quoteId col} {op.sql} ?"
+    | .isNull col => s!"{quoteId col} IS NULL"
+    | .isNotNull col => s!"{quoteId col} IS NOT NULL"
+  let whereSql := String.intercalate " AND " (conds.toList.map condSql)
+  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} WHERE {whereSql} ORDER BY id"
+  let rows ← sqlite fun db => do
+    let stmt ← db.prepare sql
+    let mut idx : Nat := 1
+    for c in conds do
+      if let .cmp _ _ v := c then
+        bindCol stmt (Int32.ofNat idx) v
+        idx := idx + 1
+    let mut out := #[]
+    repeat
+      if ← stmt.step then out := out.push (← readStored α stmt) else break
+    return out
+  rows.mapM liftExcept
 
-/-- The typed select. v1 executes the reference semantics directly
-    (`selectSpec`: product → filter → sort → id tiebreak); pushdown is a
-    later optimization that must stay observationally equal to this. -/
+/-- The live database as a row `Source`, ignoring plans. -/
+def dbSource : Source DbM := ⟨fun _ α _ => fetchAll α⟩
+
+/-- The live database narrowed by a plan's pushed conjuncts. -/
+def plannedSource (plan : SelectPlan) : Source DbM :=
+  ⟨fun i α _ => fetchFiltered α (plan.forTable i)⟩
+
+/-- The typed select. The trailing `plan` is reified from `where'` by the
+    `leandb_plan` tactic at each call site and narrows each table's fetch
+    via SQL `WHERE`; the lambda is still applied to what comes back, so the
+    reference semantics (`selectSpec` over an unfiltered source) define the
+    result and pushdown can only be an optimization. -/
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
+    (sortBy : SortBy (Rows ts) := .preserve)
+    (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
+  selectSpec ts (plannedSource plan.plan) where' sortBy
+
+/-- `select` with pushdown disabled — the executable reference, for
+    differential testing against the planned path. -/
+def selectUnplanned (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve) : DbM (Array (Rows ts)) :=
   selectSpec ts dbSource where' sortBy
 

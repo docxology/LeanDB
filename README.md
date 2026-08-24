@@ -66,17 +66,22 @@ Tests.lean           engine tests: codecs, deriving, e2e, closed worlds, negativ
 examples/tickets/    the first base: scalars, enums, entities, queries, seed, tests
 ```
 
-`select` v1 executes `selectSpec` — the four-line reference semantics
-(product → filter → sort → id tiebreak) — directly. SQL pushdown is a
-planned optimization underneath the same signature and must stay
-observationally equal to the spec (plan-v2 M4).
+`select`'s semantics are `selectSpec` — the four-line reference
+(product → filter → sort → id tiebreak). Under the same signature, a
+tactic-reified `SelectPlan` (M4) pushes the recognized fragment of each
+predicate — column/value comparisons, closed-enum equality, `Option` null
+tests, `@[db]`-tagged helpers unfolded — into per-table SQL `WHERE`
+clauses with captured variables as bound parameters; everything else stays
+residual and the lambda is always applied, so pushdown can narrow fetches
+but never change results (differential-tested). Set
+`set_option leandb.explain true` to see call-site plans.
 
 ## Status
 
 Tracked in [`plan-v2.md`](plan-v2.md). Done: M1 (typed core + deriving),
-M2 (the four verbs, e2e), M3 core (closed worlds: codec, CHECK, drift scan;
-mirror tables deferred). Next: M4 (reifying elaborator: pushdown of the
-conjunctive fragment, `#explain`), M5 (derived CLI/schema surface).
+M2 (the four verbs, e2e), M3 core (closed worlds), M4 core (reified
+plans + pushdown; equi-join and match→CASE pushdown deferred). Next: M5
+(derived CLI/schema surface).
 Deliberately deferred: migrations synthesis, SQL import, serve/MCP, query
 log — see plan-v2 "Deferred".
 

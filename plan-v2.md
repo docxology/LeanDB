@@ -116,7 +116,7 @@ Exit test: tickets `Status`/`Priority`/`Label` as closed enums; a
 `#guard_msgs` negative test showing that inserting into a closed world does
 not typecheck.
 
-## M4 — Pushdown as an optimization (the elaborator, minimal fragment)
+## M4 — Pushdown as an optimization ✅ core (2026-08-23; equi-join & CASE pushdown deferred)
 
 Only now, with differential tests ready on both sides:
 - `select` becomes an elaborator that *reflects* the elaborated `where'` term.
