@@ -1,83 +1,142 @@
-# crm CLI conformance transcript
+# crm CLI transcript
 
-Captured from `examples/crm` against a fresh `data/crm.sqlite`:
-
-```console
-$ lake build crm
-$ rm -rf data && mkdir -p data   # fresh instance; the CLI creates the db file on first open
-```
-
-`crm` below is `.lake/build/bin/crm`. Stderr lines are prefixed `stderr>`.
+Regenerated 2026-08-24 from a fresh `data/` dir. Query verbs are
+`query%`-derived from the query defs — names and arities come from code.
+Stdout/stderr merged; exit codes shown.
 
 ## schema — derived from the entity declarations
 
 ```console
 $ crm schema
 {"base":"crm","fingerprint":"5821729634224352920","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["smb","midMarket","enterprise"],"name":"segment","nullable":false,"type":"TEXT"}],"name":"company"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"email","nullable":false,"type":"TEXT"},{"name":"company","nullable":true,"references":"company","type":"INTEGER"}],"name":"person"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"enum":["email","call","meeting","chat"],"name":"channel","nullable":false,"type":"TEXT"},{"name":"note","nullable":false,"type":"TEXT"},{"name":"happenedAt","nullable":false,"type":"INTEGER"}],"name":"interaction"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"name":"title","nullable":false,"type":"TEXT"},{"enum":["open","waiting","won","lost"],"name":"status","nullable":false,"type":"TEXT"},{"name":"value","nullable":false,"type":"INTEGER"},{"name":"openedAt","nullable":false,"type":"INTEGER"}],"name":"ask"}]}
-exit code: 0
+(exit 0)
 ```
 
-## query seed — populate through the smart constructors
+## version before any instance exists
+
+```console
+$ crm version
+{"code_fingerprint":"5821729634224352920","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
+(exit 0)
+```
+
+## seed
 
 ```console
 $ crm query seed
 {"ok":true,"seeded":true}
-exit code: 0
+(exit 0)
 ```
 
-## query live — live asks, biggest value first
+## version — in sync after first open
 
 ```console
-$ crm query live
-{"count":6,"ok":true,"rows":[{"id":1,"openedAt":1696544000,"person":1,"status":"open","title":"Enterprise rollout","value":50000},{"id":6,"openedAt":1696976000,"person":4,"status":"waiting","title":"Platform migration","value":45000},{"id":7,"openedAt":1699827200,"person":5,"status":"open","title":"Compliance module","value":30000},{"id":3,"openedAt":1699136000,"person":2,"status":"waiting","title":"Security review","value":20000},{"id":8,"openedAt":1696112000,"person":6,"status":"open","title":"Consulting retainer","value":15000},{"id":4,"openedAt":1699568000,"person":3,"status":"open","title":"Starter plan","value":1200}]}
-exit code: 0
+$ crm version
+{"code_fingerprint":"5821729634224352920","in_sync":true,"instance_fingerprint":"5821729634224352920","ok":true,"schema_version":1}
+(exit 0)
 ```
 
-## insert with an INVALID enum value — closed world refuses (code=decode, exit 2)
+## zero-arg query
 
 ```console
-$ crm insert company '{"name":"Zenith Tools","segment":"galactic"}'
-stderr> {"code":"decode","message":"company.segment: \"galactic\" is not in the closed world","ok":false}
-exit code: 2
+$ crm query liveAsks
+{"ok":true,"result":[{"id":1,"openedAt":1696544000,"person":1,"status":"open","title":"Enterprise rollout","value":50000},{"id":6,"openedAt":1696976000,"person":4,"status":"waiting","title":"Platform migration","value":45000},{"id":7,"openedAt":1699827200,"person":5,"status":"open","title":"Compliance module","value":30000},{"id":3,"openedAt":1699136000,"person":2,"status":"waiting","title":"Security review","value":20000},{"id":8,"openedAt":1696112000,"person":6,"status":"open","title":"Consulting retainer","value":15000},{"id":4,"openedAt":1699568000,"person":3,"status":"open","title":"Starter plan","value":1200}]}
+(exit 0)
 ```
 
-## insert valid — a fourth company
+## typed-arg query
 
 ```console
-$ crm insert company '{"name":"Zenith Tools","segment":"smb"}'
-{"ok":true,"row":{"id":4,"name":"Zenith Tools","segment":"smb"}}
-exit code: 0
+$ crm query pipelineFor 1
+{"ok":true,"result":[[{"id":1,"openedAt":1696544000,"person":1,"status":"open","title":"Enterprise rollout","value":50000},{"company":1,"email":"ada@acme.example","id":1,"name":"Ada Lovelace"}],[{"id":3,"openedAt":1699136000,"person":2,"status":"waiting","title":"Security review","value":20000},{"company":1,"email":"grace@acme.example","id":2,"name":"Grace Hopper"}]]}
+(exit 0)
 ```
 
-## update partial — only the segment field
+## typed-arg query, bad argument (exit 2)
 
 ```console
-$ crm update company 4 '{"segment":"midMarket"}'
-{"ok":true,"row":{"id":4,"name":"Zenith Tools","segment":"midMarket"}}
-exit code: 0
+$ crm query pipelineFor x
+{"code":"decode","message":"cli.c: expected a natural number, got \"x\"","ok":false}
+(exit 2)
 ```
 
-## get missing id — not_found, exit 2
+## insert with an invalid closed-world value (exit 2)
 
 ```console
-$ crm get person 999
-stderr> {"code":"not_found","message":"person: no row with id 999","ok":false}
-exit code: 2
+$ crm insert ask {"person":1,"title":"T","status":"bogus","value":10,"openedAt":1700000000}
+{"code":"decode","message":"ask.status: \"bogus\" is not in the closed world","ok":false}
+(exit 2)
 ```
 
-## delete a referenced row — ON DELETE RESTRICT, exit 2
+## insert valid
+
+```console
+$ crm insert ask {"person":1,"title":"T","status":"open","value":10,"openedAt":1700000000}
+{"ok":true,"row":{"id":9,"openedAt":1700000000,"person":1,"status":"open","title":"T","value":10}}
+(exit 0)
+```
+
+## partial update (column-merge + CAS)
+
+```console
+$ crm update ask 1 {"status":"waiting"}
+{"ok":true,"row":{"id":1,"openedAt":1696544000,"person":1,"status":"waiting","title":"Enterprise rollout","value":50000}}
+(exit 0)
+```
+
+## rows with a typed equality filter
+
+```console
+$ crm rows ask --eq status=open --limit 3
+{"count":3,"ok":true,"rows":[{"id":4,"openedAt":1699568000,"person":3,"status":"open","title":"Starter plan","value":1200},{"id":7,"openedAt":1699827200,"person":5,"status":"open","title":"Compliance module","value":30000},{"id":8,"openedAt":1696112000,"person":6,"status":"open","title":"Consulting retainer","value":15000}]}
+(exit 0)
+```
+
+## rows filter on a nonexistent column (exit 2)
+
+```console
+$ crm rows ask --eq nope=1
+{"code":"decode","message":"ask.nope: no such column; columns: [person, title, status, value, openedAt]","ok":false}
+(exit 2)
+```
+
+## get missing id (exit 2)
+
+```console
+$ crm get ask 99999
+{"code":"not_found","message":"ask: no row with id 99999","ok":false}
+(exit 2)
+```
+
+## delete a referenced row (exit 2)
 
 ```console
 $ crm delete person 1
-stderr> {"code":"restricted","message":"person: row 1 is referenced by other rows","ok":false}
-exit code: 2
+{"code":"restricted","message":"person: row 1 is referenced by other rows","ok":false}
+(exit 2)
 ```
 
-## usage error — unknown command, exit 3
+## usage error (exit 3)
 
 ```console
-$ crm frobnicate everything
-stderr> {"code":"usage","message":"unrecognized command [frobnicate, everything]","ok":false}
-exit code: 3
+$ crm frobnicate
+{"code":"usage","message":"unrecognized command [frobnicate]","ok":false}
+(exit 3)
+```
+
+## query log — verbs, reified plans, outcomes
+
+```console
+$ crm log 3
+{"count":3,"entries":[{"at":1787584193,"detail":"person","error":"restricted","id":26,"ok":false,"rows":0,"verb":"delete"},{"at":1787584193,"detail":"ask","error":null,"id":25,"ok":true,"rows":1,"verb":"update"},{"at":1787584193,"detail":"ask","error":null,"id":24,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+(exit 0)
+```
+
+## migrate status
+
+```console
+$ crm migrate status
+{"applied":[],"fingerprint":"5821729634224352920","notes":["schema already up to date"],"ok":true}
+(exit 0)
 ```
 

@@ -77,7 +77,10 @@ structure CliTable where
   getJson : Int64 → DbM Json
   updateJson : Int64 → Json → DbM Json
   deleteRow : Int64 → DbM Json
-  rowsJson : Nat → DbM Json
+  /-- `rows` with conjunctive equality filters (plan.md §4.1: `--eq` and
+      limit are the CLI's whole filter language — anything more is a
+      typed query). -/
+  rowsWhere : List (String × String) → Nat → DbM Json
 
 private def okRow (j : Json) : Json := Json.mkObj [("ok", Json.bool true), ("row", j)]
 
@@ -99,8 +102,24 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
   deleteRow id := do
     delete (⟨id⟩ : Id α)
     return Json.mkObj [("ok", Json.bool true), ("deleted", Lean.toJson id.toInt)]
-  rowsJson limit := do
-    let rows ← fetchAll α
+  rowsWhere eqs limit := do
+    let spec := Entity.spec α
+    let mut pred : PushPred := .tt
+    for (col, v) in eqs do
+      match spec.columns.find? (·.name == col) with
+      | none =>
+          throw (.decode spec.name col
+            s!"no such column; columns: {spec.columns.toList.map (·.name)}")
+      | some c =>
+          let cv ← match c.sqlType with
+            | .integer =>
+                match v.toInt? with
+                | some i => pure (Col.int (Int64.ofInt i))
+                | none => throw (.decode spec.name col s!"expected an integer, got {String.quote v}")
+            | .text => pure (Col.text v)
+            | .real => throw (.decode spec.name col "REAL columns cannot be filtered with --eq")
+          pred := pred.andS (.cmp 0 col .eq cv)
+    let rows ← fetchFiltered α pred
     let rows := rows.toList.take limit
     return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.length),
       ("rows", Json.arr (rows.map (rowJson α)).toArray)]
@@ -124,7 +143,8 @@ private def usageJson (b : Base) : Json :=
       Json.str "get <table> <id>",
       Json.str "update <table> <id> <partial-json>",
       Json.str "delete <table> <id>",
-      Json.str "rows <table> [limit]",
+      Json.str "rows <table> [--eq col=value]... [--limit n]",
+      Json.str "version",
       Json.str "query <name> [args...]",
       Json.str "log [limit]",
       Json.str "migrate status | apply [--allow-destructive]",
@@ -149,6 +169,24 @@ private def logJson (limit : Nat) : DbM Json := do
   return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.size),
     ("entries", Json.arr rows)]
 
+/-- `rows` flags: `--eq col=value`… `--limit n` (or a bare trailing limit). -/
+private def parseRowFlags : List String → List (String × String) → Nat →
+    Except String (List (String × String) × Nat)
+  | [], eqs, limit => .ok (eqs.reverse, limit)
+  | "--eq" :: kv :: rest, eqs, limit =>
+      match kv.splitOn "=" with
+      | [k, v] => parseRowFlags rest ((k, v) :: eqs) limit
+      | _ => .error s!"--eq expects col=value, got {String.quote kv}"
+  | "--limit" :: n :: rest, eqs, _ =>
+      match n.toNat? with
+      | some limit => parseRowFlags rest eqs limit
+      | none => .error s!"--limit expects a number, got {String.quote n}"
+  | [n], eqs, _ =>
+      match n.toNat? with
+      | some limit => .ok (eqs.reverse, limit)
+      | none => .error s!"unrecognized rows argument {String.quote n}"
+  | arg :: _, _, _ => .error s!"unrecognized rows argument {String.quote arg}"
+
 /-- Resolve argv into one typed database action (or a usage error). -/
 private def command (b : Base) : List String → Except String (DbM Json)
   | ["insert", t, j] => do pure ((← table? b t).insertJson (← parseJson j))
@@ -160,10 +198,10 @@ private def command (b : Base) : List String → Except String (DbM Json)
   | ["log", n] => do
       let some limit := n.toNat? | throw s!"expected a limit, got {String.quote n}"
       pure (logJson limit)
-  | ["rows", t] => do pure ((← table? b t).rowsJson 100)
-  | ["rows", t, n] => do
-      let some limit := n.toNat? | throw s!"expected a limit, got {String.quote n}"
-      pure ((← table? b t).rowsJson limit)
+  | "rows" :: t :: flags => do
+      let tbl ← table? b t
+      let (eqs, limit) ← parseRowFlags flags [] 100
+      pure (tbl.rowsWhere eqs limit)
   | "query" :: name :: qargs =>
       match b.queries.find? (·.1 == name) with
       | some (_, q) => .ok (q qargs)
@@ -217,6 +255,20 @@ def run (b : Base) (args : List String) : IO UInt32 := do
       return 0
   | ["schema"] =>
       IO.println (schemaJson b.name b.specs).compress
+      return 0
+  | ["version"] =>
+      let codeFp := fingerprint b.specs
+      let (instFp, instVer) ← do
+        match ← instanceInfo b.dbPath with
+        | none => pure (Json.null, Json.null)
+        | some (fp, ver) =>
+            pure (fp.map Json.str |>.getD Json.null,
+              (ver.map fun v => Lean.toJson v).getD Json.null)
+      IO.println (Json.mkObj [("ok", Json.bool true),
+        ("code_fingerprint", Json.str codeFp),
+        ("instance_fingerprint", instFp),
+        ("schema_version", instVer),
+        ("in_sync", Json.bool (instFp == Json.str codeFp))]).compress
       return 0
   | "migrate" :: rest =>
       let apply ← match rest with

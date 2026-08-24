@@ -22,7 +22,7 @@ inductive Priority where
 
 /-- Hours a ticket of this priority may stay open before it breaches SLA.
     Total by `match` — a new priority cannot be added without answering. -/
-def Priority.slaHours : Priority → Nat
+@[db] def Priority.slaHours : Priority → Nat
   | .p0 => 4
   | .p1 => 24
   | .p2 => 72

@@ -256,17 +256,22 @@ def selectUnplanned (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
 private def metaDdl : String :=
   "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 
+def migrationsDdl : String :=
+  "CREATE TABLE IF NOT EXISTS _leandb_migrations (idx INTEGER PRIMARY KEY AUTOINCREMENT, \
+steps TEXT NOT NULL, fingerprint TEXT NOT NULL, \
+applied_at INTEGER NOT NULL DEFAULT (unixepoch()), ok INTEGER NOT NULL)"
+
 private def logDdl : String :=
   "CREATE TABLE IF NOT EXISTS _leandb_log (id INTEGER PRIMARY KEY AUTOINCREMENT, \
 at INTEGER NOT NULL DEFAULT (unixepoch()), verb TEXT NOT NULL, detail TEXT NOT NULL, \
 ok INTEGER NOT NULL, error TEXT, rows INTEGER NOT NULL)"
 
-private def readMeta (db : SQLite) (key : String) : IO (Option String) := do
+def readMeta (db : SQLite) (key : String) : IO (Option String) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = ?"
   stmt.bindText 1 key
   if ← stmt.step then some <$> stmt.columnText 0 else return none
 
-private def writeMeta (db : SQLite) (key value : String) : IO Unit := do
+def writeMeta (db : SQLite) (key value : String) : IO Unit := do
   let stmt ← db.prepare "INSERT OR REPLACE INTO _leandb_meta (key, value) VALUES (?, ?)"
   stmt.bindText 1 key
   stmt.bindText 2 value
@@ -281,6 +286,7 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
     db.exec "PRAGMA foreign_keys = ON"
     db.exec metaDdl
     db.exec logDdl
+    db.exec migrationsDdl
     let fp := fingerprint specs
     match ← readMeta db "schema_fingerprint" with
     | some stored =>
@@ -304,6 +310,8 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
             else break
     writeMeta db "schema_fingerprint" fp
     writeMeta db "schema_json" (specsToJson specs).compress
+    if (← readMeta db "schema_version").isNone then
+      writeMeta db "schema_version" "1"
     return .ok ⟨db⟩
   catch e =>
     return .error (.sqlite (toString e))

@@ -1,22 +1,19 @@
 import Crm
 
-/-! The crm CLI: `LeanDb.Cli.run` over this base's entities and queries.
-Tables, schema output, and row JSON are all derived from the entity
-declarations; only the query registrations below are base code. -/
+/-! The crm CLI: tables, schema, and row JSON derived from the entity
+declarations; queries `query%`-derived from the query defs' signatures —
+only the imperative `seed` verb is hand-written. -/
+
+open Lean (Json) in
+open LeanDb LeanDb.Cli Crm in
+instance : CliArg Timestamp := ⟨fun s =>
+  match s.toNat? with
+  | some n => .ok ⟨n⟩
+  | none => .error s!"expected an epoch-seconds timestamp, got {String.quote s}"⟩
 
 open Lean (Json) in
 open LeanDb LeanDb.Cli Crm in
 def main (args : List String) : IO UInt32 := do
-  let askRows := fun (rows : Array (Stored Ask)) =>
-    Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.size),
-      ("rows", Json.arr (rows.map (rowJson Ask)))]
-  let argNat := fun (args : List String) (name : String) => do
-    match args with
-    | [v] =>
-        match v.toNat? with
-        | some n => pure n
-        | none => throw (DbError.decode "cli" name s!"expected a natural number, got {v}")
-    | _ => throw (DbError.decode "cli" name "exactly one argument expected")
   Cli.run {
     name := "crm"
     dbPath := "data" / "crm.sqlite"
@@ -26,19 +23,8 @@ def main (args : List String) : IO UInt32 := do
       ("seed", fun _ => do
         seed
         return Json.mkObj [("ok", Json.bool true), ("seeded", Json.bool true)]),
-      ("live", fun _ => askRows <$> liveAsks),
-      ("pipeline", fun args => do
-        let cid ← argNat args "company-id"
-        let pipeline ← pipelineFor ⟨Int64.ofNat cid⟩
-        return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson pipeline.size),
-          ("rows", Json.arr (pipeline.map fun (a, p) =>
-            Json.mkObj [("ask", rowJson Ask a), ("person", rowJson Person p)]))]),
-      ("stale", fun args => do
-        let now ← argNat args "now-epoch-seconds"
-        askRows <$> staleAsks ⟨now⟩),
-      ("contacts", fun args => do
-        let cid ← argNat args "company-id"
-        let people ← contactsOf ⟨Int64.ofNat cid⟩
-        return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson people.size),
-          ("rows", Json.arr (people.map (rowJson Person)))])]
+      query% liveAsks,
+      query% pipelineFor,
+      query% staleAsks,
+      query% contactsOf]
   } args

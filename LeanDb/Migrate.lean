@@ -167,6 +167,7 @@ def migrate (path : System.FilePath) (specs : List TableSpec)
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
     db.exec "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    db.exec migrationsDdl
     let old? ← readStoredSchema db
     let old := old?.getD []
     match planMigration old specs with
@@ -193,6 +194,15 @@ def migrate (path : System.FilePath) (specs : List TableSpec)
             let t ← stmt.columnText 0
             throw <| IO.userError s!"foreign_key_check failed on table {t}"
           writeStoredSchema db specs
+          -- version bump + journal, atomic with the migration itself
+          let ver := (((← readMeta db "schema_version").bind (·.toNat?)).getD 0) + 1
+          writeMeta db "schema_version" (toString ver)
+          let j ← db.prepare
+            "INSERT INTO _leandb_migrations (steps, fingerprint, ok) VALUES (?, ?, 1)"
+          j.bindText 1 (Lean.Json.arr
+            (plan.steps.map (Lean.Json.str ·.describe)).toArray).compress
+          j.bindText 2 (fingerprint specs)
+          j.exec
           db.exec "COMMIT"
         catch e =>
           db.exec "ROLLBACK"
@@ -202,5 +212,17 @@ def migrate (path : System.FilePath) (specs : List TableSpec)
         return .ok (some plan, some ⟨plan.steps.map (·.describe), plan.notes, fingerprint specs⟩)
   catch e =>
     return .error (.sqlite (toString e))
+
+/-- What an instance says about itself, readable even when drifted:
+    (fingerprint, schema_version). `none` = file or meta absent. -/
+def instanceInfo (path : System.FilePath) : IO (Option (Option String × Option Nat)) := do
+  if !(← path.pathExists) then return none
+  try
+    let db ← SQLite.open path
+    let fp ← readMeta db "schema_fingerprint"
+    let ver ← readMeta db "schema_version"
+    return some (fp, ver.bind (·.toNat?))
+  catch _ =>
+    return some (none, none)
 
 end LeanDb
