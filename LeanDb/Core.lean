@@ -43,6 +43,8 @@ inductive DbError where
   | stale (table : String) (id : Int64)
   /-- Delete refused because other rows reference this one (FK RESTRICT). -/
   | restricted (table : String) (id : Int64)
+  /-- An insert/update points a `Ref` at a row that does not exist. -/
+  | missingRef (table : String)
   /-- A uniqueness constraint rejected the write. -/
   | duplicate (table detail : String)
   /-- The instance's schema fingerprint does not match the code's. -/
@@ -61,6 +63,7 @@ def DbError.code : DbError → String
   | .notFound .. => "not_found"
   | .stale .. => "stale"
   | .restricted .. => "restricted"
+  | .missingRef .. => "missing_ref"
   | .duplicate .. => "duplicate"
   | .schemaMismatch .. => "schema_mismatch"
   | .enumDrift .. => "enum_drift"
@@ -72,6 +75,7 @@ def DbError.message : DbError → String
   | .notFound table id => s!"{table}: no row with id {id}"
   | .stale table id => s!"{table}: row {id} changed since it was read"
   | .restricted table id => s!"{table}: row {id} is referenced by other rows"
+  | .missingRef table => s!"{table}: a referenced row does not exist"
   | .duplicate table detail => s!"{table}: {detail}"
   | .schemaMismatch expected actual =>
       s!"schema fingerprint mismatch: code has {expected}, instance has {actual}"
@@ -194,6 +198,10 @@ instance [ColCodec α] : ColCodec (Option α) where
     insert into or delete from; changing the vocabulary is a code change. -/
 class ClosedEnum (α : Type) where
   variants : Array String
+  /-- Every value of the closed world, in declaration order — quantify
+      over the vocabulary (consistency checks, listings) without leaving
+      the total-function discipline. -/
+  all : Array α
   encodeName : α → String
   decodeName : String → Option α
 

@@ -43,6 +43,9 @@ inductive PushPred where
   | cmp (table : Nat) (col : String) (op : PushOp) (v : Col)
   /-- column-vs-column; across distinct tables this is a join condition. -/
   | cmp2 (t1 : Nat) (c1 : String) (op : PushOp) (t2 : Nat) (c2 : String)
+  /-- value-vs-value: arises when a closed-world case split reduces a
+      conjunct to a constant compared against a captured parameter. -/
+  | cmpVV (a : Col) (op : PushOp) (b : Col)
   | isNull (table : Nat) (col : String)
   | isNotNull (table : Nat) (col : String)
   | and (a b : PushPred)
@@ -70,6 +73,7 @@ def neg : PushPred → PushPred
   | .tt => .ff | .ff => .tt
   | .cmp t c op v => .cmp t c op.negate v
   | .cmp2 t1 c1 op t2 c2 => .cmp2 t1 c1 op.negate t2 c2
+  | .cmpVV a op b => .cmpVV a op.negate b
   | .isNull t c => .isNotNull t c
   | .isNotNull t c => .isNull t c
   | .and a b => .or a.neg b.neg
@@ -80,6 +84,7 @@ def tables : PushPred → List Nat
   | .tt | .ff => []
   | .cmp t .. | .isNull t .. | .isNotNull t .. => [t]
   | .cmp2 t1 _ _ t2 _ => [t1, t2]
+  | .cmpVV .. => []
   | .and a b | .or a b => (a.tables ++ b.tables).eraseDups
 
 /-- Does the predicate relate two distinct tables? -/
@@ -110,6 +115,7 @@ def render (alias? : Bool) : PushPred → String × Array Col
   | .cmp2 t1 c1 op t2 c2 =>
       -- col/col comparison: `IS`/`IS NOT` are valid SQLite binary operators
       (s!"{col alias? t1 c1} {op.sql} {col alias? t2 c2}", #[])
+  | .cmpVV a op b => (s!"? {op.sql} ?", #[a, b])
   | .isNull t c => (s!"{col alias? t c} IS NULL", #[])
   | .isNotNull t c => (s!"{col alias? t c} IS NOT NULL", #[])
   | .and a b =>

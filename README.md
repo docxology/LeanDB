@@ -232,7 +232,7 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
 
 Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:
-`decode`, `not_found`, `stale`, `restricted`, `duplicate`, `enum_drift`,
+`decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `enum_drift`,
 `migrate`, `sqlite`) · `3` usage · `4` schema/version mismatch.
 
 ## Queries are Lean

@@ -29,11 +29,13 @@ private def sqlite (act : SQLite → IO α) : DbM α :=
   sqliteWith (fun e => .sqlite (toString e)) act
 
 /-- SQLite reports every constraint violation as primary code 19; the
-    message distinguishes the kinds. -/
-private def constraintError (table : String) (id : Int64) (e : IO.Error) : DbError :=
+    message distinguishes the kinds — but an FK failure means different
+    things per verb (dangling `Ref` on insert/update, referenced-row on
+    delete), so the caller says what it means via `fkError`. -/
+private def constraintError (table : String) (fkError : DbError) (e : IO.Error) : DbError :=
   match e with
   | .otherError 19 details =>
-      if details.startsWith "FOREIGN KEY" then .restricted table id
+      if details.startsWith "FOREIGN KEY" then fkError
       else if details.startsWith "UNIQUE" then .duplicate table details
       else .sqlite s!"constraint: {details}"
   | e => .sqlite (toString e)
@@ -115,7 +117,7 @@ def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert
   let spec := Entity.spec α
   let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
   let sql := s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
-  sqliteWith (constraintError spec.name 0) fun db => do
+  sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 (Entity.encode a)
     stmt.exec
@@ -153,7 +155,7 @@ def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog
   let pins := String.intercalate " AND " (spec.columns.toList.map (s!"{quoteId ·.name} IS ?"))
   let sql := s!"UPDATE {quoteId spec.name} SET {sets} WHERE id = ? AND {pins}"
   let n := spec.columns.size
-  let changed ← sqliteWith (constraintError spec.name old.id.toInt64) fun db => do
+  let changed ← sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 (Entity.encode new)
     stmt.bindInt64 (Int32.ofNat (n + 1)) old.id.toInt64
@@ -170,7 +172,7 @@ def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog
     `.restricted` (FK RESTRICT) — destruction is loud. -/
 def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.tableName α) (fun _ => 1) do
   let table := Entity.tableName α
-  let changed ← sqliteWith (constraintError table id.toInt64) fun db => do
+  let changed ← sqliteWith (constraintError table (.restricted table id.toInt64)) fun db => do
     let stmt ← db.prepare s!"DELETE FROM {quoteId table} WHERE id = ?"
     stmt.bindInt64 1 id.toInt64
     stmt.exec

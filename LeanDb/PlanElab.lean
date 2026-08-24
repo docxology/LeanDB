@@ -113,6 +113,9 @@ private def mkCmp (t : Nat) (c : String) (op : PushOp) (v : Expr) : MetaM Expr :
 private def mkCmp2 (a : Nat × String) (op : PushOp) (b : Nat × String) : MetaM Expr :=
   mkAppM ``PushPred.cmp2 #[mkNatLit a.1, mkStrLit a.2, mkOp op, mkNatLit b.1, mkStrLit b.2]
 
+private def mkCmpVV (a : Expr) (op : PushOp) (b : Expr) : MetaM Expr := do
+  mkAppM ``PushPred.cmpVV #[← mkVal a, mkOp op, ← mkVal b]
+
 private def mkAndS (a b : Expr) : MetaM Expr := mkAppM ``PushPred.andS #[a, b]
 private def mkOrS (a b : Expr) : MetaM Expr := mkAppM ``PushPred.orS #[a, b]
 private def mkNeg (a : Expr) : MetaM Expr := mkAppM ``PushPred.neg #[a]
@@ -129,7 +132,14 @@ private def cmpStrict (comps : Array Expr) (op : PushOp) (a b : Expr) :
   | some ca, some cb => some <$> mkCmp2 ca op cb
   | some ca, none => oneSided ca op b
   | none, some cb => oneSided cb (flipOp op) a
-  | none, none => return none
+  | none, none =>
+      -- neither side is a column: pushable as a value/value test when both
+      -- are closed (a case split leaves `constant OP captured-param`)
+      if isValue comps a && isValue comps b then
+        try return some (← mkCmpVV a op b)
+        catch _ => return none
+      else
+        return none
 where
   /-- col OP other: `other` is a value, or (for eq/ne) `some <col>`. -/
   oneSided (c : Nat × String) (op : PushOp) (other : Expr) : MetaM (Option Expr) := do
@@ -147,12 +157,14 @@ where
 private partial def strict (comps : Array Expr) (fuel : Nat) (e : Expr) :
     MetaM (Option Expr) := do
   let e ← whnfCore e
-  -- a conjunct that doesn't touch the row at all: evaluate it
+  -- a conjunct that doesn't touch the row at all: try to evaluate it (a
+  -- case-split branch may be a closed constant); when captured parameters
+  -- keep it undecided, fall through — the comparison dispatch below can
+  -- still push it as a value/value test
   if !usesComps comps e then
     let v ← withDefault (whnf e)
     if v.isConstOf ``Bool.true then return some ttE
     if v.isConstOf ``Bool.false then return some ffE
-    return none
   if e.isAppOfArity ``Bool.and 2 then
     let some a ← strict comps fuel (e.getArg! 0) | return none
     let some b ← strict comps fuel (e.getArg! 1) | return none

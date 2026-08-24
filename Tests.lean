@@ -106,6 +106,9 @@ private def testClosedEnum : IO Unit := do
   check ((fromCol (α := Status) (.text "cancelled")).isOk == false)
     "unknown variant must fail decode"
   check (ClosedEnum.variants Status == #["backlog", "inProgress", "done"]) "variant names"
+  check (ClosedEnum.all (α := Status) == #[.backlog, .inProgress, .done]) "all enumerates the world"
+  check ((ClosedEnum.all (α := Status)).all fun s => ClosedEnum.decodeName (ClosedEnum.encodeName s) == some s)
+    "encode/decode total over the world"
   let cols := Entity.columns Todo
   check ((cols.getD 1 default).enum == some #["backlog", "inProgress", "done"])
     "status column carries its closed world"
@@ -155,6 +158,9 @@ private def matchPlan : PlanFor (fun (t : Stored Todo) =>
 private def weightPlan : PlanFor (fun (t : Stored Todo) => t.val.status.weight ≥ 1) := by
   leandb_plan
 
+private def weightCapturedPlan (n : Nat) : PlanFor (fun (t : Stored Todo) =>
+    t.val.status.weight ≥ n) := by leandb_plan
+
 private def checkPlan (p : PlanFor w) (pred : PushPred) (residual : Nat) (label : String) :
     IO Unit :=
   unless p.plan.pred == pred && p.plan.residual == residual do
@@ -184,6 +190,11 @@ private def testPlans : IO Unit := do
   checkPlan weightPlan
     (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
     0 "enum-table function case-splits, false branches drop"
+  checkPlan (weightCapturedPlan 1)
+    (.or (.or (.and (.cmp 0 "status" .eq (.text "backlog")) (.cmpVV (.int 0) .ge (.int 1)))
+              (.and (.cmp 0 "status" .eq (.text "inProgress")) (.cmpVV (.int 1) .ge (.int 1))))
+         (.and (.cmp 0 "status" .eq (.text "done")) (.cmpVV (.int 2) .ge (.int 1))))
+    0 "case split against a captured threshold pushes as value tests"
 
 /-! ## JSON, derived from the schema (M5) -/
 
@@ -270,6 +281,16 @@ private def testEndToEnd : IO Unit := do
     "stale" "CAS with stale snapshot"
   -- FK RESTRICT: alan is referenced by a book
   expectErr (← withDb dbPath schema do delete alan.id) "restricted" "delete referenced author"
+  -- dangling Ref: inserting/updating toward a nonexistent row is
+  -- missing_ref, not "referenced by other rows"
+  expectErr (← withDb dbPath schema do discard <| insert Book ⟨"Ghost", ⟨99999⟩, none⟩)
+    "missing_ref" "insert with dangling Ref"
+  expectErr (← withDb dbPath schema do
+      let books ← select [Book] (fun _ => true)
+      match books[0]? with
+      | some b => discard <| update b { b.val with author := ⟨99999⟩ }
+      | none => throw (.sqlite "no book to update"))
+    "missing_ref" "update to dangling Ref"
   -- delete of unreferenced row after removing its book, then notFound on re-delete
   let r ← withDb dbPath schema do
     let books ← select [Book] (fun b => b.val.author == ada.ref)

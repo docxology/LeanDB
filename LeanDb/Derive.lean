@@ -147,8 +147,10 @@ def deriveClosedEnum (declName : Name) : CommandElabM Bool := do
     let mut dec : Term ← `((none : Option $(mkCIdent declName)))
     for (ctor, n) in (indVal.ctors.zip names).reverse do
       dec ← `(if s == $(quote n) then some $(mkCIdent ctor) else $dec)
+    let ctorTerms : Array Term := (indVal.ctors.map fun c => (mkCIdent c : Term)).toArray
     `(instance : LeanDb.ClosedEnum $(mkCIdent declName) where
         variants := #[$variantTerms,*]
+        all := #[$ctorTerms,*]
         encodeName := $enc
         decodeName := fun s => $dec)
   elabCommand cmd
