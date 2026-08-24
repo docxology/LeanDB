@@ -1,0 +1,17 @@
+name = "pricewatch"
+defaultTargets = ["pricewatch_tests"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "PriceWatch"
+
+[[lean_exe]]
+name = "pricewatch"
+root = "Main"
+
+[[lean_exe]]
+name = "pricewatch_tests"
+root = "PriceWatchTests"
