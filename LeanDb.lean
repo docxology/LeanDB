@@ -6,4 +6,6 @@ import LeanDb.Plan
 import LeanDb.PlanElab
 import LeanDb.Db
 import LeanDb.Json
+import LeanDb.Migrate
 import LeanDb.Cli
+import LeanDb.CliQuery

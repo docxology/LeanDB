@@ -1,6 +1,7 @@
 import SQLite
 import LeanDb.Select
 import LeanDb.PlanElab
+import LeanDb.Json
 
 namespace LeanDb
 
@@ -70,6 +71,35 @@ private def readStored (α : Type) [Entity α] (stmt : SQLite.Stmt) :
 def DbM.ofExcept (r : Except DbError α) : DbM α :=
   fun _ => ExceptT.mk (pure r)
 
+/-- Append to `_leandb_log`. Best-effort: the log never fails an operation. -/
+private def logOp (verb detail : String) (ok : Bool) (error : Option String) (rows : Nat) :
+    DbM Unit := fun conn => ExceptT.mk do
+  try
+    let stmt ← conn.raw.prepare
+      "INSERT INTO _leandb_log (verb, detail, ok, error, rows) VALUES (?, ?, ?, ?, ?)"
+    stmt.bindText 1 verb
+    stmt.bindText 2 detail
+    stmt.bindInt64 3 (if ok then 1 else 0)
+    match error with
+    | some e => stmt.bindText 4 e
+    | none => stmt.bindNull 4
+    stmt.bindInt64 5 (Int64.ofNat rows)
+    stmt.exec
+    return .ok ()
+  catch _ => return .ok ()
+
+/-- Run an operation and log it: verb, detail, outcome, row count. The
+    query log is the audit trail and the agent's episodic memory
+    (plan.md §4.4) — on by default. -/
+private def withLog (verb detail : String) (count : α → Nat) (act : DbM α) : DbM α := do
+  match ← fun conn => ExceptT.mk (.ok <$> (act conn).run) with
+  | .ok a =>
+      logOp verb detail true none (count a)
+      return a
+  | .error e =>
+      logOp verb detail false (some e.code) 0
+      throw e
+
 private def liftExcept (r : Except DbError α) : DbM α := DbM.ofExcept r
 
 private def quoteId (s : String) : String := "\"" ++ s ++ "\""
@@ -81,7 +111,7 @@ private def placeholders (n : Nat) : String :=
   String.intercalate ", " (List.replicate n "?")
 
 /-- `INSERT` a value; returns it with its assigned identity. -/
-def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := do
+def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
   let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
   let sql := s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
@@ -117,7 +147,7 @@ def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
 /-- Compare-and-swap update: `SET` to `new` only where the row still equals
     `old`, id included. A lost race is a typed `.stale`, never a silent
     clobber. `IS` (not `=`) so `NULL` columns pin correctly. -/
-def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := do
+def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog "update" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
   let sets := String.intercalate ", " (spec.columns.toList.map (s!"{quoteId ·.name} = ?"))
   let pins := String.intercalate " AND " (spec.columns.toList.map (s!"{quoteId ·.name} IS ?"))
@@ -138,7 +168,7 @@ def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := do
 
 /-- Delete by typed identity. Rows referenced elsewhere refuse with
     `.restricted` (FK RESTRICT) — destruction is loud. -/
-def delete [Entity α] (id : Id α) : DbM Unit := do
+def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.tableName α) (fun _ => 1) do
   let table := Entity.tableName α
   let changed ← sqliteWith (constraintError table id.toInt64) fun db => do
     let stmt ← db.prepare s!"DELETE FROM {quoteId table} WHERE id = ?"
@@ -208,10 +238,12 @@ def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve)
     (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
-  if plan.plan.pred.hasJoin then
-    selectJoined ts plan.plan where' sortBy
-  else
-    selectSpec ts (plannedSource plan.plan) where' sortBy
+  let names := String.intercalate "×" ((RowsOf.specs ts).map (·.name))
+  withLog "select" s!"{names} | {plan.plan.describe}" (·.size) <|
+    if plan.plan.pred.hasJoin then
+      selectJoined ts plan.plan where' sortBy
+    else
+      selectSpec ts (plannedSource plan.plan) where' sortBy
 
 /-- `select` with pushdown disabled — the executable reference, for
     differential testing against the planned path. -/
@@ -223,6 +255,11 @@ def selectUnplanned (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
 
 private def metaDdl : String :=
   "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+
+private def logDdl : String :=
+  "CREATE TABLE IF NOT EXISTS _leandb_log (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+at INTEGER NOT NULL DEFAULT (unixepoch()), verb TEXT NOT NULL, detail TEXT NOT NULL, \
+ok INTEGER NOT NULL, error TEXT, rows INTEGER NOT NULL)"
 
 private def readMeta (db : SQLite) (key : String) : IO (Option String) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = ?"
@@ -243,6 +280,7 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
     db.exec metaDdl
+    db.exec logDdl
     let fp := fingerprint specs
     match ← readMeta db "schema_fingerprint" with
     | some stored =>
@@ -265,9 +303,31 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
                 return .error (.enumDrift spec.name c.name v)
             else break
     writeMeta db "schema_fingerprint" fp
+    writeMeta db "schema_json" (specsToJson specs).compress
     return .ok ⟨db⟩
   catch e =>
     return .error (.sqlite (toString e))
+
+/-- Recent query-log entries, newest first, as JSON rows. -/
+def readLog (limit : Nat) : DbM (Array Lean.Json) := sqlite fun db => do
+  let stmt ← db.prepare
+    "SELECT id, at, verb, detail, ok, error, rows FROM _leandb_log ORDER BY id DESC LIMIT ?"
+  stmt.bindInt64 1 (Int64.ofNat limit)
+  let mut out := #[]
+  repeat
+    if ← stmt.step then
+      let err ← (do if (← stmt.columnType 5) == .null then pure Lean.Json.null
+                    else Lean.Json.str <$> stmt.columnText 5)
+      out := out.push <| Lean.Json.mkObj [
+        ("id", Lean.toJson (← stmt.columnInt64 0).toInt),
+        ("at", Lean.toJson (← stmt.columnInt64 1).toInt),
+        ("verb", Lean.Json.str (← stmt.columnText 2)),
+        ("detail", Lean.Json.str (← stmt.columnText 3)),
+        ("ok", Lean.Json.bool ((← stmt.columnInt64 4) == 1)),
+        ("error", err),
+        ("rows", Lean.toJson (← stmt.columnInt64 6).toInt)]
+    else break
+  return out
 
 /-- Open, run, and report — the whole lifecycle for scripts and tests. -/
 def withDb (path : System.FilePath) (specs : List TableSpec) (act : DbM α) :

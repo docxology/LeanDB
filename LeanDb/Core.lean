@@ -50,6 +50,8 @@ inductive DbError where
   /-- A stored value is outside its column's closed world — the vocabulary
       moved without a migration. -/
   | enumDrift (table column value : String)
+  /-- A migration was refused or failed; the message says why. -/
+  | migrate (message : String)
   /-- Raw SQLite error that no typed constructor claims. -/
   | sqlite (message : String)
   deriving Repr
@@ -62,6 +64,7 @@ def DbError.code : DbError → String
   | .duplicate .. => "duplicate"
   | .schemaMismatch .. => "schema_mismatch"
   | .enumDrift .. => "enum_drift"
+  | .migrate .. => "migrate"
   | .sqlite .. => "sqlite"
 
 def DbError.message : DbError → String
@@ -74,6 +77,7 @@ def DbError.message : DbError → String
       s!"schema fingerprint mismatch: code has {expected}, instance has {actual}"
   | .enumDrift table column value =>
       s!"{table}.{column}: stored value {String.quote value} is not in the closed world"
+  | .migrate msg => msg
   | .sqlite msg => msg
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
@@ -81,9 +85,11 @@ instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
 /-- Typed row identity: `Id User` and `Id Ticket` are distinct types. -/
 structure Id (α : Type) where
   toInt64 : Int64
-  deriving DecidableEq, Repr, Ord, Hashable
+  deriving DecidableEq, Repr, Hashable
 
 instance : BEq (Id α) := ⟨fun a b => a.toInt64 == b.toInt64⟩
+-- manual: the derived instance would demand `Ord α` for a phantom parameter
+instance : Ord (Id α) := ⟨fun a b => compare a.toInt64 b.toInt64⟩
 
 /-- A foreign reference to a row of `α`. Definitionally an `Id α`, so a
     `Ref` field compares directly against a fetched row's id. -/

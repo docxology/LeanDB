@@ -24,6 +24,10 @@ def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
   | Json.null =>
       if spec.nullable then .ok .null
       else .error s!"{spec.name}: null not allowed"
+  | Json.bool b =>
+      -- Bool columns store as INTEGER 0/1; accept JSON booleans for them
+      if spec.sqlType == .integer then .ok (.int (if b then 1 else 0))
+      else .error s!"{spec.name}: boolean not allowed for a {spec.sqlType.render} column"
   | _ =>
       match spec.sqlType with
       | .integer => do
@@ -48,6 +52,35 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
 def TableSpec.toJson (t : TableSpec) : Json :=
   Json.mkObj [("name", Json.str t.name),
     ("columns", Json.arr (t.columns.map (·.toJson)))]
+
+def SqlType.fromJson? (j : Json) : Except String SqlType := do
+  match ← j.getStr? with
+  | "INTEGER" => return .integer
+  | "TEXT" => return .text
+  | "REAL" => return .real
+  | s => throw s!"unknown SQL type {s}"
+
+def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
+  let name ← j.getObjVal? "name" >>= (·.getStr?)
+  let sqlType ← SqlType.fromJson? (← j.getObjVal? "type")
+  let nullable ← j.getObjVal? "nullable" >>= (·.getBool?)
+  let fkTable := (j.getObjVal? "references").toOption.bind (·.getStr?.toOption)
+  let enum := (j.getObjVal? "enum").toOption.bind fun a =>
+    (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
+  return { name, sqlType, nullable, fkTable, enum }
+
+def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
+  let name ← j.getObjVal? "name" >>= (·.getStr?)
+  let cols ← j.getObjVal? "columns" >>= (·.getArr?)
+  return ⟨name, ← cols.mapM ColumnSpec.fromJson?⟩
+
+/-- Serialize/parse a whole schema — how an instance remembers the shape
+    it was last migrated to. -/
+def specsToJson (specs : List TableSpec) : Json :=
+  Json.arr (specs.toArray.map (·.toJson))
+
+def specsFromJson? (j : Json) : Except String (List TableSpec) := do
+  return (← (← j.getArr?).mapM TableSpec.fromJson?).toList
 
 /-- The schema surface: derived from the specs, which are derived from the
     types. There is no other source. -/

@@ -287,6 +287,56 @@ private def testClosedEndToEnd : IO Unit := do
             s!"raw insert rejected by CHECK, got: {details}"
       | e => throw <| IO.userError s!"FAIL: expected constraint error 19, got: {e}"
 
+/-! ## Migrations (additive auto-apply, loud destruction, world rebuilds) -/
+
+private def migDbPath : System.FilePath := ".lake" / "leandb_test_mig.sqlite"
+
+private def col (name : String) (ty : SqlType) (nullable : Bool := false)
+    (enum : Option (Array String) := none) : ColumnSpec :=
+  { name, sqlType := ty, nullable, fkTable := none, enum }
+
+private def testMigrations : IO Unit := do
+  if ← migDbPath.pathExists then IO.FS.removeFile migDbPath
+  let v1 : TableSpec := ⟨"author", #[col "name" .text]⟩
+  let v2 : TableSpec := ⟨"author", #[col "name" .text, col "nick" .text (nullable := true)]⟩
+  let vBad : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer]⟩
+  -- create at v1 and put a row in
+  discard <| expectOk (← withDb migDbPath [v1] (pure ())) "create at v1"
+  let db ← SQLite.open migDbPath
+  db.exec "INSERT INTO author (name) VALUES ('Ada')"
+  -- additive migration applies
+  let r ← migrate migDbPath [v2] (apply := true)
+  let (_, report?) ← expectOk r "additive migrate"
+  check ((report?.map (·.applied)).getD [] == ["add column \"author\".\"nick\""])
+    "add-column step applied"
+  discard <| expectOk (← withDb migDbPath [v2] (pure ())) "open at v2 after migrate"
+  -- NOT NULL addition is refused with guidance
+  expectErr (← migrate migDbPath [vBad] (apply := true)) "migrate" "NOT NULL column refused"
+  -- destructive requires the flag
+  expectErr (← migrate migDbPath [v1] (apply := true)) "migrate" "destructive needs flag"
+  discard <| expectOk (← migrate migDbPath [v1] (apply := true) (allowDestructive := true))
+    "destructive with flag"
+  -- closed-world rebuild: grow, then a shrink that data refuses
+  if ← migDbPath.pathExists then IO.FS.removeFile migDbPath
+  let small := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b"])]⟩
+  let grown : TableSpec :=
+    ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b", "c"])]⟩
+  let shrunk : TableSpec := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a"])]⟩
+  discard <| expectOk (← withDb migDbPath [small] (pure ())) "create small world"
+  let db2 ← SQLite.open migDbPath
+  db2.exec "INSERT INTO todo (title, status) VALUES ('x', 'b')"
+  let (_, rep) ← expectOk (← migrate migDbPath [grown] (apply := true)) "grow world"
+  check (((rep.map (·.applied)).getD []).any (·.startsWith "rebuild")) "grow is a rebuild"
+  let db3 ← SQLite.open migDbPath
+  db3.exec "INSERT INTO todo (title, status) VALUES ('y', 'c')"   -- new CHECK admits 'c'
+  -- shrink to just 'a': rows say 'b'/'c' → CHECK fails during copy → rolled back
+  expectErr (← migrate migDbPath [shrunk] (apply := true)) "migrate"
+    "world shrink refused by nonconforming data"
+  let db4 ← SQLite.open migDbPath
+  let stmt ← db4.prepare "SELECT count(*) FROM todo"
+  discard <| stmt.step
+  check ((← stmt.columnInt64 0) == 2) "rollback kept the data"
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -296,5 +346,6 @@ def main : IO UInt32 := do
   testJson
   testEndToEnd
   testClosedEndToEnd
+  testMigrations
   IO.println "all engine tests passed"
   return 0

@@ -24,23 +24,29 @@ instance [Entity β] : RefTarget (Id β) := ⟨some (Entity.tableName β)⟩
 def Entity.spec (α : Type) [Entity α] : TableSpec :=
   ⟨Entity.tableName α, Entity.columns α⟩
 
+/-- One column's DDL fragment (shared by CREATE TABLE and ALTER ADD). -/
+def ColumnSpec.ddlFragment (c : ColumnSpec) : String :=
+  let base := s!"\"{c.name}\" {c.sqlType.render}"
+  let base := if c.nullable then base else base ++ " NOT NULL"
+  let base := match c.enum with
+    | some vs =>
+        let names := String.intercalate ", " (vs.toList.map fun v => s!"'{v}'")
+        base ++ s!" CHECK (\"{c.name}\" IN ({names}))"
+    | none => base
+  match c.fkTable with
+  | some fk => base ++ s!" REFERENCES \"{fk}\"(id) ON DELETE RESTRICT ON UPDATE RESTRICT"
+  | none => base
+
+/-- CREATE TABLE DDL under an explicit table name (migration rebuilds
+    create under a scratch name, then rename). -/
+def TableSpec.ddlNamed (t : TableSpec) (name : String) : String :=
+  let cols := t.columns.toList.map ColumnSpec.ddlFragment
+  let body := String.intercalate ", " ("id INTEGER PRIMARY KEY AUTOINCREMENT" :: cols)
+  s!"CREATE TABLE IF NOT EXISTS \"{name}\" ({body})"
+
 /-- Rendered DDL for one entity. Every table gets a rowid-backed `id`
     primary key; references RESTRICT on delete — destruction is loud. -/
-def TableSpec.ddl (t : TableSpec) : String :=
-  let col := fun (c : ColumnSpec) =>
-    let base := s!"\"{c.name}\" {c.sqlType.render}"
-    let base := if c.nullable then base else base ++ " NOT NULL"
-    let base := match c.enum with
-      | some vs =>
-          let names := String.intercalate ", " (vs.toList.map fun v => s!"'{v}'")
-          base ++ s!" CHECK (\"{c.name}\" IN ({names}))"
-      | none => base
-    match c.fkTable with
-    | some fk => base ++ s!" REFERENCES \"{fk}\"(id) ON DELETE RESTRICT ON UPDATE RESTRICT"
-    | none => base
-  let cols := t.columns.toList.map col
-  let body := String.intercalate ", " ("id INTEGER PRIMARY KEY AUTOINCREMENT" :: cols)
-  s!"CREATE TABLE IF NOT EXISTS \"{t.name}\" ({body})"
+def TableSpec.ddl (t : TableSpec) : String := t.ddlNamed t.name
 
 /-- Schema fingerprint: a hash of the rendered DDL of every table, in
     declaration order. Checked against `_leandb_meta` at open. -/
