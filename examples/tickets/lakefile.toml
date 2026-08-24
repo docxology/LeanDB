@@ -1,0 +1,14 @@
+name = "tickets"
+version = "0.1.0"
+defaultTargets = ["tickets_tests"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "Tickets"
+
+[[lean_exe]]
+name = "tickets_tests"
+root = "TicketsTests"

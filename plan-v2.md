@@ -48,7 +48,7 @@ Keep: lakefile/toolchain scaffolding, the `leandb_tests` executable pattern.
 
 ---
 
-## M1 — Typed core + one entity round-trip (the new "hello world")
+## M1 — Typed core + one entity round-trip ✅ (2026-08-23)
 
 Engine (`LeanDb/`):
 - `Id α` (opaque row id, phantom-typed) and `Ref α` (foreign reference).
@@ -73,7 +73,7 @@ creates a fresh sqlite file, and property-tests
 `decode (encode row) = row` for generated rows, engine built with zero
 knowledge of either type.
 
-## M2 — The four verbs, dependently typed
+## M2 — The four verbs, dependently typed ✅ (2026-08-23)
 
 Per plan.md §8 / Architecture §8 signatures:
 
@@ -101,7 +101,7 @@ Exit test: the tickets base runs `myQueue`/`openByPriority`-shaped queries
 end-to-end against a real sqlite file; CAS conflict test; delete-restricted
 test (`delete` on a referenced `User` → typed `.restricted`, data intact).
 
-## M3 — Closed worlds
+## M3 — Closed worlds ✅ core (2026-08-23; mirror tables + EnumSet deferred)
 
 - `deriving LeanDb.Closed` for payload-free inductives: stored as TEXT (or
   INT ordinal) with a CHECK constraint, mirrored into a seeded read-only
