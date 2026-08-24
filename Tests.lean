@@ -83,17 +83,23 @@ structure Draft where
   title : String
   status : Status := .backlog
   score : Nat := 10
+  note : Option Nat := some 5
   deriving Repr, LeanDb.Entity
 
 private def testDefaults : IO Unit := do
-  check (Entity.defaults Draft == #[none, some (.text "backlog"), some (.int 10)])
-    s!"defaults reified from the structure, got {repr (Entity.defaults Draft)}"
-  match Lean.Json.parse "{\"title\":\"t\"}" with
-  | .error e => throw <| IO.userError s!"FAIL: {e}"
-  | .ok j =>
-      match rowOfJson Draft j with
-      | .ok d => check (d.status == .backlog && d.score == 10) "omitted fields take defaults"
-      | .error e => throw <| IO.userError s!"FAIL: defaults not applied: {e}"
+  let cols := Entity.columns Draft
+  check (cols.map (·.dflt) == #[none, some (.text "backlog"), some (.int 10), some (.int 5)])
+    s!"defaults reified into the column specs, got {repr (cols.map (·.dflt))}"
+  let ddl := (Entity.spec Draft).ddl
+  check (((ddl.splitOn "DEFAULT 'backlog'").length == 2) && ((ddl.splitOn "DEFAULT 10").length == 2))
+    s!"DDL carries DEFAULT clauses, got {ddl}"
+  let d1 := (Lean.Json.parse "{\"title\":\"t\"}").toOption.bind
+    fun j => (rowOfJson Draft j).toOption
+  check (d1.map (fun d => d.status == .backlog && d.score == 10 && d.note == some 5) == some true)
+    "omitted fields take defaults"
+  let d2 := (Lean.Json.parse "{\"title\":\"t\",\"note\":null}").toOption.bind
+    fun j => (rowOfJson Draft j).toOption
+  check (d2.map (·.note == none) == some true) "explicit null beats a default"
 
 private def testClosedEnum : IO Unit := do
   check (roundtrip Status.inProgress && roundtrip Status.done) "closed enum roundtrip"
@@ -310,8 +316,8 @@ private def testClosedEndToEnd : IO Unit := do
 private def migDbPath : System.FilePath := ".lake" / "leandb_test_mig.sqlite"
 
 private def col (name : String) (ty : SqlType) (nullable : Bool := false)
-    (enum : Option (Array String) := none) : ColumnSpec :=
-  { name, sqlType := ty, nullable, fkTable := none, enum }
+    (enum : Option (Array String) := none) (dflt : Option Col := none) : ColumnSpec :=
+  { name, sqlType := ty, nullable, fkTable := none, enum, dflt }
 
 private def testMigrations : IO Unit := do
   if ← migDbPath.pathExists then IO.FS.removeFile migDbPath
@@ -330,6 +336,15 @@ private def testMigrations : IO Unit := do
   discard <| expectOk (← withDb migDbPath [v2] (pure ())) "open at v2 after migrate"
   -- NOT NULL addition is refused with guidance
   expectErr (← migrate migDbPath [vBad] (apply := true)) "migrate" "NOT NULL column refused"
+  -- ...but a NOT NULL column WITH a default backfills existing rows
+  let vDef : TableSpec := ⟨"author",
+    #[col "name" .text, col "nick" .text (nullable := true),
+      col "score" .integer (dflt := some (.int 7))]⟩
+  discard <| expectOk (← migrate migDbPath [vDef] (apply := true)) "defaulted NOT NULL add"
+  let dbv ← SQLite.open migDbPath
+  let stv ← dbv.prepare "SELECT score FROM author WHERE name = 'Ada'"
+  discard <| stv.step
+  check ((← stv.columnInt64 0) == 7) "existing row took the declared default"
   -- destructive requires the flag
   expectErr (← migrate migDbPath [v1] (apply := true)) "migrate" "destructive needs flag"
   discard <| expectOk (← migrate migDbPath [v1] (apply := true) (allowDestructive := true))

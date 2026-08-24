@@ -13,9 +13,6 @@ single source of truth, so nothing here is ever written by hand.
 class Entity (α : Type) where
   tableName : String
   columns : Array ColumnSpec
-  /-- Per-column default values, reified from the structure's field
-      defaults; used when incoming JSON omits a field. -/
-  defaults : Array (Option Col) := #[]
   /-- Field values in declaration order, id excluded. -/
   encode : α → Array Col
   /-- Inverse of `encode` over honest data; typed failure otherwise. -/
@@ -27,10 +24,20 @@ instance [Entity β] : RefTarget (Id β) := ⟨some (Entity.tableName β)⟩
 def Entity.spec (α : Type) [Entity α] : TableSpec :=
   ⟨Entity.tableName α, Entity.columns α⟩
 
+/-- A column value as a SQL literal (for `DEFAULT` clauses). -/
+def Col.sqlLit : Col → String
+  | .int v => toString v
+  | .real v => toString v
+  | .text v => "'" ++ (v.replace "'" "''") ++ "'"
+  | .null => "NULL"
+
 /-- One column's DDL fragment (shared by CREATE TABLE and ALTER ADD). -/
 def ColumnSpec.ddlFragment (c : ColumnSpec) : String :=
   let base := s!"\"{c.name}\" {c.sqlType.render}"
   let base := if c.nullable then base else base ++ " NOT NULL"
+  let base := match c.dflt with
+    | some v => base ++ s!" DEFAULT {v.sqlLit}"
+    | none => base
   let base := match c.enum with
     | some vs =>
         let names := String.intercalate ", " (vs.toList.map fun v => s!"'{v}'")

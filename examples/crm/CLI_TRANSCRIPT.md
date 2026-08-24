@@ -8,7 +8,7 @@ Stdout/stderr merged; exit codes shown.
 
 ```console
 $ crm schema
-{"base":"crm","fingerprint":"5821729634224352920","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["smb","midMarket","enterprise"],"name":"segment","nullable":false,"type":"TEXT"}],"name":"company"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"email","nullable":false,"type":"TEXT"},{"name":"company","nullable":true,"references":"company","type":"INTEGER"}],"name":"person"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"enum":["email","call","meeting","chat"],"name":"channel","nullable":false,"type":"TEXT"},{"name":"note","nullable":false,"type":"TEXT"},{"name":"happenedAt","nullable":false,"type":"INTEGER"}],"name":"interaction"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"name":"title","nullable":false,"type":"TEXT"},{"enum":["open","waiting","won","lost"],"name":"status","nullable":false,"type":"TEXT"},{"name":"value","nullable":false,"type":"INTEGER"},{"name":"openedAt","nullable":false,"type":"INTEGER"}],"name":"ask"}]}
+{"base":"crm","fingerprint":"15822784086805850012","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["smb","midMarket","enterprise"],"name":"segment","nullable":false,"type":"TEXT"}],"name":"company"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"email","nullable":false,"type":"TEXT"},{"name":"company","nullable":true,"references":"company","type":"INTEGER"}],"name":"person"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"enum":["email","call","meeting","chat"],"name":"channel","nullable":false,"type":"TEXT"},{"name":"note","nullable":false,"type":"TEXT"},{"name":"happenedAt","nullable":false,"type":"INTEGER"}],"name":"interaction"},{"columns":[{"name":"person","nullable":false,"references":"person","type":"INTEGER"},{"name":"title","nullable":false,"type":"TEXT"},{"default":"open","enum":["open","waiting","won","lost"],"name":"status","nullable":false,"type":"TEXT"},{"name":"value","nullable":false,"type":"INTEGER"},{"name":"openedAt","nullable":false,"type":"INTEGER"}],"name":"ask"}]}
 (exit 0)
 ```
 
@@ -16,7 +16,7 @@ $ crm schema
 
 ```console
 $ crm version
-{"code_fingerprint":"5821729634224352920","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
+{"code_fingerprint":"15822784086805850012","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
 (exit 0)
 ```
 
@@ -32,7 +32,7 @@ $ crm query seed
 
 ```console
 $ crm version
-{"code_fingerprint":"5821729634224352920","in_sync":true,"instance_fingerprint":"5821729634224352920","ok":true,"schema_version":1}
+{"code_fingerprint":"15822784086805850012","in_sync":true,"instance_fingerprint":"15822784086805850012","ok":true,"schema_version":1}
 (exit 0)
 ```
 
@@ -68,10 +68,10 @@ $ crm insert ask {"person":1,"title":"T","status":"bogus","value":10,"openedAt":
 (exit 2)
 ```
 
-## insert valid
+## insert valid (declared defaults fill omitted fields)
 
 ```console
-$ crm insert ask {"person":1,"title":"T","status":"open","value":10,"openedAt":1700000000}
+$ crm insert ask {"person":1,"title":"T","value":10,"openedAt":1700000000}
 {"ok":true,"row":{"id":9,"openedAt":1700000000,"person":1,"status":"open","title":"T","value":10}}
 (exit 0)
 ```
@@ -92,11 +92,11 @@ $ crm rows ask --eq status=open --limit 3
 (exit 0)
 ```
 
-## rows filter on a nonexistent column (exit 2)
+## rows filter with an out-of-world value (exit 2)
 
 ```console
-$ crm rows ask --eq nope=1
-{"code":"decode","message":"ask.nope: no such column; columns: [person, title, status, value, openedAt]","ok":false}
+$ crm rows ask --eq status=bogus
+{"code":"decode","message":"ask.status: \"bogus\" is not in the closed world #[open, waiting, won, lost]","ok":false}
 (exit 2)
 ```
 
@@ -128,7 +128,7 @@ $ crm frobnicate
 
 ```console
 $ crm log 3
-{"count":3,"entries":[{"at":1787584193,"detail":"person","error":"restricted","id":26,"ok":false,"rows":0,"verb":"delete"},{"at":1787584193,"detail":"ask","error":null,"id":25,"ok":true,"rows":1,"verb":"update"},{"at":1787584193,"detail":"ask","error":null,"id":24,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1787598708,"detail":"person","error":"restricted","id":26,"ok":false,"rows":0,"verb":"delete"},{"at":1787598708,"detail":"ask","error":null,"id":25,"ok":true,"rows":1,"verb":"update"},{"at":1787598708,"detail":"ask","error":null,"id":24,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
 (exit 0)
 ```
 
@@ -136,7 +136,7 @@ $ crm log 3
 
 ```console
 $ crm migrate status
-{"applied":[],"fingerprint":"5821729634224352920","notes":["schema already up to date"],"ok":true}
+{"applied":[],"fingerprint":"15822784086805850012","notes":["schema already up to date"],"ok":true}
 (exit 0)
 ```
 

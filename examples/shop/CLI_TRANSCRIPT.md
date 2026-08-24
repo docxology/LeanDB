@@ -8,7 +8,7 @@ Stdout/stderr merged; exit codes shown.
 
 ```console
 $ shop schema
-{"base":"shop","fingerprint":"7959798319987259381","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"email","nullable":false,"type":"TEXT"}],"name":"customer"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"sku","nullable":false,"type":"TEXT"},{"enum":["electronics","grocery","apparel","toys"],"name":"category","nullable":false,"type":"TEXT"},{"name":"price","nullable":false,"type":"INTEGER"},{"name":"stock","nullable":false,"type":"INTEGER"}],"name":"product"},{"columns":[{"name":"customer","nullable":false,"references":"customer","type":"INTEGER"},{"enum":["cart","placed","paid","shipped","delivered","cancelled"],"name":"status","nullable":false,"type":"TEXT"},{"name":"placedAt","nullable":false,"type":"INTEGER"}],"name":"purchase"},{"columns":[{"name":"order","nullable":false,"references":"purchase","type":"INTEGER"},{"name":"product","nullable":false,"references":"product","type":"INTEGER"},{"name":"qty","nullable":false,"type":"INTEGER"},{"name":"unitPrice","nullable":false,"type":"INTEGER"}],"name":"line_item"}]}
+{"base":"shop","fingerprint":"5377838838812634913","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"email","nullable":false,"type":"TEXT"}],"name":"customer"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"name":"sku","nullable":false,"type":"TEXT"},{"enum":["electronics","grocery","apparel","toys"],"name":"category","nullable":false,"type":"TEXT"},{"name":"price","nullable":false,"type":"INTEGER"},{"name":"stock","nullable":false,"type":"INTEGER"}],"name":"product"},{"columns":[{"name":"customer","nullable":false,"references":"customer","type":"INTEGER"},{"default":"cart","enum":["cart","placed","paid","shipped","delivered","cancelled"],"name":"status","nullable":false,"type":"TEXT"},{"name":"placedAt","nullable":false,"type":"INTEGER"}],"name":"purchase"},{"columns":[{"name":"order","nullable":false,"references":"purchase","type":"INTEGER"},{"name":"product","nullable":false,"references":"product","type":"INTEGER"},{"name":"qty","nullable":false,"type":"INTEGER"},{"name":"unitPrice","nullable":false,"type":"INTEGER"}],"name":"line_item"}]}
 (exit 0)
 ```
 
@@ -16,7 +16,7 @@ $ shop schema
 
 ```console
 $ shop version
-{"code_fingerprint":"7959798319987259381","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
+{"code_fingerprint":"5377838838812634913","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
 (exit 0)
 ```
 
@@ -32,7 +32,7 @@ $ shop query seed
 
 ```console
 $ shop version
-{"code_fingerprint":"7959798319987259381","in_sync":true,"instance_fingerprint":"7959798319987259381","ok":true,"schema_version":1}
+{"code_fingerprint":"5377838838812634913","in_sync":true,"instance_fingerprint":"5377838838812634913","ok":true,"schema_version":1}
 (exit 0)
 ```
 
@@ -68,7 +68,7 @@ $ shop insert product {"name":"C","sku":"ELEC-C-1","category":"bogus","price":10
 (exit 2)
 ```
 
-## insert valid
+## insert valid (declared defaults fill omitted fields)
 
 ```console
 $ shop insert product {"name":"C","sku":"ELEC-C-1","category":"electronics","price":100,"stock":5}
@@ -92,11 +92,11 @@ $ shop rows purchase --eq status=placed --limit 3
 (exit 0)
 ```
 
-## rows filter on a nonexistent column (exit 2)
+## rows filter with an out-of-world value (exit 2)
 
 ```console
-$ shop rows purchase --eq nope=1
-{"code":"decode","message":"purchase.nope: no such column; columns: [customer, status, placedAt]","ok":false}
+$ shop rows purchase --eq status=bogus
+{"code":"decode","message":"purchase.status: \"bogus\" is not in the closed world #[cart, placed, paid, shipped, delivered, cancelled]","ok":false}
 (exit 2)
 ```
 
@@ -128,7 +128,7 @@ $ shop frobnicate
 
 ```console
 $ shop log 3
-{"count":3,"entries":[{"at":1787584194,"detail":"customer","error":"restricted","id":29,"ok":false,"rows":0,"verb":"delete"},{"at":1787584194,"detail":"product","error":null,"id":28,"ok":true,"rows":1,"verb":"update"},{"at":1787584194,"detail":"product","error":null,"id":27,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1787598709,"detail":"customer","error":"restricted","id":29,"ok":false,"rows":0,"verb":"delete"},{"at":1787598709,"detail":"product","error":null,"id":28,"ok":true,"rows":1,"verb":"update"},{"at":1787598709,"detail":"product","error":null,"id":27,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
 (exit 0)
 ```
 
@@ -136,7 +136,7 @@ $ shop log 3
 
 ```console
 $ shop migrate status
-{"applied":[],"fingerprint":"7959798319987259381","notes":["schema already up to date"],"ok":true}
+{"applied":[],"fingerprint":"5377838838812634913","notes":["schema already up to date"],"ok":true}
 (exit 0)
 ```
 

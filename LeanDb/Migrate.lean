@@ -87,10 +87,10 @@ def planMigration (old new : List TableSpec) : Except String MigPlan := do
           | some o => o != c
           | none => false
         for c in added do
-          unless c.nullable do
-            throw s!"table \"{spec.name}\": new column \"{c.name}\" is NOT NULL — \
-existing rows have no value for it. Make it `Option` (backfill-and-tighten later), \
-or migrate by hand."
+          unless c.nullable || c.dflt.isSome do
+            throw s!"table \"{spec.name}\": new column \"{c.name}\" is NOT NULL with no \
+default — existing rows have no value for it. Make it `Option`, or give it a \
+`:= default` (existing rows take the default), or migrate by hand."
         if changed.isEmpty then
           steps := steps ++ added.map (.addColumn spec.name ·)
             ++ dropped.map (.dropColumn spec.name ·.name)
@@ -103,8 +103,9 @@ or migrate by hand."
           unless dropped.isEmpty do
             notes := notes ++ [s!"rebuild of \"{spec.name}\" DROPS columns {dropped.map (·.name)}"]
           for c in added do
-            unless c.nullable do
-              throw s!"table \"{spec.name}\": new column \"{c.name}\" must be nullable (rebuild)"
+            unless c.nullable || c.dflt.isSome do
+              throw s!"table \"{spec.name}\": new column \"{c.name}\" must be nullable or \
+carry a default (rebuild)"
           steps := steps ++ [.rebuildTable spec copyCols]
   -- dropped tables
   for oldSpec in old do

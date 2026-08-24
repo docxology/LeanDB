@@ -82,6 +82,13 @@ def DbError.message : DbError → String
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
 
+/-- Process exit code for a failed command (plan.md §4.5): fingerprint
+    drift is 4, every other typed error is 2. Matching on the constructor,
+    not the code string — strings are diagnostics, never identity. -/
+def DbError.exitCode : DbError → UInt32
+  | .schemaMismatch .. => 4
+  | _ => 2
+
 /-- Typed row identity: `Id User` and `Id Ticket` are distinct types. -/
 structure Id (α : Type) where
   toInt64 : Int64
@@ -227,20 +234,26 @@ structure ColumnSpec where
   nullable : Bool
   fkTable : Option String
   enum : Option (Array String) := none
-  deriving Repr, DecidableEq, Inhabited
+  /-- Declared default, as an evaluated column value — emitted as a SQL
+      `DEFAULT`, used when incoming JSON omits the field, and what lets a
+      migration add a NOT NULL column to existing rows. -/
+  dflt : Option Col := none
+  deriving Repr, BEq, Inhabited
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
-def columnSpec (name : String) (α : Type) [ColCodec α] [RefTarget α] [ColEnum α] : ColumnSpec where
+def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
+    [ColCodec α] [RefTarget α] [ColEnum α] : ColumnSpec where
   name := name
   sqlType := ColCodec.sqlType α
   nullable := ColCodec.nullable α
   fkTable := RefTarget.target α
   enum := ColEnum.variants α
+  dflt := dflt
 
 structure TableSpec where
   name : String
   columns : Array ColumnSpec
-  deriving Repr, DecidableEq
+  deriving Repr, BEq
 
 /-- Decode one column, attaching table/field context to failures. -/
 def decodeField (table field : String) (α : Type) [ColCodec α] (c : Col) : Except DbError α :=

@@ -68,7 +68,7 @@ $ gpus insert offering {"provider":1,"chip":"h200","region":"eu","hourly":100,"a
 (exit 2)
 ```
 
-## insert valid
+## insert valid (declared defaults fill omitted fields)
 
 ```console
 $ gpus insert offering {"provider":1,"chip":"h100","region":"eu","hourly":100,"available":true}
@@ -92,11 +92,11 @@ $ gpus rows offering --eq chip=h100 --limit 3
 (exit 0)
 ```
 
-## rows filter on a nonexistent column (exit 2)
+## rows filter with an out-of-world value (exit 2)
 
 ```console
-$ gpus rows offering --eq nope=1
-{"code":"decode","message":"offering.nope: no such column; columns: [provider, chip, region, hourly, available]","ok":false}
+$ gpus rows offering --eq chip=bogus
+{"code":"decode","message":"offering.chip: \"bogus\" is not in the closed world #[h100, a100, l40s, rtx4090, rtx3090, mi300x, mi325x]","ok":false}
 (exit 2)
 ```
 
@@ -128,7 +128,7 @@ $ gpus frobnicate
 
 ```console
 $ gpus log 3
-{"count":3,"entries":[{"at":1787584196,"detail":"provider","error":"restricted","id":21,"ok":false,"rows":0,"verb":"delete"},{"at":1787584196,"detail":"offering","error":null,"id":20,"ok":true,"rows":1,"verb":"update"},{"at":1787584196,"detail":"offering","error":null,"id":19,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1787598710,"detail":"provider","error":"restricted","id":21,"ok":false,"rows":0,"verb":"delete"},{"at":1787598710,"detail":"offering","error":null,"id":20,"ok":true,"rows":1,"verb":"update"},{"at":1787598710,"detail":"offering","error":null,"id":19,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
 (exit 0)
 ```
 

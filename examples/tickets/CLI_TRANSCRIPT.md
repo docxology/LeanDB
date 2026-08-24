@@ -8,7 +8,7 @@ Stdout/stderr merged; exit codes shown.
 
 ```console
 $ tickets schema
-{"base":"tickets","fingerprint":"364500657974955029","ok":true,"tables":[{"columns":[{"name":"handle","nullable":false,"type":"TEXT"},{"name":"display","nullable":false,"type":"TEXT"}],"name":"user"},{"columns":[{"name":"title","nullable":false,"type":"TEXT"},{"name":"body","nullable":false,"type":"TEXT"},{"enum":["backlog","inProgress","blocked","inReview","done"],"name":"status","nullable":false,"type":"TEXT"},{"enum":["p0","p1","p2","p3"],"name":"priority","nullable":false,"type":"TEXT"},{"name":"reporter","nullable":false,"references":"user","type":"INTEGER"},{"name":"assignee","nullable":true,"references":"user","type":"INTEGER"},{"name":"estimate","nullable":true,"type":"INTEGER"},{"name":"createdAt","nullable":false,"type":"INTEGER"}],"name":"ticket"},{"columns":[{"name":"ticket","nullable":false,"references":"ticket","type":"INTEGER"},{"name":"author","nullable":false,"references":"user","type":"INTEGER"},{"name":"body","nullable":false,"type":"TEXT"},{"name":"at","nullable":false,"type":"INTEGER"}],"name":"comment"}]}
+{"base":"tickets","fingerprint":"14584463042647267630","ok":true,"tables":[{"columns":[{"name":"handle","nullable":false,"type":"TEXT"},{"name":"display","nullable":false,"type":"TEXT"}],"name":"user"},{"columns":[{"name":"title","nullable":false,"type":"TEXT"},{"name":"body","nullable":false,"type":"TEXT"},{"default":"backlog","enum":["backlog","inProgress","blocked","inReview","done"],"name":"status","nullable":false,"type":"TEXT"},{"default":"p2","enum":["p0","p1","p2","p3"],"name":"priority","nullable":false,"type":"TEXT"},{"name":"reporter","nullable":false,"references":"user","type":"INTEGER"},{"name":"assignee","nullable":true,"references":"user","type":"INTEGER"},{"name":"estimate","nullable":true,"type":"INTEGER"},{"name":"createdAt","nullable":false,"type":"INTEGER"}],"name":"ticket"},{"columns":[{"name":"ticket","nullable":false,"references":"ticket","type":"INTEGER"},{"name":"author","nullable":false,"references":"user","type":"INTEGER"},{"name":"body","nullable":false,"type":"TEXT"},{"name":"at","nullable":false,"type":"INTEGER"}],"name":"comment"}]}
 (exit 0)
 ```
 
@@ -16,7 +16,7 @@ $ tickets schema
 
 ```console
 $ tickets version
-{"code_fingerprint":"364500657974955029","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
+{"code_fingerprint":"14584463042647267630","in_sync":false,"instance_fingerprint":null,"ok":true,"schema_version":null}
 (exit 0)
 ```
 
@@ -32,7 +32,7 @@ $ tickets query seed
 
 ```console
 $ tickets version
-{"code_fingerprint":"364500657974955029","in_sync":true,"instance_fingerprint":"364500657974955029","ok":true,"schema_version":1}
+{"code_fingerprint":"14584463042647267630","in_sync":true,"instance_fingerprint":"14584463042647267630","ok":true,"schema_version":1}
 (exit 0)
 ```
 
@@ -68,10 +68,10 @@ $ tickets insert ticket {"title":"T","body":"b","status":"bogus","priority":"p1"
 (exit 2)
 ```
 
-## insert valid
+## insert valid (declared defaults fill omitted fields)
 
 ```console
-$ tickets insert ticket {"title":"T","body":"b","status":"backlog","priority":"p1","reporter":1,"createdAt":1700000000}
+$ tickets insert ticket {"title":"T","body":"b","priority":"p1","reporter":1,"createdAt":1700000000}
 {"ok":true,"row":{"assignee":null,"body":"b","createdAt":1700000000,"estimate":null,"id":9,"priority":"p1","reporter":1,"status":"backlog","title":"T"}}
 (exit 0)
 ```
@@ -92,11 +92,11 @@ $ tickets rows ticket --eq status=backlog --limit 3
 (exit 0)
 ```
 
-## rows filter on a nonexistent column (exit 2)
+## rows filter with an out-of-world value (exit 2)
 
 ```console
-$ tickets rows ticket --eq nope=1
-{"code":"decode","message":"ticket.nope: no such column; columns: [title, body, status, priority, reporter, assignee, estimate, createdAt]","ok":false}
+$ tickets rows ticket --eq status=bogus
+{"code":"decode","message":"ticket.status: \"bogus\" is not in the closed world #[backlog, inProgress, blocked, inReview, done]","ok":false}
 (exit 2)
 ```
 
@@ -128,7 +128,7 @@ $ tickets frobnicate
 
 ```console
 $ tickets log 3
-{"count":3,"entries":[{"at":1787584192,"detail":"user","error":"restricted","id":19,"ok":false,"rows":0,"verb":"delete"},{"at":1787584192,"detail":"ticket","error":null,"id":18,"ok":true,"rows":1,"verb":"update"},{"at":1787584192,"detail":"ticket","error":null,"id":17,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1787598707,"detail":"user","error":"restricted","id":19,"ok":false,"rows":0,"verb":"delete"},{"at":1787598707,"detail":"ticket","error":null,"id":18,"ok":true,"rows":1,"verb":"update"},{"at":1787598706,"detail":"ticket","error":null,"id":17,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
 (exit 0)
 ```
 
@@ -136,7 +136,7 @@ $ tickets log 3
 
 ```console
 $ tickets migrate status
-{"applied":[],"fingerprint":"364500657974955029","notes":["schema already up to date"],"ok":true}
+{"applied":[],"fingerprint":"14584463042647267630","notes":["schema already up to date"],"ok":true}
 (exit 0)
 ```
 

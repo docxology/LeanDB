@@ -145,7 +145,7 @@ structure Note where
   title  : Title
   body   : String
   status : Status := .draft
-  pinned : Option Bool                -- new column: must be Option (see below)
+  pinned : Option Bool                -- new column: Option, or give it a default
   ...
 ```
 
@@ -171,9 +171,10 @@ $ $notes version
 
 The rules, all loud:
 
-- **New columns must be `Option`** — existing rows need a value and LeanDB
-  refuses to invent one. (Backfill after, then tighten in a later
-  migration.) A `NOT NULL` addition is refused with that guidance.
+- **New columns must be `Option` or carry a `:= default`** — a declared
+  default backfills existing rows (and shows up in the DDL and the
+  `schema` output); without one, a `NOT NULL` addition is refused with
+  guidance rather than inventing a value.
 - **New tables** apply as plain `CREATE TABLE`.
 - **Changed column shapes** (a grown/renamed closed world, a type change)
   rebuild the table in place, copying surviving columns. **Shrinking a

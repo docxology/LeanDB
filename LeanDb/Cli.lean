@@ -8,7 +8,8 @@ namespace LeanDb.Cli
 
 A base gets a machine-first CLI by listing its entities and queries; every
 verb's behavior and JSON shape is derived from `Entity` instances. Exit
-codes per plan.md §4.5: 0 ok, 2 typed `DbError` (JSON on stderr), 3 usage.
+codes per plan.md §4.5: 0 ok, 2 typed `DbError` (JSON on stderr), 3 usage,
+4 schema/version mismatch (`DbError.exitCode`).
 The argv boundary is the one place strings are inherent; they are parsed
 into types immediately and everything past this module is typed.
 -/
@@ -111,6 +112,13 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
           throw (.decode spec.name col
             s!"no such column; columns: {spec.columns.toList.map (·.name)}")
       | some c =>
+          -- a closed-world column refuses unknown variants loudly — a
+          -- silent empty result is the exact failure mode LeanDB exists
+          -- to kill
+          if let some vs := c.enum then
+            unless vs.contains v do
+              throw (.decode spec.name col
+                s!"{String.quote v} is not in the closed world {vs}")
           let cv ← match c.sqlType with
             | .integer =>
                 match v.toInt? with
@@ -217,7 +225,7 @@ def serve (b : Base) : IO UInt32 := do
   match ← openDb b.dbPath b.specs with
   | .error e =>
       IO.eprintln e.toJson.compress
-      return 2
+      return e.exitCode
   | .ok conn =>
       let stdin ← IO.getStdin
       let out ← IO.getStdout
@@ -313,7 +321,6 @@ def run (b : Base) (args : List String) : IO UInt32 := do
               return 0
           | .error e =>
               IO.eprintln e.toJson.compress
-              -- plan.md §4.5: version/fingerprint mismatch is its own exit code
-              return (if e.code == "schema_mismatch" then 4 else 2)
+              return e.exitCode
 
 end LeanDb.Cli

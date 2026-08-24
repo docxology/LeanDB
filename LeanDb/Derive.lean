@@ -17,6 +17,28 @@ namespace LeanDb.Derive
 
 open Lean Elab Command Term Meta PrettyPrinter
 
+private unsafe def evalColUnsafe (e : Expr) : MetaM LeanDb.Col :=
+  evalExpr LeanDb.Col (mkConst ``LeanDb.Col) e
+
+/-- Evaluate a `Col`-valued closed expression at elaboration time. Used to
+    turn structure field defaults into literals with their definition-site
+    instances baked in (a delab/re-elaborate round trip can resolve scoped
+    instances differently, and referencing the `_default` constant from
+    compiled code trips an LCNF panic on this toolchain). -/
+@[implemented_by evalColUnsafe]
+private opaque evalCol (e : Expr) : MetaM LeanDb.Col
+
+/-- Quote an evaluated `Col` back into surface syntax. -/
+private def colLitStx (v : LeanDb.Col) : Elab.TermElabM Term :=
+  match v with
+  | .text s => `(LeanDb.Col.text $(quote s))
+  | .int i =>
+      let n : Nat := i.toInt.natAbs
+      if i.toInt < 0 then `(LeanDb.Col.int (-(Int64.ofNat $(quote n))))
+      else `(LeanDb.Col.int (Int64.ofNat $(quote n)))
+  | .real f => `(LeanDb.Col.real (Float.ofBits (UInt64.ofNat $(quote f.toBits.toNat))))
+  | .null => `(LeanDb.Col.null)
+
 /-- `"UserProfile"` → `"user_profile"`. -/
 def tableNameOf (declName : Name) : String :=
   let last := declName.getString!
@@ -45,7 +67,6 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
     let mut colSpecs : Array Term := #[]
     let mut encs : Array Term := #[]
     let mut fieldTys : Array Term := #[]
-    let mut dflts : Array Term := #[]
     for i in [0:fields.size] do
       let fname := fields[i]!
       let ftype ← inferType xs[i]!
@@ -53,26 +74,29 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
         throwError "deriving LeanDb.Entity: field '{fname}' of {declName} depends on an earlier field; proof/dependent fields are not supported yet"
       let tyStx ← delab ftype
       fieldTys := fieldTys.push tyStx
-      colSpecs := colSpecs.push
-        (← `(LeanDb.columnSpec $(quote fname.toString) $tyStx))
-      encs := encs.push
-        (← `(LeanDb.ColCodec.toCol ($(mkCIdent (declName ++ fname)) r)))
-      -- Reify `:= default` field values (non-dependent ones) for JSON
-      -- decode. The default's defining term is inlined — referencing the
-      -- `_default` constant in compiled code trips an LCNF boxing panic
-      -- on this toolchain (its inlining attributes interact badly with
-      -- closed-term extraction).
-      dflts := dflts.push (← do
+      -- Reify a `:= default` field value by EVALUATING it here, at
+      -- elaboration time, with its definition-site instances — then embed
+      -- the literal in the column spec (DDL DEFAULT, JSON omission,
+      -- migration backfill all read it from there).
+      let dfltStx : Term ← do
         match getDefaultFnForField? env declName fname with
         | some dn =>
             let info ← getConstInfo dn
-            if info.type.isForall then `((none : Option LeanDb.Col))
+            if info.type.isForall then
+              logWarning m!"deriving LeanDb.Entity: default of '{declName}.{fname}' depends on other fields and is not reified — JSON inserts must supply it"
+              `((none : Option LeanDb.Col))
             else
               try
-                let valStx ← delab info.value!
-                `(some (LeanDb.ColCodec.toCol ($valStx : $(fieldTys[i]!))))
-              catch _ => `((none : Option LeanDb.Col))
-        | none => `((none : Option LeanDb.Col)))
+                let v ← evalCol (← mkAppM ``LeanDb.ColCodec.toCol #[info.value!])
+                `(some $(← colLitStx v))
+              catch ex =>
+                logWarning m!"deriving LeanDb.Entity: default of '{declName}.{fname}' could not be evaluated ({ex.toMessageData}) — JSON inserts must supply it"
+                `((none : Option LeanDb.Col))
+        | none => `((none : Option LeanDb.Col))
+      colSpecs := colSpecs.push
+        (← `(LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx))
+      encs := encs.push
+        (← `(LeanDb.ColCodec.toCol ($(mkCIdent (declName ++ fname)) r)))
     -- decode: right fold of decodeField binds ending in the constructor.
     let ctorArgs := (Array.range fields.size).map fun i => (fieldBinder i : Term)
     let mut body : Term ← `(Except.ok ($(mkCIdent ctorName) $ctorArgs*))
@@ -84,7 +108,6 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
     `(instance : LeanDb.Entity $(mkCIdent declName) where
         tableName := $(quote tblName)
         columns := #[$colSpecs,*]
-        defaults := #[$dflts,*]
         encode := fun r => #[$encs,*]
         decode := fun row =>
           if row.size == $n then $body
@@ -118,9 +141,9 @@ def deriveClosedEnum (declName : Name) : CommandElabM Bool := do
     -- boxing pass on this toolchain; an index into the variants array
     -- compiles everywhere.
     let idxArms : Array Term := (List.range names.length).toArray.map fun i => quote i
-    let enc ← `(fun x =>
-      (#[$variantTerms,*] : Array String)[$(mkCIdent (declName ++ `casesOn))
-        (motive := fun _ => Nat) x $idxArms*]!)
+    let enc ← `(
+      let vs : Array String := #[$variantTerms,*]
+      fun x => vs[$(mkCIdent (declName ++ `casesOn)) (motive := fun _ => Nat) x $idxArms*]!)
     let mut dec : Term ← `((none : Option $(mkCIdent declName)))
     for (ctor, n) in (indVal.ctors.zip names).reverse do
       dec ← `(if s == $(quote n) then some $(mkCIdent ctor) else $dec)

@@ -48,6 +48,7 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
      ("nullable", Json.bool c.nullable)]
     ++ (c.fkTable.map fun fk => ("references", Json.str fk)).toList
     ++ (c.enum.map fun vs => ("enum", Json.arr (vs.map Json.str))).toList
+    ++ (c.dflt.map fun v => ("default", v.toJson)).toList
 
 def TableSpec.toJson (t : TableSpec) : Json :=
   Json.mkObj [("name", Json.str t.name),
@@ -67,7 +68,12 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
   let fkTable := (j.getObjVal? "references").toOption.bind (·.getStr?.toOption)
   let enum := (j.getObjVal? "enum").toOption.bind fun a =>
     (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
-  return { name, sqlType, nullable, fkTable, enum }
+  let partial_ : ColumnSpec := { name, sqlType, nullable, fkTable, enum }
+  -- default roundtrips through the column's own type (stored schema JSON
+  -- must decode identically or migrations would see phantom diffs)
+  let dflt := (j.getObjVal? "default").toOption.bind fun v =>
+    (Col.fromJson partial_ v).toOption
+  return { partial_ with dflt }
 
 def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
   let name ← j.getObjVal? "name" >>= (·.getStr?)
@@ -96,19 +102,20 @@ def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
     (fields.toList.map fun (c, v) => (c.name, v.toJson))
 
 /-- Decode a full row from JSON field-by-field, then through the entity's
-    codecs (and thus every smart constructor). Missing nullable fields are
-    `null`; missing required fields are typed errors. -/
+    codecs (and thus every smart constructor). An omitted field takes its
+    declared default; without one it is `null` if the column is nullable
+    and a typed error otherwise. An explicit JSON `null` is always `null`,
+    default or not. -/
 def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   let table := Entity.tableName α
-  let cols ← (Entity.columns α).zipIdx.mapM fun (c, i) =>
+  let cols ← (Entity.columns α).mapM fun c =>
     match j.getObjVal? c.name with
     | .ok v =>
         match Col.fromJson c v with
         | .ok col => .ok col
         | .error m => .error (.decode table c.name m)
     | .error _ =>
-        -- omitted field: the declared default, else null if allowed
-        match (Entity.defaults α).getD i none with
+        match c.dflt with
         | some col => .ok col
         | none =>
             if c.nullable then .ok .null
