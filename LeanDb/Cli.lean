@@ -116,6 +116,8 @@ def run (b : Base) (args : List String) : IO UInt32 := do
             ("message", Json.str msg)]).compress
           return 3
       | .ok act =>
+          if let some parent := b.dbPath.parent then
+            IO.FS.createDirAll parent
           match ← withDb b.dbPath b.specs act with
           | .ok j =>
               IO.println j.compress
