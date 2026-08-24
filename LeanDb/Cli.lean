@@ -313,6 +313,7 @@ def run (b : Base) (args : List String) : IO UInt32 := do
               return 0
           | .error e =>
               IO.eprintln e.toJson.compress
-              return 2
+              -- plan.md §4.5: version/fingerprint mismatch is its own exit code
+              return (if e.code == "schema_mismatch" then 4 else 2)
 
 end LeanDb.Cli

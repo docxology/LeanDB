@@ -77,6 +77,24 @@ structure Todo where
 -- delete from — this must not typecheck.
 #check_failure insert Status Status.backlog
 
+/-- Regression: structure field defaults must compile in the derived
+    instance and be honored when JSON omits the field. -/
+structure Draft where
+  title : String
+  status : Status := .backlog
+  score : Nat := 10
+  deriving Repr, LeanDb.Entity
+
+private def testDefaults : IO Unit := do
+  check (Entity.defaults Draft == #[none, some (.text "backlog"), some (.int 10)])
+    s!"defaults reified from the structure, got {repr (Entity.defaults Draft)}"
+  match Lean.Json.parse "{\"title\":\"t\"}" with
+  | .error e => throw <| IO.userError s!"FAIL: {e}"
+  | .ok j =>
+      match rowOfJson Draft j with
+      | .ok d => check (d.status == .backlog && d.score == 10) "omitted fields take defaults"
+      | .error e => throw <| IO.userError s!"FAIL: defaults not applied: {e}"
+
 private def testClosedEnum : IO Unit := do
   check (roundtrip Status.inProgress && roundtrip Status.done) "closed enum roundtrip"
   check ((fromCol (α := Status) (.text "cancelled")).isOk == false)
@@ -343,6 +361,7 @@ def main : IO UInt32 := do
   testSortBy
   testPlans
   testClosedEnum
+  testDefaults
   testJson
   testEndToEnd
   testClosedEndToEnd

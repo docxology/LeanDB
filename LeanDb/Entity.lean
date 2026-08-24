@@ -13,6 +13,9 @@ single source of truth, so nothing here is ever written by hand.
 class Entity (α : Type) where
   tableName : String
   columns : Array ColumnSpec
+  /-- Per-column default values, reified from the structure's field
+      defaults; used when incoming JSON omits a field. -/
+  defaults : Array (Option Col) := #[]
   /-- Field values in declaration order, id excluded. -/
   encode : α → Array Col
   /-- Inverse of `encode` over honest data; typed failure otherwise. -/

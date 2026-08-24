@@ -45,6 +45,7 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
     let mut colSpecs : Array Term := #[]
     let mut encs : Array Term := #[]
     let mut fieldTys : Array Term := #[]
+    let mut dflts : Array Term := #[]
     for i in [0:fields.size] do
       let fname := fields[i]!
       let ftype ← inferType xs[i]!
@@ -56,6 +57,22 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
         (← `(LeanDb.columnSpec $(quote fname.toString) $tyStx))
       encs := encs.push
         (← `(LeanDb.ColCodec.toCol ($(mkCIdent (declName ++ fname)) r)))
+      -- Reify `:= default` field values (non-dependent ones) for JSON
+      -- decode. The default's defining term is inlined — referencing the
+      -- `_default` constant in compiled code trips an LCNF boxing panic
+      -- on this toolchain (its inlining attributes interact badly with
+      -- closed-term extraction).
+      dflts := dflts.push (← do
+        match getDefaultFnForField? env declName fname with
+        | some dn =>
+            let info ← getConstInfo dn
+            if info.type.isForall then `((none : Option LeanDb.Col))
+            else
+              try
+                let valStx ← delab info.value!
+                `(some (LeanDb.ColCodec.toCol ($valStx : $(fieldTys[i]!))))
+              catch _ => `((none : Option LeanDb.Col))
+        | none => `((none : Option LeanDb.Col)))
     -- decode: right fold of decodeField binds ending in the constructor.
     let ctorArgs := (Array.range fields.size).map fun i => (fieldBinder i : Term)
     let mut body : Term ← `(Except.ok ($(mkCIdent ctorName) $ctorArgs*))
@@ -67,6 +84,7 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
     `(instance : LeanDb.Entity $(mkCIdent declName) where
         tableName := $(quote tblName)
         columns := #[$colSpecs,*]
+        defaults := #[$dflts,*]
         encode := fun r => #[$encs,*]
         decode := fun row =>
           if row.size == $n then $body
@@ -95,8 +113,14 @@ def deriveClosedEnum (declName : Name) : CommandElabM Bool := do
   let names := indVal.ctors.map (·.getString!)
   let cmd ← liftTermElabM do
     let variantTerms : Array Term := (names.map fun n => (quote n : Term)).toArray
-    let caseArms : Array Term := variantTerms
-    let enc ← `(fun x => $(mkCIdent (declName ++ `casesOn)) (motive := fun _ => String) x $caseArms*)
+    -- The scalar `Nat` motive matters: a `String`-motive casesOn inside a
+    -- closed term (e.g. a reified field default) panics the compiler's
+    -- boxing pass on this toolchain; an index into the variants array
+    -- compiles everywhere.
+    let idxArms : Array Term := (List.range names.length).toArray.map fun i => quote i
+    let enc ← `(fun x =>
+      (#[$variantTerms,*] : Array String)[$(mkCIdent (declName ++ `casesOn))
+        (motive := fun _ => Nat) x $idxArms*]!)
     let mut dec : Term ← `((none : Option $(mkCIdent declName)))
     for (ctor, n) in (indVal.ctors.zip names).reverse do
       dec ← `(if s == $(quote n) then some $(mkCIdent ctor) else $dec)

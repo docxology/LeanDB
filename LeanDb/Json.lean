@@ -100,15 +100,19 @@ def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
     `null`; missing required fields are typed errors. -/
 def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   let table := Entity.tableName α
-  let cols ← (Entity.columns α).mapM fun c =>
+  let cols ← (Entity.columns α).zipIdx.mapM fun (c, i) =>
     match j.getObjVal? c.name with
     | .ok v =>
         match Col.fromJson c v with
         | .ok col => .ok col
         | .error m => .error (.decode table c.name m)
     | .error _ =>
-        if c.nullable then .ok .null
-        else .error (.decode table c.name "missing required field")
+        -- omitted field: the declared default, else null if allowed
+        match (Entity.defaults α).getD i none with
+        | some col => .ok col
+        | none =>
+            if c.nullable then .ok .null
+            else .error (.decode table c.name "missing required field")
   Entity.decode cols
 
 /-- Overlay a partial JSON object onto an existing row at the column level,
