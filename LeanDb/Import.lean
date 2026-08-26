@@ -29,7 +29,7 @@ structure RawColumn where
   notnull : Bool
   /-- 1-based position within the primary key; 0 when not part of it. -/
   pkIndex : Nat
-  hasDefault : Bool
+  defaultSql : Option String
   deriving Repr, Inhabited
 
 structure RawFk where
@@ -38,6 +38,9 @@ structure RawFk where
   toTable : String
   /-- `none` means the FK targets the parent's primary key implicitly. -/
   toCol : Option String
+  onUpdate : String
+  onDelete : String
+  matchClause : String
   deriving Repr, Inhabited
 
 structure RawTable where
@@ -89,13 +92,13 @@ def introspect (path : System.FilePath) : IO RawSchema := do
         let cname ← stmt.columnText 1
         let decl ← stmt.columnText 2
         let notnull ← stmt.columnInt64 3
-        let hasDefault ← do
+        let defaultSql ← do
           match ← stmt.columnType 4 with
-          | .null => pure false
-          | _ => pure true
+          | .null => pure none
+          | _ => some <$> stmt.columnText 4
         let pk ← stmt.columnInt64 5
         pure { name := cname, declType := decl, notnull := notnull != 0,
-               pkIndex := pk.toNatClampNeg, hasDefault : RawColumn }
+               pkIndex := pk.toNatClampNeg, defaultSql : RawColumn }
       let fks ← collectRows db s!"PRAGMA foreign_key_list({quoteIdent name})" fun stmt => do
         let gid ← stmt.columnInt64 0
         let toTable ← stmt.columnText 2
@@ -104,7 +107,11 @@ def introspect (path : System.FilePath) : IO RawSchema := do
           match ← stmt.columnType 4 with
           | .null => pure none
           | _ => some <$> stmt.columnText 4
-        pure { groupId := gid.toNatClampNeg, fromCol, toTable, toCol : RawFk }
+        let onUpdate ← stmt.columnText 5
+        let onDelete ← stmt.columnText 6
+        let matchClause ← stmt.columnText 7
+        pure { groupId := gid.toNatClampNeg, fromCol, toTable, toCol,
+               onUpdate, onDelete, matchClause : RawFk }
       tables := tables.push { name, createSql := sql, columns, fks }
     else if ty == "view" then
       views := views.push name
@@ -275,7 +282,7 @@ private def mapColumn (eligibleNames : Array (String × String))
   let fk? := t.fks.find? (·.fromCol == c.name)
   let isComposite := fk?.elim false fun fk => (t.fks.filter (·.groupId == fk.groupId)).size > 1
   if hasSub declU "BLOB" then
-    let extra := if c.notnull && !c.hasDefault then
+    let extra := if c.notnull && c.defaultSql.isNone then
       " (NOT NULL without default: inserts through LeanDB will be rejected by SQLite)" else ""
     .error (c.name, s!"BLOB columns are unsupported; column skipped{extra}")
   let mapping ← do
@@ -314,6 +321,8 @@ private def mapColumn (eligibleNames : Array (String × String))
   if let some fk := fk? then
     if !(hasSub declU "INT") then
       notes := notes.push s!"FK to {fk.toTable} on a non-INTEGER column; reference not typed"
+    if fk.onDelete != "RESTRICT" || fk.onUpdate != "RESTRICT" || fk.matchClause != "NONE" then
+      notes := notes.push s!"source FK actions are ON DELETE {fk.onDelete}, ON UPDATE {fk.onUpdate}, MATCH {fk.matchClause}; the adopted file keeps them, while a future LeanDB table rebuild normalizes the typed FK to RESTRICT"
   return { column := c.name, declType := c.declType, nullable := !c.notnull, mapping, notes }
 
 /-- Build the import plan: eligibility, column mapping, topological order
@@ -399,6 +408,18 @@ def planOf (baseName moduleName : String) (raw : RawSchema) : Plan := _root_.Id.
   for ix in raw.indexes do
     notCarried := notCarried.push ⟨"index", ix,
       "indexes are not represented in the generated schema (no @[index] emission yet); the physical index remains in the adopted database file"⟩
+  for t in raw.tables do
+    for c in t.columns do
+      if let some dflt := c.defaultSql then
+        notCarried := notCarried.push ⟨"default", s!"{t.name}.{c.name}",
+          s!"SQLite default {String.quote dflt} is not lifted into the generated field; inserts must supply the field, and a future LeanDB rebuild will not preserve this source default"⟩
+    for fk in t.fks do
+      if fk.onDelete != "RESTRICT" || fk.onUpdate != "RESTRICT" || fk.matchClause != "NONE" then
+        notCarried := notCarried.push ⟨"foreign-key action", s!"{t.name}.{fk.fromCol}",
+          s!"source uses ON DELETE {fk.onDelete}, ON UPDATE {fk.onUpdate}, MATCH {fk.matchClause}; the adopted file retains those actions, but LeanDB rebuilds emit RESTRICT"⟩
+    if hasSub (upperStr t.createSql) "UNIQUE" then
+      notCarried := notCarried.push ⟨"unique constraint", t.name,
+        "table-level/inline UNIQUE constraints are not represented in the generated schema; they remain in the adopted file but a future LeanDB rebuild will not preserve them"⟩
   for t in raw.tables do
     if hasSub (upperStr t.createSql) "CHECK" then
       notCarried := notCarried.push ⟨"check", t.name,
@@ -550,8 +571,9 @@ def importMd (p : Plan) (source dbPath : String) : String := _root_.Id.run do
     "  `_leandb_meta` table inside the file. This is expected and harmless.",
     "- The engine's DDL runs as `CREATE TABLE IF NOT EXISTS` — a no-op on",
     "  the existing tables; your data is untouched.",
-    "- `PRAGMA foreign_keys = ON` is set per connection; deletes of",
-    "  referenced rows fail loudly (`restricted`).",
+    "- `PRAGMA foreign_keys = ON` is set per connection. The adopted file's",
+    "  original FK actions remain authoritative; non-RESTRICT actions are",
+    "  listed below because a future LeanDB rebuild normalizes them to RESTRICT.",
     "",
     "**Import loose, tighten forever**: every text column arrived as a named",
     "newtype with an identity `make`. Tighten each `make` in",

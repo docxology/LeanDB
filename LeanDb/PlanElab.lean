@@ -126,6 +126,11 @@ private def flipOp : PushOp → PushOp
 /-- Reify one comparison. `none` = not translatable. -/
 private def cmpStrict (comps : Array Expr) (op : PushOp) (a b : Expr) :
     MetaM (Option Expr) := do
+  -- SQL ordering is only sound when both encodings preserve Lean's order.
+  -- In particular, Option's `none` ordering and closed-enum constructor
+  -- order do not match SQLite NULL/TEXT ordering.
+  unless op == .eq || op == .ne do
+    unless (← hasSqlOrd a) && (← hasSqlOrd b) do return none
   let ca? ← colOf? comps a
   let cb? ← colOf? comps b
   match ca?, cb? with
@@ -141,6 +146,9 @@ private def cmpStrict (comps : Array Expr) (op : PushOp) (a b : Expr) :
       else
         return none
 where
+  hasSqlOrd (e : Expr) : MetaM Bool := do
+    let ty ← inferType e
+    return (← synthInstance? (← mkAppM ``LeanDb.SqlOrd #[ty])).isSome
   /-- col OP other: `other` is a value, or (for eq/ne) `some <col>`. -/
   oneSided (c : Nat × String) (op : PushOp) (other : Expr) : MetaM (Option Expr) := do
     let otherW ← whnfR other

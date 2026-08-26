@@ -37,6 +37,9 @@ lake build leandb     # the importer executable (used in "Importing" below)
 lake build leandb_tests && .lake/build/bin/leandb_tests   # optional: "all engine tests passed"
 ```
 
+Maintainers can run the full engine, example, and importer release pass with
+`./scripts/release_check.sh`; see `RELEASING.md` for the tag checklist.
+
 ## A new base from scratch
 
 A LeanDB database ("base") is an ordinary Lake package depending on
@@ -232,7 +235,7 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
 
 Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:
-`decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `enum_drift`,
+`decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `schema`, `enum_drift`,
 `migrate`, `sqlite`) · `3` usage · `4` schema/version mismatch.
 
 ## Queries are Lean

@@ -24,6 +24,10 @@ def main (args : List String) : IO UInt32 := do
       query% bigVram,
       query% catalog,
       query% providerInfo,
+      query% chipInfo,
+      query% byArch,
+      query% minBandwidth,
+      query% valueRank,
       query% models,
       query% canServe]
   } args

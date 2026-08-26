@@ -108,6 +108,13 @@ def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
     default or not. -/
 def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   let table := Entity.tableName α
+  let obj ← match j with
+    | .obj obj => .ok obj
+    | _ => .error (.decode table "*" "expected a JSON object")
+  let known := (Entity.columns α).map (·.name)
+  for (name, _) in obj.toList do
+    unless known.contains name do
+      throw (.decode table name s!"unknown field; fields: {known.toList}")
   let cols ← (Entity.columns α).mapM fun c =>
     match j.getObjVal? c.name with
     | .ok v =>
@@ -128,9 +135,12 @@ def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
 def rowMergeJson (α : Type) [Entity α] (base : α) (j : Json) : Except DbError α := do
   let table := Entity.tableName α
   let obj ← match j with
-    | .obj _ => .ok ()
+    | .obj obj => .ok obj
     | _ => .error (.decode table "*" "expected a JSON object")
-  let _ := obj
+  let known := (Entity.columns α).map (·.name)
+  for (name, _) in obj.toList do
+    unless known.contains name do
+      throw (.decode table name s!"unknown field; fields: {known.toList}")
   let cols ← ((Entity.columns α).zip (Entity.encode base)).mapM fun (c, old) =>
     match j.getObjVal? c.name with
     | .ok v =>

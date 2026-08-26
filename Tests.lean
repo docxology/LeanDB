@@ -22,6 +22,9 @@ structure Book where
   rating : Option Float
   deriving Repr, LeanDb.Entity
 
+structure Marker where
+  deriving Repr, LeanDb.Entity
+
 def schema : List TableSpec := [Entity.spec Author, Entity.spec Book]
 
 /-! ## Pure tests -/
@@ -40,6 +43,14 @@ private def testCodecs : IO Unit := do
   check ((fromCol (α := Nat) (.int (-1))).isOk == false) "negative Nat must fail decode"
   check ((fromCol (α := Bool) (.int 2)).isOk == false) "Bool 2 must fail decode"
   check ((fromCol (α := String) (.int 5)).isOk == false) "String from INTEGER must fail"
+  check ((fromCol (α := UInt16) (.int 65535)).toOption == some 65535)
+    "UInt16 maximum must decode"
+  check ((fromCol (α := UInt16) (.int 65536)).isOk == false)
+    "UInt16 size must not wrap to zero"
+  check ((fromCol (α := UInt32) (.int 4294967295)).toOption == some 4294967295)
+    "UInt32 maximum must decode"
+  check ((fromCol (α := UInt32) (.int 4294967296)).isOk == false)
+    "UInt32 size must not wrap to zero"
 
 private def testDerivedSpec : IO Unit := do
   check (Entity.tableName Author == "author") "table name snake_case"
@@ -53,6 +64,12 @@ private def testDerivedSpec : IO Unit := do
   check (rt.toOption.map (·.name) == some "Ada") "entity encode/decode roundtrip"
   check (((Entity.decode #[.int 1] : Except DbError Author)).isOk == false)
     "wrong column count must fail decode"
+  let missingFk := validateSchema [Entity.spec Book]
+  check (missingFk.isOk == false) "schema rejects a reference to an omitted table"
+  let duplicate := validateSchema [Entity.spec Author, Entity.spec Author]
+  check (duplicate.isOk == false) "schema rejects duplicate table names"
+  let reserved : TableSpec := ⟨"_leandb_user", #[]⟩
+  check ((validateSchema [reserved]).isOk == false) "schema rejects the internal table prefix"
 
 private def testSortBy : IO Unit := do
   let xs := #[(3, "c"), (1, "b"), (1, "a"), (2, "z")]
@@ -66,11 +83,27 @@ private def testSortBy : IO Unit := do
 
 inductive Status where
   | backlog | inProgress | done
-  deriving Repr, DecidableEq, LeanDb.ClosedEnum
+  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
 
 structure Todo where
   title : String
   status : Status
+  deriving Repr, LeanDb.Entity
+
+private def Status.rank : Status → Nat
+  | .backlog => 0 | .inProgress => 1 | .done => 2
+
+private instance : LT Status := ⟨fun a b => a.rank < b.rank⟩
+private instance (a b : Status) : Decidable (a < b) := by
+  change Decidable (a.rank < b.rank)
+  infer_instance
+
+private instance (a b : Option Nat) : Decidable (a < b) := by
+  change Decidable (Option.lt (fun x y : Nat => x < y) a b)
+  cases a <;> cases b <;> simp [Option.lt] <;> infer_instance
+
+structure MaybeRank where
+  score : Option Nat
   deriving Repr, LeanDb.Entity
 
 -- Closed types are not entities: there is nothing to insert into or
@@ -147,6 +180,14 @@ private def orPlan : PlanFor (fun (a : Stored Author) =>
 
 private def notPlan : PlanFor (fun (a : Stored Author) => !(a.val.age ≥ 40)) := by leandb_plan
 
+private def nullableOrderPlan : PlanFor (fun (r : Stored MaybeRank) =>
+    decide (r.val.score < some 4)) := by
+  leandb_plan
+
+private def enumOrderPlan : PlanFor (fun (t : Stored Todo) =>
+    decide (t.val.status < Status.done)) := by
+  leandb_plan
+
 private def orResidualPlan : PlanFor (fun (a : Stored Author) =>
     a.val.age < 30 || opaquePred a) := by leandb_plan
 
@@ -183,6 +224,11 @@ private def testPlans : IO Unit := do
   checkPlan orPlan (.or (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "age" .gt (.int 50))) 0
     "disjunction pushes whole"
   checkPlan notPlan (.cmp 0 "age" .lt (.int 40)) 0 "negation is exact"
+  checkPlan nullableOrderPlan .tt 1 "nullable ordering remains residual"
+  checkPlan enumOrderPlan
+    (.or (.cmp 0 "status" .eq (.text "backlog"))
+      (.cmp 0 "status" .eq (.text "inProgress"))) 0
+    "closed-enum ordering case-splits instead of using SQL text order"
   checkPlan orResidualPlan .tt 1 "or with unpushable side is fully residual"
   checkPlan matchPlan
     (.or (.cmp 0 "status" .eq (.text "backlog")) (.cmp 0 "status" .eq (.text "inProgress")))
@@ -216,6 +262,12 @@ private def testJson : IO Unit := do
     "rowMergeJson overlays only present fields"
   check ((rowOfJson Book (← parseJ "{\"author\":3}")).isOk == false)
     "missing required field must fail"
+  check ((rowOfJson Draft (← parseJ "null")).isOk == false)
+    "insert input must be an object even when every field has a default"
+  check ((rowOfJson Draft (← parseJ "{\"title\":\"t\",\"scroe\":9}")).isOk == false)
+    "insert must reject unknown fields instead of silently taking a default"
+  check ((rowMergeJson Book b.val (← parseJ "{\"titel\":\"typo\"}")).isOk == false)
+    "update must reject unknown fields instead of silently doing nothing"
   let bogus := rowMergeJson Todo ⟨"x", .backlog⟩ (← parseJ "{\"status\":\"bogus\"}")
   match bogus with
   | .error (.decode "todo" "status" _) => pure ()
@@ -390,6 +442,33 @@ private def testMigrations : IO Unit := do
   let stmt ← db4.prepare "SELECT count(*) FROM todo"
   discard <| stmt.step
   check ((← stmt.columnInt64 0) == 2) "rollback kept the data"
+  -- Corrupt metadata is not an empty schema: migration must stop instead
+  -- of blessing the live database with a new fingerprint.
+  db4.exec "UPDATE _leandb_meta SET value = 'not-json' WHERE key = 'schema_json'"
+  expectErr (← migrate migDbPath [grown] (apply := false)) "migrate"
+    "invalid stored schema metadata must be reported"
+
+private def quoteDbPath : System.FilePath := ".lake" / "leandb_test_quote.sqlite"
+
+private def testSqlQuoting : IO Unit := do
+  if ← quoteDbPath.pathExists then IO.FS.removeFile quoteDbPath
+  let quoted : TableSpec := ⟨"odd\"table",
+    #[col "odd\"column" .text (enum := some #["it's"])]⟩
+  discard <| expectOk (← withDb quoteDbPath [quoted] (pure ()))
+    "quoted SQL identifiers and enum values"
+  let db ← SQLite.open quoteDbPath
+  db.exec "INSERT INTO \"odd\"\"table\" (\"odd\"\"column\") VALUES ('it''s')"
+
+private def emptyDbPath : System.FilePath := ".lake" / "leandb_test_empty.sqlite"
+
+private def testEmptyEntity : IO Unit := do
+  if ← emptyDbPath.pathExists then IO.FS.removeFile emptyDbPath
+  let stored ← expectOk (← withDb emptyDbPath [Entity.spec Marker] do
+    let row ← insert Marker {}
+    update row {}) "zero-field insert and update"
+  check (stored.id.toInt64 == 1) "zero-field entity gets a row identity"
+  discard <| expectOk (← withDb emptyDbPath [Entity.spec Marker] do delete stored.id)
+    "zero-field delete"
 
 def main : IO UInt32 := do
   testCodecs
@@ -402,5 +481,7 @@ def main : IO UInt32 := do
   testEndToEnd
   testClosedEndToEnd
   testMigrations
+  testSqlQuoting
+  testEmptyEntity
   IO.println "all engine tests passed"
   return 0

@@ -27,12 +27,19 @@ instance : CliArg Nat := ⟨fun s => match s.toNat? with
   | none => .error s!"expected a natural number, got {String.quote s}"⟩
 
 instance : CliArg Int64 := ⟨fun s => match s.toInt? with
-  | some i => .ok (Int64.ofInt i)
+  | some i =>
+      if i < Int64.minValue.toInt || i > Int64.maxValue.toInt then
+        .error s!"integer out of Int64 range: {s}"
+      else .ok (Int64.ofInt i)
   | none => .error s!"expected an integer, got {String.quote s}"⟩
 
 instance : CliArg String := ⟨.ok⟩
 
-instance : CliArg (Id α) := ⟨fun s => (CliArg.parse s : Except String Nat).map (⟨Int64.ofNat ·⟩)⟩
+instance : CliArg (Id α) := ⟨fun s => do
+  let n ← (CliArg.parse s : Except String Nat)
+  if n > Int64.maxValue.toNatClampNeg then
+    throw s!"row id out of Int64 range: {s}"
+  return ⟨Int64.ofNat n⟩⟩
 
 instance [ClosedEnum α] : CliArg α := ⟨fun s =>
   match ClosedEnum.decodeName s with
@@ -122,7 +129,10 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
           let cv ← match c.sqlType with
             | .integer =>
                 match v.toInt? with
-                | some i => pure (Col.int (Int64.ofInt i))
+                | some i =>
+                    if i < Int64.minValue.toInt || i > Int64.maxValue.toInt then
+                      throw (.decode spec.name col s!"integer out of Int64 range: {v}")
+                    pure (Col.int (Int64.ofInt i))
                 | none => throw (.decode spec.name col s!"expected an integer, got {String.quote v}")
             | .text => pure (Col.text v)
             | .real => throw (.decode spec.name col "REAL columns cannot be filtered with --eq")
@@ -162,7 +172,10 @@ private def usageJson (b : Base) : Json :=
 
 private def parseId (s : String) : Except String Int64 :=
   match s.toNat? with
-  | some n => .ok (Int64.ofNat n)
+  | some n =>
+      if n > Int64.maxValue.toNatClampNeg then
+        .error s!"row id out of Int64 range: {s}"
+      else .ok (Int64.ofNat n)
   | none => .error s!"expected a row id, got {String.quote s}"
 
 private def parseJson (s : String) : Except String Json := Json.parse s

@@ -48,16 +48,16 @@ def MigStep.destructive : MigStep → Bool
 
 def MigStep.sql : MigStep → List String
   | .createTable spec => [spec.ddl]
-  | .addColumn t c => [s!"ALTER TABLE \"{t}\" ADD COLUMN {c.ddlFragment}"]
-  | .dropColumn t c => [s!"ALTER TABLE \"{t}\" DROP COLUMN \"{c}\""]
-  | .dropTable t => [s!"DROP TABLE \"{t}\""]
+  | .addColumn t c => [s!"ALTER TABLE {quoteIdent t} ADD COLUMN {c.ddlFragment}"]
+  | .dropColumn t c => [s!"ALTER TABLE {quoteIdent t} DROP COLUMN {quoteIdent c}"]
+  | .dropTable t => [s!"DROP TABLE {quoteIdent t}"]
   | .rebuildTable spec copyCols =>
       let tmp := s!"_leandb_new_{spec.name}"
-      let cols := String.intercalate ", " ("id" :: copyCols.map (s!"\"{·}\""))
-      [ spec.ddlNamed tmp,
-        s!"INSERT INTO \"{tmp}\" ({cols}) SELECT {cols} FROM \"{spec.name}\"",
-        s!"DROP TABLE \"{spec.name}\"",
-        s!"ALTER TABLE \"{tmp}\" RENAME TO \"{spec.name}\"" ]
+      let cols := String.intercalate ", " ("id" :: copyCols.map quoteIdent)
+      [ spec.ddlNamed tmp (ifNotExists := false),
+        s!"INSERT INTO {quoteIdent tmp} ({cols}) SELECT {cols} FROM {quoteIdent spec.name}",
+        s!"DROP TABLE {quoteIdent spec.name}",
+        s!"ALTER TABLE {quoteIdent tmp} RENAME TO {quoteIdent spec.name}" ]
 
 structure MigPlan where
   steps : List MigStep := []
@@ -138,15 +138,15 @@ def MigrateReport.toJson (r : MigrateReport) : Json :=
     ("notes", Json.arr (r.notes.map Json.str).toArray),
     ("fingerprint", Json.str r.fingerprint)]
 
-private def readStoredSchema (db : SQLite) : IO (Option (List TableSpec)) := do
+private def readStoredSchema (db : SQLite) : IO (Except String (Option (List TableSpec))) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = 'schema_json'"
   if ← stmt.step then
     let raw ← stmt.columnText 0
     match Lean.Json.parse raw >>= specsFromJson? with
-    | .ok specs => return some specs
-    | .error _ => return none
+    | .ok specs => return .ok (some specs)
+    | .error e => return .error s!"stored schema metadata is invalid: {e}"
   else
-    return none
+    return .ok none
 
 private def writeStoredSchema (db : SQLite) (specs : List TableSpec) : IO Unit := do
   let stmt ← db.prepare "INSERT OR REPLACE INTO _leandb_meta (key, value) VALUES (?, ?)"
@@ -164,12 +164,15 @@ private def writeStoredSchema (db : SQLite) (specs : List TableSpec) : IO Unit :
 def migrate (path : System.FilePath) (specs : List TableSpec)
     (apply : Bool) (allowDestructive : Bool := false) :
     IO (Except DbError (Option MigPlan × Option MigrateReport)) := do
+  if let .error e := validateSchema specs then return .error e
   try
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
     db.exec "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     db.exec migrationsDdl
-    let old? ← readStoredSchema db
+    let old? ← match ← readStoredSchema db with
+      | .ok old? => pure old?
+      | .error msg => return .error (.migrate msg)
     let old := old?.getD []
     match planMigration old specs with
     | .error msg => return .error (.migrate msg)

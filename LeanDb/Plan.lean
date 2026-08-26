@@ -66,8 +66,8 @@ def orS : PushPred → PushPred → PushPred
   | a, .ff => a | _, .tt => .tt
   | a, b => .or a b
 
-/-- Exact negation. Order comparisons only arise on non-nullable columns
-    (an `Option` column reaches SQL only through null-safe `IS`), so
+/-- Exact negation. Order comparisons only arise on `SqlOrd` columns
+    (nullable and closed-enum columns do not opt in), so
     `NOT (a < b)` ↔ `a >= b` holds on everything the tactic emits. -/
 def neg : PushPred → PushPred
   | .tt => .ff | .ff => .tt

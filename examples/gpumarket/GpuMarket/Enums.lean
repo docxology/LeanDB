@@ -44,21 +44,6 @@ inductive Vendor where
   | nvidia | amd
   deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
 
-/-- Total: a new Gpu constructor forces a row here — the compiler is the
-    completeness check. `@[db]`: usable inside `select` predicates, where
-    it compiles to SQL by case-splitting the closed world. -/
-@[db] def Gpu.vendor : Gpu → Vendor
-  | .mi300x | .mi325x => .amd
-  | _ => .nvidia
-
-@[db] def Gpu.vramGb : Gpu → Nat
-  | .h100Sxm | .h100Pcie => 80
-  | .h200 => 141 | .b200 => 192 | .gh200 => 96
-  | .a100Sxm80 => 80 | .a100Pcie40 => 40
-  | .l40s => 48 | .l4 => 24 | .a10 => 24
-  | .rtx4090 => 24 | .rtx5090 => 32
-  | .mi300x => 192 | .mi325x => 256
-
 @[db] def Gpu.isH100 (g : Gpu) : Bool :=
   g == .h100Sxm || g == .h100Pcie
 

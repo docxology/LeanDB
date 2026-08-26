@@ -104,7 +104,7 @@ private def withLog (verb detail : String) (count : α → Nat) (act : DbM α) :
 
 private def liftExcept (r : Except DbError α) : DbM α := DbM.ofExcept r
 
-private def quoteId (s : String) : String := "\"" ++ s ++ "\""
+private def quoteId (s : String) : String := quoteIdent s
 
 private def columnList (α : Type) [Entity α] : String :=
   String.intercalate ", " ("id" :: (Entity.columns α).toList.map (quoteId ·.name))
@@ -116,10 +116,13 @@ private def placeholders (n : Nat) : String :=
 def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
   let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
-  let sql := s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
+  let sql := if spec.columns.isEmpty then
+    s!"INSERT INTO {quoteId spec.name} DEFAULT VALUES"
+  else
+    s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
   sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
     let stmt ← db.prepare sql
-    bindCols stmt 1 (Entity.encode a)
+    unless spec.columns.isEmpty do bindCols stmt 1 (Entity.encode a)
     stmt.exec
   let id ← sqlite (·.lastInsertRowId)
   return ⟨⟨id⟩, a⟩
@@ -151,6 +154,14 @@ def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
     clobber. `IS` (not `=`) so `NULL` columns pin correctly. -/
 def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog "update" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
+  if spec.columns.isEmpty then
+    let changed ← sqlite fun db => do
+      let stmt ← db.prepare s!"UPDATE {quoteId spec.name} SET id = id WHERE id = ?"
+      stmt.bindInt64 1 old.id.toInt64
+      stmt.exec
+      db.changes
+    if changed == 0 then throw (.notFound spec.name old.id.toInt64)
+    return ⟨old.id, new⟩
   let sets := String.intercalate ", " (spec.columns.toList.map (s!"{quoteId ·.name} = ?"))
   let pins := String.intercalate " AND " (spec.columns.toList.map (s!"{quoteId ·.name} IS ?"))
   let sql := s!"UPDATE {quoteId spec.name} SET {sets} WHERE id = ? AND {pins}"
@@ -283,6 +294,7 @@ def writeMeta (db : SQLite) (key value : String) : IO Unit := do
     DDL idempotently and refuses to open an instance whose fingerprint
     disagrees with the code's — drift is an error, not a surprise. -/
 def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbError Conn) := do
+  if let .error e := validateSchema specs then return .error e
   try
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"

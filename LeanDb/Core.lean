@@ -49,6 +49,8 @@ inductive DbError where
   | duplicate (table detail : String)
   /-- The instance's schema fingerprint does not match the code's. -/
   | schemaMismatch (expected actual : String)
+  /-- The code supplied an internally inconsistent or reserved schema. -/
+  | schemaInvalid (message : String)
   /-- A stored value is outside its column's closed world — the vocabulary
       moved without a migration. -/
   | enumDrift (table column value : String)
@@ -66,6 +68,7 @@ def DbError.code : DbError → String
   | .missingRef .. => "missing_ref"
   | .duplicate .. => "duplicate"
   | .schemaMismatch .. => "schema_mismatch"
+  | .schemaInvalid .. => "schema"
   | .enumDrift .. => "enum_drift"
   | .migrate .. => "migrate"
   | .sqlite .. => "sqlite"
@@ -79,6 +82,7 @@ def DbError.message : DbError → String
   | .duplicate table detail => s!"{table}: {detail}"
   | .schemaMismatch expected actual =>
       s!"schema fingerprint mismatch: code has {expected}, instance has {actual}"
+  | .schemaInvalid msg => s!"invalid schema: {msg}"
   | .enumDrift table column value =>
       s!"{table}.{column}: stored value {String.quote value} is not in the closed world"
   | .migrate msg => msg
@@ -126,6 +130,12 @@ class ColCodec (α : Type) where
 
 export ColCodec (toCol fromCol)
 
+/-- Marker for column types whose Lean ordering is preserved by SQLite's
+    ordering of their encoded values. The planner only pushes `<`/`≤`/`>`/`≥`
+    for these types; equality is pushable for every codec. Custom codecs
+    may opt in when their encoding is order-preserving. -/
+class SqlOrd (α : Type) : Prop where
+
 /-- Build a codec for a validated newtype from the codec of its raw
     representation and its smart constructor. -/
 @[reducible] def ColCodec.via [ColCodec β] (enc : α → β) (dec : β → Except String α) : ColCodec α where
@@ -144,6 +154,8 @@ instance : ColCodec Int64 where
     | .int v => .ok v
     | c => expected "INTEGER" c
 
+instance : SqlOrd Int64 where
+
 /-- `Nat` stores as INTEGER. Values ≥ 2^63 are not representable in a
     SQLite INTEGER and wrap on encode; model such magnitudes explicitly
     rather than reaching them through a `Nat` column. -/
@@ -154,16 +166,21 @@ instance : ColCodec Nat where
     | .int v => if v < 0 then .error s!"expected Nat, found {v}" else .ok v.toNatClampNeg
     | c => expected "INTEGER" c
 
+instance : SqlOrd Nat where
+
 instance : ColCodec UInt32 := ColCodec.via (β := Int64) (fun n => Int64.ofNat n.toNat)
-  (fun v => if 0 ≤ v && v ≤ Int64.ofNat UInt32.size then .ok (UInt32.ofNat v.toNatClampNeg)
+  (fun v => if 0 ≤ v && v < Int64.ofNat UInt32.size then .ok (UInt32.ofNat v.toNatClampNeg)
             else .error s!"UInt32 out of range: {v}")
+instance : SqlOrd UInt32 where
 
 instance : ColCodec UInt16 := ColCodec.via (β := Int64) (fun n => Int64.ofNat n.toNat)
-  (fun v => if 0 ≤ v && v ≤ Int64.ofNat UInt16.size then .ok (UInt16.ofNat v.toNatClampNeg)
+  (fun v => if 0 ≤ v && v < Int64.ofNat UInt16.size then .ok (UInt16.ofNat v.toNatClampNeg)
             else .error s!"UInt16 out of range: {v}")
+instance : SqlOrd UInt16 where
 
 instance : ColCodec Bool := ColCodec.via (β := Int64) (fun b => if b then 1 else 0)
   (fun | 0 => .ok false | 1 => .ok true | v => .error s!"expected 0 or 1, found {v}")
+instance : SqlOrd Bool where
 
 instance : ColCodec String where
   sqlType := .text
@@ -171,6 +188,7 @@ instance : ColCodec String where
   fromCol
     | .text v => .ok v
     | c => expected "TEXT" c
+instance : SqlOrd String where
 
 instance : ColCodec Float where
   sqlType := .real
@@ -181,6 +199,7 @@ instance : ColCodec Float where
     | c => expected "REAL" c
 
 instance : ColCodec (Id α) := ColCodec.via (β := Int64) Id.toInt64 (fun v => .ok ⟨v⟩)
+instance : SqlOrd (Id α) where
 
 instance [ColCodec α] : ColCodec (Option α) where
   sqlType := ColCodec.sqlType α

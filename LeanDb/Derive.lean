@@ -61,6 +61,10 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
   let ctorInfo ← getConstInfoCtor ctorName
   let fields := getStructureFields env declName
   let tblName := tableNameOf declName
+  if tblName.startsWith "_leandb_" then
+    throwError "deriving LeanDb.Entity: table name '{tblName}' uses the reserved _leandb_ prefix"
+  if fields.any (·.getString! == "id") then
+    throwError "deriving LeanDb.Entity: field 'id' is reserved for LeanDB row identity"
   let cmd ← liftTermElabM <| forallTelescopeReducing ctorInfo.type fun xs _ => do
     unless xs.size == fields.size do
       throwError "deriving LeanDb.Entity: unexpected constructor arity for {declName}"

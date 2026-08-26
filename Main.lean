@@ -82,6 +82,16 @@ def runImport (a : ImportArgs) : IO UInt32 := do
     let plan := planOf name moduleName raw
     let files := renderFiles plan a.requirePath dbPath file toolchain
     let outPath := System.FilePath.mk out
+    -- Generation is a one-shot handoff. Refuse the whole operation before
+    -- writing anything if any target exists; generated files explicitly
+    -- invite user edits and must never be clobbered by a second import.
+    let mut conflicts : Array String := #[]
+    for (rel, _) in files do
+      if ← (outPath / System.FilePath.mk rel).pathExists then
+        conflicts := conflicts.push rel
+    unless conflicts.isEmpty do
+      return ← opErr "exists"
+        s!"refusing to overwrite existing generated files in {out}: {conflicts.toList}"
     for (rel, contents) in files do
       let p := outPath / System.FilePath.mk rel
       if let some parent := p.parent then

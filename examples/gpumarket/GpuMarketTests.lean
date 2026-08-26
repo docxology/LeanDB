@@ -22,6 +22,28 @@ private def price (l : Stored Listing) : Nat := l.val.usdHr.milli
 def main : IO UInt32 := do
   -- pure vocabulary checks: total functions are the lookup tables
   check (Gpu.vramGb .mi325x == 256 && Gpu.vendor .h200 == .nvidia) "vocabulary tables"
+  -- consistency, quantified over the whole closed world
+  let world := ClosedEnum.all (α := Gpu)
+  check (world.size == 14) "the silicon world has 14 SKUs"
+  for g in world do
+    let sp := g.spec
+    check (sp.memBwGBs > 0 && sp.vramGb > 0 && sp.tdpW > 0 && sp.transistorsB > 0
+        && sp.year ≥ 2020 && sp.year ≤ 2026)
+      s!"spec sanity for {sp.marketing}"
+    check ((g.tflops .fp4).isSome == (sp.arch == .blackwell))
+      s!"fp4 is Blackwell-generation only ({sp.marketing})"
+    check ((g.tflops .fp8).isSome == (sp.arch != .ampere))
+      s!"fp8 exists everywhere after Ampere ({sp.marketing})"
+    check ((g.tflops .bf16).isSome && (g.tflops .int8).isSome)
+      s!"bf16/int8 universal ({sp.marketing})"
+    check (Gpu.vramGb g == sp.vramGb && Gpu.vendor g == sp.vendor)
+      s!"@[db] accessors read the spec ({sp.marketing})"
+    -- monotone precision ladder: halving precision never loses throughput
+    match g.tflops .bf16, g.tflops .fp8 with
+    | some b, some f => check (f ≥ b) s!"fp8 ≥ bf16 throughput ({sp.marketing})"
+    | _, _ => pure ()
+  check ((Gpu.spec .b200).interconnect == .nvlink 5 1800) "B200 carries NVLink 5"
+  check ((Gpu.spec .mi300x).cacheMb == 256) "MI300X Infinity Cache"
   check (fitsOn ⟨⟨"m"⟩, .deepseek, 671, some 37, 128, 8, true⟩ .mi300x ⟨8⟩)
     "DeepSeek-V3 fp8 fits an 8x MI300X node"
   check (!fitsOn ⟨⟨"m"⟩, .metaAi, 405, none, 128, 16, true⟩ .rtx4090 ⟨8⟩)

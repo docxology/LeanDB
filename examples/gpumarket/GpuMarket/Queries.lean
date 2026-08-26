@@ -1,4 +1,5 @@
 import GpuMarket.Entities
+import GpuMarket.Arch
 
 /-! # Queries — domain logic as plain Lean over `select`
 
@@ -47,6 +48,38 @@ def bigVram (minGb : Nat) : DbM (Array (Stored Listing)) :=
 /-- One provider's whole catalog, cheapest first. -/
 def catalog (pr : Provider) : DbM (Array (Stored Listing)) :=
   select [Listing] (fun l => l.val.provider == pr) byPrice
+
+/-- Listings on one architecture generation — `Gpu.arch` reads the spec
+    table; the plan case-splits it into `gpu IS …` disjunctions. -/
+def byArch (a : Arch) : DbM (Array (Stored Listing)) :=
+  select [Listing] (fun l => l.val.gpu.arch == a && l.val.available) byPrice
+
+/-- Memory-bandwidth floor (GB/s), from the spec table. -/
+def minBandwidth (gbs : Nat) : DbM (Array (Stored Listing)) :=
+  select [Listing] (fun l => l.val.gpu.memBwGBs ≥ gbs && l.val.available) byPrice
+
+open Lean (Json) in
+/-- The full datasheet for one SKU — pure vocabulary, no rows touched. -/
+def chipInfo (g : Gpu) : DbM Json :=
+  pure (g.spec.toJson g)
+
+open Lean (Json) in
+/-- On-demand $/TFLOP ranking at a precision: listings on silicon that
+    supports it, scored microdollars per dense TFLOP-hour, best first.
+    The arithmetic is client-side; the fetch narrowing is SQL. -/
+def valueRank (p : Precision) : DbM Json := do
+  let rows ← select [Listing] (fun l => l.val.available && l.val.pricing == .onDemand)
+  let scored := (rows.filterMap fun l =>
+      (l.val.gpu.tflops p).map fun t => (l, t, l.val.usdHr.milli * 1000 / t))
+    |>.qsort (fun a b => a.2.2 < b.2.2)
+  return Json.mkObj [("ok", Json.bool true),
+    ("precision", Json.str (LeanDb.ClosedEnum.encodeName p)),
+    ("rows", Json.arr <| scored.map fun (l, t, score) => Json.mkObj [
+      ("provider", Json.str (LeanDb.ClosedEnum.encodeName l.val.provider)),
+      ("gpu", Json.str (LeanDb.ClosedEnum.encodeName l.val.gpu)),
+      ("usd_hr_milli", Lean.toJson l.val.usdHr.milli),
+      ("dense_tflops", Lean.toJson t),
+      ("micro_usd_per_tflop_hr", Lean.toJson score)])]
 
 open Lean (Json) in
 /-- Vocabulary lookup: the closed world answers from code, the open world

@@ -29,7 +29,8 @@
    "notes": [],
    "columns":
    [{"nullable": false,
-     "notes": [],
+     "notes":
+     ["source FK actions are ON DELETE NO ACTION, ON UPDATE NO ACTION, MATCH NONE; the adopted file keeps them, while a future LeanDB table rebuild normalizes the typed FK to RESTRICT"],
      "mapping": "Ref Customers",
      "declaredType": "INTEGER",
      "column": "customer_id"},
@@ -57,6 +58,14 @@
   {"reason":
    "indexes are not represented in the generated schema (no @[index] emission yet); the physical index remains in the adopted database file",
    "name": "idx_orders_customer",
-   "kind": "index"}],
+   "kind": "index"},
+  {"reason":
+   "SQLite default \"0\" is not lifted into the generated field; inserts must supply the field, and a future LeanDB rebuild will not preserve this source default",
+   "name": "customers.balance",
+   "kind": "default"},
+  {"reason":
+   "source uses ON DELETE NO ACTION, ON UPDATE NO ACTION, MATCH NONE; the adopted file retains those actions, but LeanDB rebuilds emit RESTRICT",
+   "name": "orders.customer_id",
+   "kind": "foreign-key action"}],
  "dbPath": "data/legacy.db",
  "base": "legacy"}

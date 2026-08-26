@@ -1,4 +1,5 @@
 import GpuMarket.Entities
+import GpuMarket.Arch
 
 /-! # Models — the other open world
 
