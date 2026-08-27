@@ -298,6 +298,8 @@ Tests.lean           engine tests          Main.lean            the leandb execu
 
 Design docs: [`plan.md`](plan.md) (interface spec),
 [`plan-v2.md`](plan-v2.md) (milestones and status),
+[`LEP-0001`](proposals/LEP-0001-database-derived-row-symbols.md)
+(database-derived row symbols for query ergonomics),
 [`claude-discussion.md`](claude-discussion.md) (original design
 discussion). Deferred, by name: MCP/HTTP serve, log replay,
 `--output-lean`, migration source-file synthesis, `--infer-enums` on
