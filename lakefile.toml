@@ -2,8 +2,8 @@ name = "leandb"
 version = "0.2.0"
 defaultTargets = ["LeanDb"]
 
-# Pinned to the last leansqlite commit on lean4 v4.31.0; bump in lockstep
-# with lean-toolchain.
+# Pinned and verified against lean4 v4.33.0; bump in lockstep with
+# lean-toolchain.
 [[require]]
 name = "leansqlite"
 git = "https://github.com/leanprover/leansqlite"

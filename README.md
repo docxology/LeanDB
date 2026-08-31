@@ -1,25 +1,104 @@
 # LeanDB
 
-**Strongly typed SQL.** Your schema is Lean code; everything else — DDL,
-JSON, CLI, query plans, migrations — is derived from it. Wrong queries
-don't run: they don't typecheck. Wrong data doesn't load: it fails with a
-typed error. And the database engine's characteristic failure mode —
-answering wrong with exit code 0 — is replaced by errors that name
-themselves.
+**Strongly typed SQL in Lean 4.** LeanDB combines Lean's expressive type
+system with SQLite, giving a dependently typed front end to a SQL backend.
+That gives you:
+
+- validated, typed data,
+- queries checked against the tables they read, and
+- schema-derived migrations (with typed data transformations coming soon).
+
+## Typed Data
+
+Model domain values directly. Every value read from SQLite or decoded from
+JSON passes through its `ColCodec`, while `Ref User` makes a foreign key's
+target part of its Lean type.
 
 ```lean
-structure Ticket where
-  title    : Title                -- validated newtype: its smart constructor is the only way in
-  status   : Status := .backlog   -- closed world: deriving LeanDb.ClosedEnum
-  reporter : Ref User             -- typed FK; Ref User ≠ Ref Ticket
-  deriving Repr, LeanDb.Entity    -- the schema; there is no other source
+import LeanDb
 
--- The predicate's type is forced by the table list — a wrong-table
--- predicate does not typecheck. This join runs as one SQL statement.
-select [Ticket, User]
-  (fun (t, u) => t.val.reporter == u.ref && t.val.status != .done)
-  (.key fun (t, _) => t.val.priority)
+open LeanDb
+
+structure Title where
+  raw : String
+  deriving Repr, DecidableEq, Ord
+
+def Title.make (s : String) : Except String Title :=
+  let title := s.trimAscii.toString
+  if title.isEmpty then .error "title must be nonempty" else .ok ⟨title⟩
+
+instance : ColCodec Title := ColCodec.via (·.raw) Title.make
+
+inductive Status where
+  | backlog | inProgress | done
+  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
+
+structure User where
+  name : String
+  deriving Repr, LeanDb.Entity
+
+structure Ticket where
+  title    : Title
+  status   : Status := .backlog
+  reporter : Ref User
+  deriving Repr, LeanDb.Entity
+
+def schema : List TableSpec :=
+  [Entity.spec User, Entity.spec Ticket]
 ```
+
+`deriving LeanDb.Entity` produces each table specification; `schema` lists
+those tables in foreign-key dependency order. LeanDB derives the columns,
+default, foreign-key constraint, JSON codec, and migration metadata from the
+entity declarations, so there is no second schema to keep in sync.
+
+## Typed Queries
+
+The table list fixes the predicate's input type, so a predicate for the wrong
+table does not compile. This join is checked in Lean and runs as one SQL
+statement:
+
+```lean
+def activeTickets : DbM (Array (Stored Ticket × Stored User)) :=
+  select [Ticket, User]
+    (fun (ticket, user) =>
+      ticket.val.reporter == user.ref && ticket.val.status != .done)
+    (.key fun (ticket, _) => ticket.val.title)
+
+-- `select [User]` requires a `Stored User → Bool`, so this is rejected:
+#check_failure
+  select [User] (fun (ticket : Stored Ticket) => ticket.val.status == .done)
+```
+
+LeanDB reifies the part of the predicate it can express in SQL and always
+checks the original Lean predicate on the returned rows, preserving Lean's
+reference semantics.
+
+## Schema migrations (typed transformations coming soon)
+
+A migration starts as a type-safe schema edit. For example, adding an optional
+field is enough to produce a non-destructive migration plan:
+
+```diff
+ structure Ticket where
+   title    : Title
+   status   : Status := .backlog
+   reporter : Ref User
++  assignee : Option (Ref User)
+   deriving Repr, LeanDb.Entity
+```
+
+```console
+$ tickets migrate status
+{"destructive":false,"notes":[],"ok":true,"steps":["add column \"ticket\".\"assignee\""]}
+
+$ tickets migrate apply
+{"applied":["add column \"ticket\".\"assignee\""],"ok":true,…}
+```
+
+LeanDB already derives and transactionally applies schema changes. A future
+typed-transformation API will cover changes that need application-specific
+row conversion rather than a mechanical SQLite migration.
 
 Backed by SQLite ([leansqlite](https://github.com/leanprover/leansqlite),
 bundled — nothing to install). Machine-first: every command emits one JSON
@@ -31,7 +110,7 @@ You need [`elan`](https://github.com/leanprover/elan) (the Lean toolchain
 manager). Then:
 
 ```bash
-git clone <this-repo> leandb && cd leandb
+git clone https://github.com/theoriclabs/LeanDB.git leandb && cd leandb
 lake build            # engine (first build compiles bundled SQLite; takes a few minutes)
 lake build leandb     # the importer executable (used in "Importing" below)
 lake build leandb_tests && .lake/build/bin/leandb_tests   # optional: "all engine tests passed"
@@ -48,7 +127,7 @@ A LeanDB database ("base") is an ordinary Lake package depending on
 **`lean-toolchain`** — must match the engine's (copy it):
 
 ```
-leanprover/lean4:v4.31.0
+leanprover/lean4:v4.33.0
 ```
 
 **`lakefile.toml`**:
@@ -73,7 +152,7 @@ import LeanDb
 
 open LeanDb LeanDb.Cli
 
-/-- A validated newtype: the smart constructor is the only way in. -/
+/-- A validated newtype: database and JSON decoding use its smart constructor. -/
 structure Title where
   raw : String
   deriving Repr
@@ -263,7 +342,8 @@ shows plans at compile time.
 
 ## Example bases
 
-Each is a standalone package with tests and a `CLI_TRANSCRIPT.md`:
+The hand-written bases are standalone packages with tests and a
+`CLI_TRANSCRIPT.md`; `legacy` is the checked-in importer output:
 
 | Base | Domain | Worth seeing |
 |---|---|---|
@@ -272,6 +352,7 @@ Each is a standalone package with tests and a `CLI_TRANSCRIPT.md`:
 | `examples/shop` | ecommerce | basket/revenue joins, Money/Sku/Qty scalars |
 | `examples/gpus` | GPU SKUs & providers | match→CASE pushdown; `#check_failure LeanDb.delete (α := Chip) ⟨1⟩` — you can't delete a chip from the universe |
 | `examples/gpumarket` | GPU rental market + models | providers as a *closed world* (deleting Lambda doesn't typecheck), total vocabulary functions, `query h100 onDemand` → cheapest first, `canServe <model>` joins models against listings |
+| `examples/pricewatch` | ecommerce price comparison | typed hard constraints plus sorted, Pareto-front, and knee-point selection strategies |
 | `examples/legacy` | generated by `import-sqlite` | what the importer emits |
 
 ```bash
