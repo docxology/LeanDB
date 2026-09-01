@@ -206,6 +206,14 @@ inductive Pred : List Type → Type 1 where
   /-- A conjunct the tactic could not translate. Runs in Lean, never in
       SQL. This is the residual, as a leaf. -/
   | opaque (f : Rows ts → Bool)
+  /-- RESERVED, not in this proposal's scope (see LEP-0004): a quantifier
+      over a child table related by a foreign key —
+      `∃ row ∈ child, row.fk = this.id ∧ body`. Renders as `EXISTS (SELECT
+      1 FROM child WHERE …)`; `∀` is `¬∃¬`. Listed here so the IR's shape
+      is not closed before the restaurant base's central query (study
+      §3.3) can be expressed as one `select`. -/
+  | exists (child : Type) [Entity child] (fk : Col [child] (Ref α))
+           (body : Pred (child :: ts)) : Pred ts
 ```
 
 Three things are now structural that are tactic discipline today:
@@ -315,6 +323,10 @@ into the symbol immediately:
 - Typing `RefTarget`/`fkTable` (FK identity by table name). Same category.
 - The served wire carrying `Pred`. This proposal produces the serialization
   and stops there.
+- Implementing `exists`. It is reserved in the constructor list so `denote`,
+  `approx` and `render` are written with it in view; its rendering, its
+  denotation as a nested fetch in the reference semantics, and the tactic
+  rule that recognizes `child.any`/`child.all` are LEP-0004.
 - `SqlOrd` as a proof obligation.
 - Cost-based planning over `Pred`. The discussion's "reify, then plan"
   becomes possible once `Pred` is data; nothing here plans.
