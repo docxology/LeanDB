@@ -381,6 +381,8 @@ Design docs: [`plan.md`](plan.md) (interface spec),
 [`plan-v2.md`](plan-v2.md) (milestones and status),
 [`LEP-0001`](proposals/LEP-0001-database-derived-row-symbols.md)
 (database-derived row symbols for query ergonomics),
+[`LEP-0002`](proposals/LEP-0002-typed-predicate-ir.md)
+(typed predicate IR: `Field` symbols, `Pred ts`, pushdown soundness by theorem),
 [`claude-discussion.md`](claude-discussion.md) (original design
 discussion). Deferred, by name: MCP/HTTP serve, log replay,
 `--output-lean`, migration source-file synthesis, `--infer-enums` on
