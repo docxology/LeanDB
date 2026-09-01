@@ -11,10 +11,10 @@ has the query that needs it.
 
 | Step | Milestone | Status |
 |---|---|---|
-| R0 | Land the verified 0.2.x fixes and the design documents | in progress |
-| R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | in progress |
-| R2 | `examples/kernels` — kernel base, evidence for nested values | in progress |
-| R3 | LEP-0002 — typed predicate IR | designed |
+| R0 | Land the verified 0.2.x fixes and the design documents | done 2026-09-01 |
+| R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
+| R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
+| R3 | LEP-0002 — typed predicate IR | next |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | to be written from R1/R2 evidence |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
@@ -37,11 +37,15 @@ ordering through validated newtypes, `||`/`if` on columns for the
 midnight wrap, three-table joins, `Option (Ref _)` — and exposes exactly
 one missing thing in its central query.
 
-Includes one small engine change, done alongside because the base's
-`Diet.allows` needs it: **case-splitting on a captured closed-enum
-parameter** (study §3.4). Today the tactic splits only on enum *columns*;
-a `@[db]` function that matches on its parameter first goes residual.
-The extension splits on the parameter the same way, emitting `cmpVV`.
+Included three small engine changes the base needed, each with goldens:
+**case-splitting on a captured closed-enum parameter** (study §3.4 — a
+`@[db]` function matching on its parameter first no longer goes
+residual); **folding value/value guards at plan build** (`cmpVVS`: the
+guards a parameter split leaves are decidable once the parameter is
+known, so the tree collapses to the surviving column conditions — both
+match orders of `Diet.allows` yield the same SQL); and **`if`/`cond` on
+columns** as `(c ∧ t) ∨ (¬c ∧ e)`, which the study assumed and the tactic
+lacked. Also `rows --eq` now splits at the first `=` only, found by R2.
 
 **Done when:**
 - `eats query avgPrice chai-latte sanFrancisco`, `openFor tiramisu fri 21:30`,

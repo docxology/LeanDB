@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Pushdown: comparisons through a validated newtype's projection push when
+the projection is the column's encoding (checked by definitional
+equality); case splits on captured closed-enum parameters; value/value
+guards fold at plan build; `if`/`cond` on columns reify. BLOB columns are
+a typed `decode` error naming table and field. Constraint classification
+matches extended result codes first and message text case-insensitively.
+The importer reports UNIQUE constraints from `PRAGMA index_list`, named
+by column list, and detects CHECK token- and quote-aware. `rows --eq`
+splits at the first `=`.
+
+Two new bases: `examples/eats` (restaurants; dietary suitability computed
+from ingredients, never stored) and `examples/kernels` (GPU kernels with
+typed signatures and composition, benches keyed by gpumarket's `Gpu`).
+Design: LEP-0002 (typed predicate IR), the kernels/restaurants stress
+study, `ROADMAP.md`.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

@@ -309,7 +309,7 @@ into the symbol immediately:
 
 | Boundary | Today | After |
 |---|---|---|
-| `rows --eq col=value` | `PushPred.cmp 0 col …` from the raw string | `Field.ofName? col` → `Pred.eq (Col.here f) .eq (← fromCol …)`; unknown column is a typed error naming `Field.all` |
+| `rows --eq col=value` | `PushPred.cmp 0 col …` from the raw string — the value never meets the column's codec, so a canonical encoding (`K=4096,M=4096` vs `M=4096,K=4096`) is not honoured; found by `examples/kernels` | `Field.ofName? col` → parse through `Entity.codec f` → `Pred.eq (Col.here f) .eq v`; the boundary runs the smart constructor like every other one, and an unknown column is a typed error naming `Field.all` |
 | `_leandb_log` detail | `describe` string | serialized opaque-free plan, plus `residuals` count (§4.4's "plan as data") |
 | `serve` wire | argv strings only | unchanged in this proposal; the serialization exists for a later wire LEP |
 | DDL, `schema` JSON, migrations, fingerprint | `ColumnSpec.name : String` | unchanged, now derived from `Field` |

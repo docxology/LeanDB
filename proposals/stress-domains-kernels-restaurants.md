@@ -471,7 +471,7 @@ def openFor (dish : KnownDish) (day : Weekday) (t : Clock) :
   select [Restaurant, Dish, Hours] (fun (r, d, h) =>
     d.val.restaurant == r.ref && h.val.restaurant == r.ref             -- ✓ two joins
       && d.val.canonical == cd.ref && h.val.day == day                 -- ✓
-      && h.servesAt t)                                                 -- ✓ `if` on a column comparison → and/or of cmp2 + cmp; all through `.minutes`
+      && h.servesAt t)                                                 -- ✓ `if` on columns → (c ∧ t) ∨ (¬c ∧ e), through `.minutes` (tactic case added in R1)
     (.key fun (r, _, _) => r.val.name)
 
 /-- "Places that serve ramen I can eat" — vegetarian, or no pork/beef.
@@ -550,6 +550,16 @@ The original design (transcript §4) named three encodings, none built:
 | inline flatten — `launch.grid`, `launch.block`, … as sibling columns | small fixed structures; `LaunchConfig`, `NumericProps` | full | yes |
 | child table — `KernelInput (kernel, position, dtype, rank)` | lists; `ins`, `outs`, `fuses`, `ProgramNode.feeds` | full, via joins | yes |
 
+**R2 built this and wrote up what it could not do** — see
+`examples/kernels/README.md`, "Evidence for LEP-0003". The short version:
+every predicate that reads inside `sig` is a full-table fetch; the search
+columns cannot describe a list; `migrate`, the fingerprint and the
+enum-drift scan all stop at the JSON boundary (adding a field to `TensorTy`
+is invisible to `version` and then fails per-row on read); inline
+flattening was right for `NumericProps`; child tables are the only
+encoding under which per-input questions push. The recommendation below
+stands, with those specifics.
+
 Recommendation for the base: **`KernelSig` as a JSON-codec'd newtype
 column** (`ColCodec.via Json.compress Json.parse` through derived
 instances — this is writable today with no engine change, as one
@@ -607,14 +617,16 @@ reduces to comparisons of the closed value `diet` against constants —
 the variable, `findEnumCol` finds no *column* to split, and the conjunct
 goes residual. The same applies to `Arch.supports arch k.val.minArch`.
 
-By my reading of `caseSplit`/`findEnumCol` this is real and should be
-confirmed with a golden. The fix is a small tactic extension: when a
-conjunct is stuck on a closed value of a `ClosedEnum` type (a captured
-parameter), split on *it* — `⋁_c (param IS 'c' ∧ branch)` — exactly the
-existing rule with `cmp` replaced by `cmpVV`. Sound for the same reason, and
-it removes an ergonomic trap where the pushability of a `@[db]` function
-depends on which argument its `match` inspects first. ~20 lines; do it
-during the restaurant base.
+**Landed in R1** (confirmed by golden first). The tactic now splits on a
+captured `ClosedEnum` parameter — `⋁_c (param IS 'c' ∧ branch)` — when no
+column is left to split, and because both sides of each guard are known
+when the plan is built, `cmpVVS` folds every guard but one away: the
+derived `Diet.allows d k := !(d.forbids.contains k)` with `d :=
+.noPorkBeef` renders as `(kind IS ? OR kind IS ?)`, and both match orders
+produce the same plan. One refinement to the reading above: a `match` on
+the parameter hides the column under the alternatives' binders, where
+`findEnumCol` does not look, so the parameter is split *first* there —
+sound, and the folded result is identical.
 
 Fuel is the other limit: `caseSplit` is bounded at depth 2 and each level
 is `|enum|` branches. `Arch.supports` over 8×8 and `Diet.allows` over 12×19

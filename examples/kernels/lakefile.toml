@@ -1,0 +1,23 @@
+name = "kernels"
+defaultTargets = ["kernels_tests"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+# First cross-base type reuse: `Bench.sku` is gpumarket's closed `Gpu`
+# world, and `Gpu.spec` / `Gpu.tflops` come along for roofline arithmetic.
+[[require]]
+name = "gpumarket"
+path = "../gpumarket"
+
+[[lean_lib]]
+name = "Kernels"
+
+[[lean_exe]]
+name = "kernels"
+root = "Main"
+
+[[lean_exe]]
+name = "kernels_tests"
+root = "KernelsTests"
