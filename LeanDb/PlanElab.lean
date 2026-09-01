@@ -17,13 +17,20 @@ in its goal type. It reifies what it recognizes into a `PushPred` tree:
   representation type, so ordering is pushed whenever *it* is `SqlOrd`;
 - column-vs-column comparisons — across tables these are join conditions
   (`t.val.ref == u.ref`, also through `some`), routed to the joined executor;
-- `&&`, `||`, `!` (negation is exact — see `PushPred.neg`);
+- `&&`, `||`, `!` (negation is exact — see `PushPred.neg`), and
+  `if c then t else e` on `Bool` as `(c ∧ t) ∨ (¬c ∧ e)`;
 - `Option` tests (`== none`, `.isNone`, `.isSome`) as null-safe SQL;
 - bare `Bool` columns; `@[db]`-tagged defs unfolded;
 - `match` on a closed-enum column (directly or via an unfolded `@[db]`
   function like an SLA table) by *case-splitting on the closed world*:
   `⋁_c (col IS 'c' ∧ reify (conjunct[col := c]))` — total because the
-  world is closed; branches that reduce to `false` drop out.
+  world is closed; branches that reduce to `false` drop out;
+- the same split on a *captured parameter* of closed-enum type when the
+  conjunct is stuck on it and no column is left to split (a `@[db]`
+  function that matches on its parameter before its column argument, or
+  a derived form like `!(d.forbids.contains k)`):
+  `⋁_c (param IS 'c' ∧ reify (conjunct[param := c]))` — the guard is a
+  value/value test, bound as parameters at run time.
 
 Everything else is counted residual and left to the client-side lambda,
 which is always applied. The tactic never fails: on any surprise it emits
@@ -150,7 +157,7 @@ private def mkCmp2 (a : Nat × String) (op : PushOp) (b : Nat × String) : MetaM
   mkAppM ``PushPred.cmp2 #[mkNatLit a.1, mkStrLit a.2, mkOp op, mkNatLit b.1, mkStrLit b.2]
 
 private def mkCmpVV (a : Expr) (op : PushOp) (b : Expr) : MetaM Expr := do
-  mkAppM ``PushPred.cmpVV #[← mkVal a, mkOp op, ← mkVal b]
+  mkAppM ``PushPred.cmpVVS #[← mkVal a, mkOp op, ← mkVal b]
 
 private def mkAndS (a b : Expr) : MetaM Expr := mkAppM ``PushPred.andS #[a, b]
 private def mkOrS (a b : Expr) : MetaM Expr := mkAppM ``PushPred.orS #[a, b]
@@ -220,6 +227,17 @@ private partial def strict (comps : Array Expr) (fuel : Nat) (e : Expr) :
   if e.isAppOfArity ``Bool.not 1 then
     let some a ← strict comps fuel (e.getArg! 0) | return none
     return some (← mkNeg a)
+  -- `if c then t else e` on `Bool` is `(c ∧ t) ∨ (¬c ∧ e)`; the negation is
+  -- exact for the same reason `!` is. `ite` carries a `Prop` condition
+  -- with its `Decidable` instance, which is exactly a `decide`; `cond`
+  -- carries a `Bool` directly.
+  if e.isAppOfArity ``ite 5 then
+    let c := mkApp2 (mkConst ``Decidable.decide) (e.getArg! 1) (e.getArg! 2)
+    if let some r ← ifThenElse fuel c (e.getArg! 3) (e.getArg! 4) then return some r
+    return none
+  if e.isAppOfArity ``cond 4 then
+    if let some r ← ifThenElse fuel (e.getArg! 1) (e.getArg! 2) (e.getArg! 3) then return some r
+    return none
   if e.isAppOfArity ``bne 4 then
     if let some p ← cmpStrict comps .ne (e.getArg! 2) (e.getArg! 3) then return some p
     return ← caseSplit fuel e
@@ -251,22 +269,37 @@ private partial def strict (comps : Array Expr) (fuel : Nat) (e : Expr) :
         return ← strict comps fuel e'
   caseSplit fuel e
 where
+  ifThenElse (fuel : Nat) (c t e : Expr) : MetaM (Option Expr) := do
+    let some c' ← strict comps fuel c | return none
+    let some t' ← strict comps fuel t | return none
+    let some e' ← strict comps fuel e | return none
+    mkOrS (← mkAndS c' t') (← mkAndS (← mkNeg c') e')
   try2 (fuel : Nat) (whole : Expr) (op : PushOp) (a b : Expr) : MetaM (Option Expr) := do
     if let some r ← cmpStrict comps op a b then return some r
     caseSplit fuel whole
-  /-- Find a closed-enum column mentioned in `e` and case-split on its
-      world: `⋁_c (col IS 'c' ∧ strict (e[col := c]))`. -/
+  /-- Case-split on a closed world. A closed-enum column mentioned in `e`
+      first: `⋁_c (col IS 'c' ∧ strict (e[col := c]))`. When none is
+      left, a captured parameter of closed-enum type (a free variable
+      that is not a row component): `⋁_c (param IS 'c' ∧ strict (e[param := c]))`,
+      the guard a value/value test. Both are exhaustive because the world
+      is closed, and each branch is guarded by the equality that
+      justifies its substitution. -/
   caseSplit (fuel : Nat) (e : Expr) : MetaM (Option Expr) := do
     if fuel == 0 then return none
-    let some (colExpr, ic, enumName) ← findEnumCol e | return none
+    if let some (colExpr, ic, enumName) ← findEnumCol e then
+      return ← splitWorld fuel e colExpr enumName (mkCmp ic.1 ic.2 .eq)
+    let some (param, enumName) ← findEnumParam e | return none
+    splitWorld fuel e param enumName (mkCmpVV param .eq)
+  /-- `⋁_c (tag c ∧ strict (e[x := c]))` over the constructors of `enumName`. -/
+  splitWorld (fuel : Nat) (e x : Expr) (enumName : Name) (tag : Expr → MetaM Expr) :
+      MetaM (Option Expr) := do
     let info ← getConstInfoInduct enumName
     let mut acc := ffE
     for ctorName in info.ctors do
       let ctor := mkConst ctorName
-      let e' := e.replace fun x => if x == colExpr then some ctor else none
+      let e' := e.replace fun y => if y == x then some ctor else none
       let some branch ← strict comps (fuel - 1) e' | return none
-      let tag ← mkCmp ic.1 ic.2 .eq ctor
-      acc ← mkOrS acc (← mkAndS tag branch)
+      acc ← mkOrS acc (← mkAndS (← tag ctor) branch)
     return some acc
   /-- First subterm that is a closed-enum column access. -/
   findEnumCol (e : Expr) : MetaM (Option (Expr × (Nat × String) × Name)) := do
@@ -277,6 +310,19 @@ where
         if let .const tyName _ := ty then
           if (← synthInstance? (← mkAppM ``LeanDb.ClosedEnum #[ty])).isSome then
             return some (x, ic, tyName)
+    return none
+  /-- First free variable of closed-enum type in `e` that is not a row
+      component: a captured parameter of the query. Restricted to fvars
+      (not arbitrary closed subterms) so the split stays predictable. -/
+  findEnumParam (e : Expr) : MetaM (Option (Expr × Name)) := do
+    let st := collectFVars {} e
+    for fv in st.fvarIds do
+      let x := mkFVar fv
+      if comps.contains x then continue
+      let ty ← whnfR (← inferType x)
+      if let .const tyName _ := ty then
+        if (← synthInstance? (← mkAppM ``LeanDb.ClosedEnum #[ty])).isSome then
+          return some (x, tyName)
     return none
   collectApps (e : Expr) (acc : Array Expr) : Array Expr :=
     match e with

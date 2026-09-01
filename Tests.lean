@@ -180,6 +180,13 @@ private def orPlan : PlanFor (fun (a : Stored Author) =>
 
 private def notPlan : PlanFor (fun (a : Stored Author) => !(a.val.age ≥ 40)) := by leandb_plan
 
+-- `if` on a column comparison: the shape a midnight-wrapping opening-hours
+-- predicate takes (`if closes < opens then … else …`)
+private def itePlan : PlanFor (fun (a : Stored Author) =>
+    if a.val.age < 30 then a.val.name == "x" else a.val.age > 50) := by leandb_plan
+private def iteResidualPlan : PlanFor (fun (a : Stored Author) =>
+    if opaquePred a then a.val.age < 30 else true) := by leandb_plan
+
 private def nullableOrderPlan : PlanFor (fun (r : Stored MaybeRank) =>
     decide (r.val.score < some 4)) := by
   leandb_plan
@@ -247,6 +254,70 @@ private def foreignProjPlan : PlanFor (fun (r : Stored Priced) =>
 private def foreignProjEqPlan : PlanFor (fun (r : Stored Priced) =>
     r.val.span.hi == 5) := by leandb_plan
 
+/-! Case splits on a *captured parameter* of closed-enum type: after the
+    column split, a `@[db]` function that inspects its parameter before
+    its column argument (or a derived form like `!(d.forbids.contains k)`)
+    is stuck on the parameter; the tactic splits on its world too, with a
+    value/value guard. -/
+
+inductive Diet where
+  | vegetarian | pescatarian | omnivore
+  deriving Repr, DecidableEq, LeanDb.ClosedEnum
+
+inductive Kind where
+  | meat | fish | plant
+  deriving Repr, DecidableEq, LeanDb.ClosedEnum
+
+structure Ingredient where
+  name : String
+  kind : Kind
+  deriving Repr, LeanDb.Entity
+
+private def Diet.forbids : Diet → List Kind
+  | .vegetarian => [.meat, .fish] | .pescatarian => [.meat] | .omnivore => []
+
+/-- The derived form: list membership, no `match` on the column at all. -/
+@[db] private def Diet.allows (d : Diet) (k : Kind) : Bool := !(d.forbids.contains k)
+
+/-- Matches on the parameter first: `whnf` is stuck on `d` once the
+    column has been substituted. -/
+@[db] private def Diet.allowsParamFirst (d : Diet) (k : Kind) : Bool :=
+  match d with
+  | .omnivore => true
+  | .pescatarian => k != .meat
+  | .vegetarian => k == .plant
+
+/-- Matches on the column first: the column split alone leaves
+    `d OP constant`, the plain value/value path. -/
+@[db] private def Diet.allowsColumnFirst (d : Diet) (k : Kind) : Bool :=
+  match k with
+  | .plant => true
+  | .fish => d != .vegetarian
+  | .meat => d == .omnivore
+
+private def allowsPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+    d.allows i.val.kind) := by leandb_plan
+
+private def paramFirstPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+    d.allowsParamFirst i.val.kind) := by leandb_plan
+
+private def columnFirstPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+    d.allowsColumnFirst i.val.kind) := by leandb_plan
+
+/-- A captured `Nat` is not a closed world: after the column split the
+    branch `kindBonus n .plant` is stuck on `n` and must stay residual. -/
+private def kindBonus (n : Nat) (k : Kind) : Bool :=
+  match k with | .plant => n > 3 | _ => false
+private def natParamPlan (n : Nat) : PlanFor (fun (i : Stored Ingredient) =>
+    kindBonus n i.val.kind) := by leandb_plan
+
+/-- An enum parameter inside a genuinely opaque function: the split fires
+    but no branch can be evaluated, so the conjunct stays residual. -/
+@[irreducible] private def dietOpaque (d : Diet) (k : Kind) : Bool :=
+  d == .omnivore || k == .plant
+private def opaqueParamPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+    dietOpaque d i.val.kind) := by leandb_plan
+
 private def checkPlan (p : PlanFor w) (pred : PushPred) (residual : Nat) (label : String) :
     IO Unit :=
   unless p.plan.pred == pred && p.plan.residual == residual do
@@ -269,6 +340,11 @@ private def testPlans : IO Unit := do
   checkPlan orPlan (.or (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "age" .gt (.int 50))) 0
     "disjunction pushes whole"
   checkPlan notPlan (.cmp 0 "age" .lt (.int 40)) 0 "negation is exact"
+  checkPlan itePlan
+    (.or (.and (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "name" .eq (.text "x")))
+         (.and (.cmp 0 "age" .ge (.int 30)) (.cmp 0 "age" .gt (.int 50))))
+    0 "if-then-else on columns pushes as (c ∧ t) ∨ (¬c ∧ e)"
+  checkPlan iteResidualPlan .tt 1 "if with an opaque condition is fully residual"
   checkPlan nullableOrderPlan .tt 1 "nullable ordering remains residual"
   checkPlan enumOrderPlan
     (.or (.cmp 0 "status" .eq (.text "backlog"))
@@ -281,11 +357,12 @@ private def testPlans : IO Unit := do
   checkPlan weightPlan
     (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
     0 "enum-table function case-splits, false branches drop"
+  -- the value/value guards a case split leaves behind compare two values
+  -- that are both known when the plan is built (`cmpVVS`), so `0 ≥ 1`
+  -- folds to `ff` and drops its branch: only the surviving columns reach SQL
   checkPlan (weightCapturedPlan 1)
-    (.or (.or (.and (.cmp 0 "status" .eq (.text "backlog")) (.cmpVV (.int 0) .ge (.int 1)))
-              (.and (.cmp 0 "status" .eq (.text "inProgress")) (.cmpVV (.int 1) .ge (.int 1))))
-         (.and (.cmp 0 "status" .eq (.text "done")) (.cmpVV (.int 2) .ge (.int 1))))
-    0 "case split against a captured threshold pushes as value tests"
+    (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
+    0 "case split against a captured threshold folds the value tests"
   checkPlan newtypeEqPlan (.cmp 0 "price" .eq (.int 500)) 0
     "newtype projection that is the codec's encoding pushes (eq, literal)"
   checkPlan newtypeLePlan (.cmp 0 "price" .le (.int 500)) 0
@@ -301,6 +378,29 @@ private def testPlans : IO Unit := do
     "projection that is not the codec's encoding stays residual (order)"
   checkPlan foreignProjEqPlan .tt 1
     "projection that is not the codec's encoding stays residual (equality)"
+  -- captured closed-enum parameter: the world of `d` is split too, guarded
+  -- by `d IS 'c'` — known at plan build, so every guard but one folds away
+  -- and both match orders leave the same column condition
+  checkPlan (paramFirstPlan .vegetarian) (.cmp 0 "kind" .eq (.text "plant")) 0
+    "@[db] function matching on the parameter first splits on its world"
+  checkPlan (columnFirstPlan .vegetarian) (.cmp 0 "kind" .eq (.text "plant")) 0
+    "@[db] function matching on the column first reaches the same plan"
+  for d in ClosedEnum.all (α := Diet) do
+    check ((allowsPlan d).plan.residual == 0)
+      s!"derived allows ({repr d}) pushes with residual 0"
+    check ((paramFirstPlan d).plan.residual == 0)
+      s!"param-first allows ({repr d}) pushes with residual 0"
+    check ((columnFirstPlan d).plan.residual == 0)
+      s!"column-first allows ({repr d}) pushes with residual 0"
+  check ((allowsPlan .vegetarian).plan.pred.describe ==
+      "(t0.\"kind\" IS NOT ? AND t0.\"kind\" IS NOT ?)")
+    s!"derived allows folds to the forbidden kinds, got {(allowsPlan .vegetarian).plan.pred.describe}"
+  -- omnivore forbids nothing: the whole conjunct folds to `true` — no
+  -- narrowing, no residual
+  checkPlan (paramFirstPlan .omnivore) .tt 0 "a diet that allows everything folds to tt"
+  checkPlan (natParamPlan 5) .tt 1 "captured Nat inside a non-@[db] function stays residual"
+  checkPlan (opaqueParamPlan .omnivore) .tt 1
+    "enum parameter inside an opaque function stays residual"
 
 /-! ## JSON, derived from the schema (M5) -/
 
@@ -443,6 +543,44 @@ private def testClosedEndToEnd : IO Unit := do
           check ((details.toLower.splitOn "check constraint").length == 2)
             s!"raw insert rejected by CHECK, got: {details}"
       | e => throw <| IO.userError s!"FAIL: expected constraint error 19, got: {e}"
+
+private def dietDbPath : System.FilePath := ".lake" / "leandb_test_diet.sqlite"
+
+/-- Differential: the parameter-split plans must agree with the unplanned
+    reference for every diet, and with the hand-written expectation. -/
+private def testParamSplitEndToEnd : IO Unit := do
+  if ← dietDbPath.pathExists then IO.FS.removeFile dietDbPath
+  let r ← withDb dietDbPath [Entity.spec Ingredient] do
+    discard <| insert Ingredient ⟨"pork", .meat⟩
+    discard <| insert Ingredient ⟨"salmon", .fish⟩
+    discard <| insert Ingredient ⟨"tofu", .plant⟩
+    discard <| insert Ingredient ⟨"lentils", .plant⟩
+    let byName : SortBy (Stored Ingredient) := .key (·.val.name)
+    let names (rows : Array (Stored Ingredient)) := rows.map (·.val.name)
+    for d in ClosedEnum.all (α := Diet) do
+      let allowed := fun (i : Stored Ingredient) => d.allows i.val.kind
+      let planned ← select [Ingredient] allowed byName
+      let reference ← selectUnplanned [Ingredient] allowed byName
+      unless names planned == names reference do
+        throw (.sqlite s!"FAIL: derived allows ({repr d}): planned {names planned} vs reference {names reference}")
+      let forbidden := fun (i : Stored Ingredient) => !(d.allows i.val.kind)
+      let plannedF ← select [Ingredient] forbidden byName
+      let referenceF ← selectUnplanned [Ingredient] forbidden byName
+      unless names plannedF == names referenceF do
+        throw (.sqlite s!"FAIL: negated allows ({repr d}): planned {names plannedF} vs reference {names referenceF}")
+      let paramFirst := fun (i : Stored Ingredient) => d.allowsParamFirst i.val.kind
+      let plannedP ← select [Ingredient] paramFirst byName
+      let referenceP ← selectUnplanned [Ingredient] paramFirst byName
+      unless names plannedP == names referenceP do
+        throw (.sqlite s!"FAIL: param-first allows ({repr d}): planned {names plannedP} vs reference {names referenceP}")
+    let vegetarian ← select [Ingredient] (fun i => Diet.vegetarian.allows i.val.kind) byName
+    let pescatarian ← select [Ingredient] (fun i => Diet.pescatarian.allows i.val.kind) byName
+    let omnivore ← select [Ingredient] (fun i => Diet.omnivore.allows i.val.kind) byName
+    return (names vegetarian, names pescatarian, names omnivore)
+  let (veg, pesc, omni) ← expectOk r "diet queries"
+  check (veg == #["lentils", "tofu"]) s!"vegetarian sees plants only, got {veg}"
+  check (pesc == #["lentils", "salmon", "tofu"]) s!"pescatarian adds fish, got {pesc}"
+  check (omni == #["lentils", "pork", "salmon", "tofu"]) s!"omnivore sees everything, got {omni}"
 
 /-! ## Migrations (additive auto-apply, loud destruction, world rebuilds) -/
 
@@ -684,6 +822,7 @@ def main : IO UInt32 := do
   testJson
   testEndToEnd
   testClosedEndToEnd
+  testParamSplitEndToEnd
   testMigrations
   testSqlQuoting
   testEmptyEntity

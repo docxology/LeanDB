@@ -66,6 +66,39 @@ def orS : PushPred → PushPred → PushPred
   | a, .ff => a | _, .tt => .tt
   | a, b => .or a b
 
+/-- Evaluate a value/value comparison when both sides are already known:
+    `IS`/`IS NOT` null-safe, ordering only within one storage class.
+    Anything else (mixed classes, where SQLite's numeric affinity makes
+    `1 IS 1.0` true; REAL ordering, where NaN is NULL) is left to SQLite —
+    `none` never folds, which is always safe. -/
+def evalCmpVV : PushOp → Col → Col → Option Bool
+  | .eq, .null, .null => some true
+  | .eq, .null, _ | .eq, _, .null => some false
+  | .ne, .null, .null => some false
+  | .ne, .null, _ | .ne, _, .null => some true
+  | .eq, .int a, .int b => some (a == b)
+  | .eq, .text a, .text b => some (a == b)
+  | .ne, .int a, .int b => some (a != b)
+  | .ne, .text a, .text b => some (a != b)
+  | op, .int a, .int b => some (holds op (compare a b))
+  | op, .text a, .text b => some (holds op (compare a b))
+  | _, _, _ => none
+where
+  holds : PushOp → Ordering → Bool
+    | .lt, o => o == .lt | .le, o => o != .gt
+    | .gt, o => o == .gt | .ge, o => o != .lt
+    | _, _ => false
+
+/-- `cmpVV`, folded when decidable now. A closed-world case split against
+    a captured parameter guards each branch with `param IS 'c'`; at plan
+    build time the parameter is known, so every guard but one is `ff` and
+    the tree collapses to the surviving column conditions before SQL. -/
+def cmpVVS (a : Col) (op : PushOp) (b : Col) : PushPred :=
+  match evalCmpVV op a b with
+  | some true => .tt
+  | some false => .ff
+  | none => .cmpVV a op b
+
 /-- Exact negation. Order comparisons only arise on `SqlOrd` columns
     (nullable and closed-enum columns do not opt in), so
     `NOT (a < b)` ↔ `a >= b` holds on everything the tactic emits. -/

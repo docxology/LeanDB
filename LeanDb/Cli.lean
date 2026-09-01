@@ -195,8 +195,10 @@ private def parseRowFlags : List String → List (String × String) → Nat →
     Except String (List (String × String) × Nat)
   | [], eqs, limit => .ok (eqs.reverse, limit)
   | "--eq" :: kv :: rest, eqs, limit =>
+      -- split at the first `=` only: a value may itself contain `=`
+      -- (a canonical `M=4096,N=4096` binding, say)
       match kv.splitOn "=" with
-      | [k, v] => parseRowFlags rest ((k, v) :: eqs) limit
+      | k :: v :: vs => parseRowFlags rest ((k, String.intercalate "=" (v :: vs)) :: eqs) limit
       | _ => .error s!"--eq expects col=value, got {String.quote kv}"
   | "--limit" :: n :: rest, eqs, _ =>
       match n.toNat? with
