@@ -3,9 +3,14 @@ import PriceWatch.Choose
 /-! # The decision queries
 
 The shapes from the original design discussion, over ecommerce: hard
-constraints (max price, min rating, max delivery, category, store) answered
-in SQL, then `sorted` / `pareto` / `knee` selection over the feasible set.
-Every constraint that can push, pushes — check `pricewatch log`. -/
+constraints answered in SQL, then `sorted` / `pareto` / `knee` selection
+over the feasible set. The join, category, store, availability and the
+`Money` price bound all push — `price` is a validated newtype over `Nat`,
+and the plan sees through `.minor` because that projection *is* its codec.
+What stays residual is what reaches through an `Option`: the min-rating
+floor (`Option.map`/`getD`), the delivery-days ceiling (`Option.any`) and
+the `deals` discount arithmetic. Those are decided by the lambda, which is
+always applied — check `pricewatch log`. -/
 
 namespace PriceWatch
 

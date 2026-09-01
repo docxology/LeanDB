@@ -28,15 +28,38 @@ private def sqliteWith (onErr : IO.Error → DbError) (act : SQLite → IO α) :
 private def sqlite (act : SQLite → IO α) : DbM α :=
   sqliteWith (fun e => .sqlite (toString e)) act
 
+private def hasSub (s sub : String) : Bool := (s.splitOn sub).length > 1
+
 /-- SQLite reports every constraint violation as primary code 19; the
     message distinguishes the kinds — but an FK failure means different
     things per verb (dangling `Ref` on insert/update, referenced-row on
-    delete), so the caller says what it means via `fkError`. -/
+    delete), so the caller says what it means via `fkError`.
+
+    TEXT-SHAPE DEPENDENCY. The seam that separates `.missingRef`,
+    `.restricted` and `.duplicate` from a catch-all `.sqlite` *should* be
+    SQLite's extended result code — SQLITE_CONSTRAINT_FOREIGNKEY 787,
+    _UNIQUE 2067, _PRIMARYKEY 1555, each `19 ||| (subtype <<< 8)`, so the
+    low byte stays 19. It is not: bundled `leansqlite` passes
+    `sqlite3_step`/`sqlite3_exec`'s return value straight to
+    `IO.Error.otherError` (bindings/leansqlite.c) and binds neither
+    `sqlite3_extended_result_codes` nor `sqlite3_extended_errcode` — and
+    SQLite has no PRAGMA for either — so extended codes stay off and only
+    19 ever arrives. That leaves the human-readable message, which is not
+    a stable API, deciding which typed error the caller sees.
+
+    So: match the extended codes anyway (free today, correct the day
+    upstream binds `sqlite3_extended_result_codes`), and fall back to a
+    case-insensitive substring match, which survives the re-wordings that
+    `startsWith` on "FOREIGN KEY" / "UNIQUE" would silently downgrade. -/
 private def constraintError (table : String) (fkError : DbError) (e : IO.Error) : DbError :=
   match e with
-  | .otherError 19 details =>
-      if details.startsWith "FOREIGN KEY" then fkError
-      else if details.startsWith "UNIQUE" then .duplicate table details
+  | .otherError code details =>
+      if code % 256 != 19 then .sqlite (toString e) else
+      let msg := details.toLower
+      if code == 787 || hasSub msg "foreign key" then fkError
+      -- _UNIQUE and _PRIMARYKEY both read "UNIQUE constraint failed: t.c".
+      else if code == 2067 || code == 1555 || hasSub msg "unique" || hasSub msg "primary key" then
+        .duplicate table details
       else .sqlite s!"constraint: {details}"
   | e => .sqlite (toString e)
 
@@ -51,23 +74,37 @@ private def bindCols (stmt : SQLite.Stmt) (first : Nat) (cols : Array Col) : IO 
   for h : i in [0:cols.size] do
     bindCol stmt (Int32.ofNat (first + i)) cols[i]
 
-private def readCol (stmt : SQLite.Stmt) (i : Int32) : IO Col := do
+/-- A column we cannot represent is a decode failure like any other, so it
+    carries the table and field it came from rather than escaping untyped. -/
+private def readCol (table field : String) (stmt : SQLite.Stmt) (i : Int32) :
+    IO (Except DbError Col) := do
   match ← stmt.columnType i with
-  | .integer => .int <$> stmt.columnInt64 i
-  | .float => .real <$> stmt.columnDouble i
-  | .text => .text <$> stmt.columnText i
-  | .null => return .null
-  | .blob => throw <| IO.userError "BLOB columns are not supported"
+  | .integer => return .ok (.int (← stmt.columnInt64 i))
+  | .float => return .ok (.real (← stmt.columnDouble i))
+  | .text => return .ok (.text (← stmt.columnText i))
+  | .null => return .ok .null
+  | .blob => return .error (.decode table field "BLOB columns are not supported")
+
+/-- Read `labels.size` result columns starting at `first`, each labelled
+    with the `(table, field)` it was selected from. -/
+private def readRow (stmt : SQLite.Stmt) (first : Nat) (labels : Array (String × String)) :
+    IO (Except DbError (Array Col)) := do
+  let mut cols : Array Col := #[]
+  for h : i in [0:labels.size] do
+    let (table, field) := labels[i]
+    match ← readCol table field stmt (Int32.ofNat (first + i)) with
+    | .ok c => cols := cols.push c
+    | .error e => return .error e
+  return .ok cols
 
 /-- Read the current result row as `id` (column 0) plus the entity columns. -/
 private def readStored (α : Type) [Entity α] (stmt : SQLite.Stmt) :
     IO (Except DbError (Stored α)) := do
   let id ← stmt.columnInt64 0
-  let n := (Entity.columns α).size
-  let mut cols : Array Col := #[]
-  for i in [0:n] do
-    cols := cols.push (← readCol stmt (Int32.ofNat (i + 1)))
-  return (Entity.decode cols).map (⟨⟨id⟩, ·⟩)
+  let table := Entity.tableName α
+  match ← readRow stmt 1 ((Entity.columns α).map fun c => (table, c.name)) with
+  | .error e => return .error e
+  | .ok cols => return (Entity.decode cols).map (⟨⟨id⟩, ·⟩)
 
 /-- Lift a typed result into `DbM`. -/
 def DbM.ofExcept (r : Except DbError α) : DbM α :=
@@ -226,20 +263,20 @@ def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
   let (whereSql, binds) := plan.pred.render true
   let sql := s!"SELECT {String.intercalate ", " sel} FROM {String.intercalate ", " froms} " ++
     s!"WHERE {whereSql} ORDER BY {String.intercalate ", " order}"
-  let total := specs.foldl (fun n spec => n + 1 + spec.columns.size) 0
+  -- One label per selected column, in the same order as `sel` above, so a
+  -- bad value names the table and field it actually came from.
+  let labels : Array (String × String) := specs.foldl (init := #[]) fun acc spec =>
+    acc.push (spec.name, "id") ++ (spec.columns.map fun c => (spec.name, c.name))
   let raw ← sqlite fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 binds
-    let mut out : Array (Array Col) := #[]
+    let mut out : Array (Except DbError (Array Col)) := #[]
     repeat
-      if ← stmt.step then
-        let mut cols : Array Col := #[]
-        for i in [0:total] do
-          cols := cols.push (← readCol stmt (Int32.ofNat i))
-        out := out.push cols
-      else break
+      if ← stmt.step then out := out.push (← readRow stmt 0 labels) else break
     return out
-  let rows ← raw.mapM fun cols => liftExcept (RowsOf.decodeFrom (ts := ts) cols 0)
+  let rows ← raw.mapM fun r => do
+    let cols ← liftExcept r
+    liftExcept (RowsOf.decodeFrom (ts := ts) cols 0)
   return finishRows ts rows where' sortBy
 
 /-- The typed select. The trailing `plan` is reified from `where'` by the

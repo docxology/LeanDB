@@ -8,10 +8,10 @@ namespace LeanDb.Import
 /-! # `leandb import-sqlite` — generate a typed base from an existing SQLite file
 
 Introspects an existing SQLite database (`sqlite_master`, `PRAGMA
-table_info`, `PRAGMA foreign_key_list`) and generates a complete base
-package: validated newtypes per text column ("import loose, tighten
-forever"), `Ref` for single-column FKs onto INTEGER-PRIMARY-KEY row keys,
-`Option` for nullable columns.
+table_info`, `PRAGMA foreign_key_list`, `PRAGMA index_list` and `PRAGMA
+index_info`) and generates a complete base package: validated newtypes per
+text column ("import loose, tighten forever"), `Ref` for single-column FKs
+onto INTEGER-PRIMARY-KEY row keys, `Option` for nullable columns.
 
 Partial SQL support is a stated non-concern (plan.md §5.3) — *silent*
 partiality is not. Everything not carried (views, triggers, indexes,
@@ -43,11 +43,28 @@ structure RawFk where
   matchClause : String
   deriving Repr, Inhabited
 
+/-- One row of `PRAGMA index_list`, plus its `PRAGMA index_info` columns.
+    This is the authoritative source for UNIQUE constraints — far better
+    than scanning the `CREATE TABLE` text, which cannot tell a constraint
+    from a column named `unique_ref`. -/
+structure RawIndex where
+  name : String
+  isUnique : Bool
+  /-- `origin`: `"u"` a UNIQUE clause, `"pk"` the primary key, `"c"` a
+      `CREATE INDEX`. Empty on SQLite too old to report it — treated as
+      unknown, i.e. still reported. -/
+  origin : String
+  isPartial : Bool
+  /-- Indexed columns in order; `none` for an indexed expression. -/
+  columns : Array (Option String)
+  deriving Repr, Inhabited
+
 structure RawTable where
   name : String
   createSql : String
   columns : Array RawColumn
   fks : Array RawFk
+  indexes : Array RawIndex
   deriving Repr, Inhabited
 
 structure RawSchema where
@@ -112,7 +129,27 @@ def introspect (path : System.FilePath) : IO RawSchema := do
         let matchClause ← stmt.columnText 7
         pure { groupId := gid.toNatClampNeg, fromCol, toTable, toCol,
                onUpdate, onDelete, matchClause : RawFk }
-      tables := tables.push { name, createSql := sql, columns, fks }
+      -- Collect the index rows first: `index_info` needs its own statement
+      -- per index, so the outer cursor must be exhausted before we recurse.
+      let indexList ← collectRows db s!"PRAGMA index_list({quoteIdent name})"
+        fun stmt => do
+          let iname ← stmt.columnText 1
+          let uniq ← stmt.columnInt64 2
+          let origin ← stmt.columnText 3
+          let part ← stmt.columnInt64 4
+          pure (iname, uniq != 0, origin, part != 0)
+      let mut tblIndexes : Array RawIndex := #[]
+      for (iname, isUnique, origin, isPartial) in indexList do
+        let cols ← collectRows db s!"PRAGMA index_info({quoteIdent iname})"
+          fun stmt => do
+            -- An indexed expression has a NULL column name.
+            match ← stmt.columnType 2 with
+            | .null => pure none
+            | _ => some <$> stmt.columnText 2
+        tblIndexes := tblIndexes.push { name := iname, isUnique, origin,
+                                        isPartial, columns := cols }
+      tables := tables.push { name, createSql := sql, columns, fks,
+                              indexes := tblIndexes }
     else if ty == "view" then
       views := views.push name
     else if ty == "trigger" then
@@ -198,6 +235,74 @@ private def camelizeColumn (col : String) : String :=
   let segs := (cleaned.splitOn "_").filter (!·.isEmpty)
   let joined := segs.foldl (fun acc seg => acc ++ capitalize seg) ""
   if joined.isEmpty then "Column" else joined
+
+/-! ## Lexically-aware scanning of stored DDL
+
+SQLite has no pragma for CHECK constraints, so they can only come from the
+stored `CREATE TABLE` text. A bare substring search over that text invents
+constraints for a column named `check_digit`, for `CHECK` inside a string
+default or a quoted identifier, or inside a comment — `sqlite_master.sql`
+keeps comments verbatim. These helpers tokenize instead: quoted runs and
+comments yield nothing, so nothing inside them can pass for a keyword.
+
+This is deliberately *not* a SQL parser. It answers one question — does
+this bare word appear as a token here — and anything it cannot resolve
+stays reported. -/
+
+/-- SQLite identifier body characters. Used to require whole-token matches,
+    so `check_digit` never reads as `CHECK`. -/
+private def isIdentChar (c : Char) : Bool :=
+  c.isAlpha || c.isDigit || c == '_' || c == '$'
+
+/-- Skip past the closing `q`; a doubled `q` is the SQL escape, not a close.
+    An unterminated run swallows the rest, which is what SQLite would do. -/
+private partial def skipQuoted (q : Char) : List Char → List Char
+  | [] => []
+  | [c] => if c == q then [] else []
+  | c :: c' :: rest =>
+      if c == q then (if c' == q then skipQuoted q rest else c' :: rest)
+      else skipQuoted q (c' :: rest)
+
+private partial def skipBlockComment : List Char → List Char
+  | [] => []
+  | '*' :: '/' :: rest => rest
+  | _ :: rest => skipBlockComment rest
+
+private partial def bareWordsAux : List Char → Array String → Array String
+  | [], acc => acc
+  | '-' :: '-' :: rest, acc => bareWordsAux (rest.dropWhile (· != '\n')) acc
+  | '/' :: '*' :: rest, acc => bareWordsAux (skipBlockComment rest) acc
+  | '\'' :: rest, acc => bareWordsAux (skipQuoted '\'' rest) acc
+  | '"' :: rest, acc => bareWordsAux (skipQuoted '"' rest) acc
+  | '`' :: rest, acc => bareWordsAux (skipQuoted '`' rest) acc
+  -- `[...]` identifiers have no escape: the first `]` closes.
+  | '[' :: rest, acc => bareWordsAux ((rest.dropWhile (· != ']')).drop 1) acc
+  | c :: rest, acc =>
+      if isIdentChar c then
+        let word := String.ofList (c :: rest.takeWhile isIdentChar)
+        bareWordsAux (rest.dropWhile isIdentChar) (acc.push word)
+      else bareWordsAux rest acc
+
+/-- Bare word tokens of some SQL, in order, original case. Text inside
+    string literals, quoted identifiers and comments is not represented. -/
+private def bareWords (sql : String) : Array String :=
+  bareWordsAux sql.toList #[]
+
+/-- The CHECK constraints of a stored `CREATE TABLE`, in source order; the
+    payload is the `CONSTRAINT <name>` label where the source gave one.
+    `CHECK` is reserved in SQLite, so a bare `CHECK` token in a table
+    definition is always a constraint — an identifier spelled that way has
+    to be quoted, and quoted text never reaches here. -/
+private def checkConstraintsIn (createSql : String) : Array (Option String) :=
+  _root_.Id.run do
+    let ws := bareWords createSql
+    let mut out : Array (Option String) := #[]
+    for i in [0:ws.size] do
+      if upperStr ws[i]! == "CHECK" then
+        out := out.push <|
+          if i ≥ 2 && upperStr ws[i - 2]! == "CONSTRAINT" then some ws[i - 1]!
+          else none
+    return out
 
 /-! ## The import plan -/
 
@@ -406,8 +511,13 @@ def planOf (baseName moduleName : String) (raw : RawSchema) : Plan := _root_.Id.
     notCarried := notCarried.push ⟨"trigger", tr,
       "triggers are not imported; it remains in the adopted database file and will still fire inside SQLite"⟩
   for ix in raw.indexes do
+    -- A UNIQUE index carries a constraint, not just a lookup structure;
+    -- calling it "an index" would under-report what is being dropped.
+    let uniq := raw.tables.any fun t =>
+      t.indexes.any fun i => i.name == ix && i.isUnique
     notCarried := notCarried.push ⟨"index", ix,
-      "indexes are not represented in the generated schema (no @[index] emission yet); the physical index remains in the adopted database file"⟩
+      "indexes are not represented in the generated schema (no @[index] emission yet); the physical index remains in the adopted database file"
+      ++ (if uniq then " — note this one is UNIQUE, a constraint the typed layer does not enforce" else "")⟩
   for t in raw.tables do
     for c in t.columns do
       if let some dflt := c.defaultSql then
@@ -417,13 +527,29 @@ def planOf (baseName moduleName : String) (raw : RawSchema) : Plan := _root_.Id.
       if fk.onDelete != "RESTRICT" || fk.onUpdate != "RESTRICT" || fk.matchClause != "NONE" then
         notCarried := notCarried.push ⟨"foreign-key action", s!"{t.name}.{fk.fromCol}",
           s!"source uses ON DELETE {fk.onDelete}, ON UPDATE {fk.onUpdate}, MATCH {fk.matchClause}; the adopted file retains those actions, but LeanDB rebuilds emit RESTRICT"⟩
-    if hasSub (upperStr t.createSql) "UNIQUE" then
-      notCarried := notCarried.push ⟨"unique constraint", t.name,
-        "table-level/inline UNIQUE constraints are not represented in the generated schema; they remain in the adopted file but a future LeanDB rebuild will not preserve them"⟩
+    for ix in t.indexes do
+      -- `origin` is authoritative: "pk" is the primary key (carried as the
+      -- row key, or the whole table is already skipped) and "c" is a
+      -- CREATE INDEX, reported above by name. Anything else — "u", or an
+      -- origin this SQLite did not report — is a UNIQUE clause we drop.
+      if ix.isUnique && ix.origin != "pk" && ix.origin != "c" then
+        let cols := String.intercalate ", "
+          (ix.columns.toList.map (·.getD "<expression>"))
+        let part := if ix.isPartial then " partial" else ""
+        notCarried := notCarried.push
+          ⟨"unique constraint", s!"{t.name}({cols})",
+           s!"the UNIQUE constraint on ({cols}) is not represented in the generated schema; it stays enforced by SQLite inside the adopted file (backing{part} index {ix.name}), but a future LeanDB rebuild will not preserve it"⟩
   for t in raw.tables do
-    if hasSub (upperStr t.createSql) "CHECK" then
+    -- No pragma exposes CHECKs, so this one is textual; see `bareWords`.
+    let checks := checkConstraintsIn t.createSql
+    for check in checks do
+      if let some cname := check then
+        notCarried := notCarried.push ⟨"check", s!"{t.name}.{cname}",
+          s!"CHECK constraint {String.quote cname} is not lifted into a smart constructor; it stays enforced by SQLite inside the adopted file (detected by scanning the stored CREATE TABLE — SQLite exposes no pragma for CHECKs)"⟩
+    let anon := (checks.filter (·.isNone)).size
+    if anon > 0 then
       notCarried := notCarried.push ⟨"check", t.name,
-        "CHECK constraint(s) in the table definition are not lifted into smart constructors; they remain enforced by SQLite inside the adopted file"⟩
+        s!"{anon} unnamed CHECK constraint(s) in the table definition are not lifted into smart constructors; they stay enforced by SQLite inside the adopted file (detected by scanning the stored CREATE TABLE — SQLite exposes no pragma for CHECKs)"⟩
   let notes := #[
     "Import loose, tighten forever: every text column is a named newtype with an identity validator — tighten `make` when you know the rule.",
     "On first open the engine creates `_leandb_meta` inside the adopted file and stores the schema fingerprint; this is expected.",

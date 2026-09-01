@@ -10,6 +10,11 @@ in its goal type. It reifies what it recognizes into a `PushPred` tree:
 - `row.val.field OP value` (both orders) via `==`/`!=`/`BEq` and
   `decide`-coerced `<`/`≤`/`>`/`≥`; captured variables and literals become
   embedded `toCol` terms, bound as SQL parameters at run time;
+- the same through a validated newtype's projection — `row.val.field.rep`
+  — but only when that projection *is* the column's encoding, i.e.
+  `toCol a` and `toCol a.rep` are definitionally equal (which is what
+  `ColCodec.via (·.rep) _` gives). The comparison then happens on the
+  representation type, so ordering is pushed whenever *it* is `SqlOrd`;
 - column-vs-column comparisons — across tables these are join conditions
   (`t.val.ref == u.ref`, also through `some`), routed to the joined executor;
 - `&&`, `||`, `!` (negation is exact — see `PushPred.neg`);
@@ -54,25 +59,32 @@ private partial def withComps (ρ : Expr) (k : Array Expr → Expr → MetaM α)
 
 /-- If `e` is a column access on one of the row components, return
     (component index, column name). Recognizes `Stored.val c |>.field`
-    (as projection-fn application or `Expr.proj`) and `Stored.id`/`.ref`. -/
-private partial def colOf? (comps : Array Expr) (e : Expr) : MetaM (Option (Nat × String)) := do
+    (as projection-fn application or `Expr.proj`), `Stored.id`/`.ref`, and
+    a projection *through* a column whose codec is that very projection —
+    `col.field` on a validated newtype (see `throughCodec?`). `fuel`
+    bounds how many such projections are unwrapped. -/
+private partial def colOf? (comps : Array Expr) (e : Expr) (fuel : Nat := 8) :
+    MetaM (Option (Nat × String)) := do
   let e ← whnfR e
   match e with
   | .proj s i x =>
       if s == ``Stored && i == 0 then
         return (← compIdx? x).map ((·, "id"))
-      let some ci ← storedValComp? x | return none
-      let some info := getStructureInfo? (← getEnv) s | return none
-      let some fname := info.fieldNames[i]? | return none
-      return some (ci, fname.toString)
+      if let some ci ← storedValComp? x then
+        let some info := getStructureInfo? (← getEnv) s | return none
+        let some fname := info.fieldNames[i]? | return none
+        return some (ci, fname.toString)
+      throughCodec? x e fun a => .proj s i a
   | _ =>
       let .const declName _ := e.getAppFn | return none
       if (declName == ``Stored.id || declName == ``Stored.ref) && e.getAppNumArgs == 2 then
         return (← compIdx? (e.getArg! 1)).map ((·, "id"))
       let some _ := (← getEnv).getProjectionFnInfo? declName | return none
-      let some x := e.getAppArgs.back? | return none
-      let some ci ← storedValComp? x | return none
-      return some (ci, declName.getString!)
+      let args := e.getAppArgs
+      let some x := args.back? | return none
+      if let some ci ← storedValComp? x then
+        return some (ci, declName.getString!)
+      throughCodec? x e fun a => mkAppN e.getAppFn (args.set! (args.size - 1) a)
 where
   compIdx? (x : Expr) : MetaM (Option Nat) := do
     let x ← whnfR x
@@ -83,6 +95,30 @@ where
     match x with
     | .proj s 1 c => if s == ``Stored then compIdx? c else return none
     | _ => return none
+  /-- `whole` is `f x` for a projection `f : α → β`, and `x` resolves to a
+      column of type `α`. Push through `f` exactly when `f` *is* that
+      column's encoding: with a fresh `a : α`, `toCol a` must be
+      definitionally `toCol (f a)`. `ColCodec.via enc dec` is reducible and
+      sets `toCol a := toCol (enc a)`, so the check passes precisely for a
+      newtype stored through this projection — and then the column's bytes
+      already *are* the encoding of `f a`, so SQLite compares exactly what
+      the Lean predicate compares. The column name and table index stay
+      those of the underlying field: this unwraps, it does not rename.
+      Anything else (a codec that mixes two fields, an unrelated
+      projection) fails the check and stays residual. -/
+  throughCodec? (x whole : Expr) (rebuild : Expr → Expr) :
+      MetaM (Option (Nat × String)) := do
+    if fuel == 0 then return none
+    let some col ← colOf? comps x (fuel - 1) | return none
+    let α ← inferType x
+    let β ← inferType whole
+    let some ia ← synthInstance? (mkApp (mkConst ``LeanDb.ColCodec) α) | return none
+    let some ib ← synthInstance? (mkApp (mkConst ``LeanDb.ColCodec) β) | return none
+    let ok ← withLocalDeclD `a α fun a =>
+      withNewMCtxDepth <| withDefault <|
+        isDefEq (mkApp3 (mkConst ``LeanDb.ColCodec.toCol) α ia a)
+                (mkApp3 (mkConst ``LeanDb.ColCodec.toCol) β ib (rebuild a))
+    return if ok then some col else none
 
 /-- Does `e` mention any row component (i.e. is it *not* a closed value)? -/
 private def usesComps (comps : Array Expr) (e : Expr) : Bool :=

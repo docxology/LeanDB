@@ -202,6 +202,51 @@ private def weightPlan : PlanFor (fun (t : Stored Todo) => t.val.status.weight �
 private def weightCapturedPlan (n : Nat) : PlanFor (fun (t : Stored Todo) =>
     t.val.status.weight ≥ n) := by leandb_plan
 
+/-! Validated newtypes: a column stored *through* a projection. The
+    planner may only unwrap the projection when it is the codec's own
+    encoding — `Milli` qualifies, `Span` (whose codec mixes both fields)
+    does not, and must stay residual. -/
+
+private structure Milli where
+  v : Nat
+  deriving Repr, DecidableEq
+
+private instance : ColCodec Milli := ColCodec.via (·.v) (.ok ⟨·⟩)
+
+private structure Span where
+  lo : Nat
+  hi : Nat
+  deriving Repr, DecidableEq
+
+private instance : ColCodec Span :=
+  ColCodec.via (fun s => s.lo * 1000 + s.hi) (fun n => .ok ⟨n / 1000, n % 1000⟩)
+
+private structure Priced where
+  price : Milli
+  span : Span
+
+private def newtypeEqPlan : PlanFor (fun (r : Stored Priced) => r.val.price.v == 500) := by
+  leandb_plan
+
+private def newtypeLePlan : PlanFor (fun (r : Stored Priced) =>
+    r.val.price.v ≤ 500) := by leandb_plan
+
+private def newtypeCapturedPlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+    r.val.price.v ≤ n) := by leandb_plan
+
+private def newtypeGePlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+    r.val.price.v ≥ n) := by leandb_plan
+
+private def newtypeAndPlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+    r.val.price.v ≤ n && r.val.price.v ≥ 10) := by leandb_plan
+
+/-- The guard doing its job: same syntactic shape, different codec. -/
+private def foreignProjPlan : PlanFor (fun (r : Stored Priced) =>
+    r.val.span.lo ≤ 5) := by leandb_plan
+
+private def foreignProjEqPlan : PlanFor (fun (r : Stored Priced) =>
+    r.val.span.hi == 5) := by leandb_plan
+
 private def checkPlan (p : PlanFor w) (pred : PushPred) (residual : Nat) (label : String) :
     IO Unit :=
   unless p.plan.pred == pred && p.plan.residual == residual do
@@ -241,6 +286,21 @@ private def testPlans : IO Unit := do
               (.and (.cmp 0 "status" .eq (.text "inProgress")) (.cmpVV (.int 1) .ge (.int 1))))
          (.and (.cmp 0 "status" .eq (.text "done")) (.cmpVV (.int 2) .ge (.int 1))))
     0 "case split against a captured threshold pushes as value tests"
+  checkPlan newtypeEqPlan (.cmp 0 "price" .eq (.int 500)) 0
+    "newtype projection that is the codec's encoding pushes (eq, literal)"
+  checkPlan newtypeLePlan (.cmp 0 "price" .le (.int 500)) 0
+    "ordering through the encoding projection pushes (literal)"
+  checkPlan (newtypeCapturedPlan 700) (.cmp 0 "price" .le (.int 700)) 0
+    "ordering through the encoding projection pushes (captured variable)"
+  checkPlan (newtypeGePlan 700) (.cmp 0 "price" .ge (.int 700)) 0
+    "reverse ordering through the encoding projection pushes"
+  checkPlan (newtypeAndPlan 700)
+    (.and (.cmp 0 "price" .le (.int 700)) (.cmp 0 "price" .ge (.int 10))) 0
+    "both bounds through the projection push"
+  checkPlan foreignProjPlan .tt 1
+    "projection that is not the codec's encoding stays residual (order)"
+  checkPlan foreignProjEqPlan .tt 1
+    "projection that is not the codec's encoding stays residual (equality)"
 
 /-! ## JSON, derived from the schema (M5) -/
 
@@ -470,6 +530,150 @@ private def testEmptyEntity : IO Unit := do
   discard <| expectOk (← withDb emptyDbPath [Entity.spec Marker] do delete stored.id)
     "zero-field delete"
 
+private def blobDbPath : System.FilePath := ".lake" / "leandb_test_blob.sqlite"
+
+/-- A BLOB is a decode failure like any other bad value: typed, and naming
+    the column it came from. -/
+private def expectBlobDecode (r : Except DbError Unit) (context : String) : IO Unit := do
+  expectErr r "decode" context
+  match r with
+  | .error e =>
+      check (e.message == "author.name: BLOB columns are not supported")
+        s!"{context}: decode error names the table and field, got {e}"
+  | .ok _ => pure ()
+
+/-- Only raw SQL can plant a BLOB in a typed column, so the fixture goes in
+    behind the typed layer — then every read path must refuse it the same
+    way. -/
+private def testBlobColumn : IO Unit := do
+  if ← blobDbPath.pathExists then IO.FS.removeFile blobDbPath
+  discard <| expectOk (← withDb blobDbPath schema do
+    let a ← insert Author ⟨"Ada", 36⟩
+    discard <| insert Book ⟨"Notes", a.ref, none⟩) "seed before planting a BLOB"
+  let db ← SQLite.open blobDbPath
+  db.exec "UPDATE author SET name = x'414243'"
+  expectBlobDecode (← withDb blobDbPath schema do
+    discard <| get (α := Author) ⟨1⟩) "get over a BLOB column"
+  expectBlobDecode (← withDb blobDbPath schema do
+    discard <| select [Author] (fun _ => true)) "unfiltered select over a BLOB column"
+  expectBlobDecode (← withDb blobDbPath schema do
+    discard <| select [Author] (fun a => a.val.age ≥ 1)) "filtered select over a BLOB column"
+  expectBlobDecode (← withDb blobDbPath schema do
+    discard <| select [Book, Author] (fun (b, a) => b.val.author == a.ref))
+    "joined select over a BLOB column"
+
+private def uniqDbPath : System.FilePath := ".lake" / "leandb_test_unique.sqlite"
+
+/-- The `duplicate` classification depends on SQLite's message text (see
+    `constraintError`); pin it so a re-wording fails here, not in the field. -/
+private def testUniqueConstraint : IO Unit := do
+  if ← uniqDbPath.pathExists then IO.FS.removeFile uniqDbPath
+  discard <| expectOk (← withDb uniqDbPath schema do
+    discard <| insert Author ⟨"Ada", 36⟩) "seed before the unique index"
+  let db ← SQLite.open uniqDbPath
+  db.exec "CREATE UNIQUE INDEX u_author_name ON author(name)"
+  expectErr (← withDb uniqDbPath schema do discard <| insert Author ⟨"Ada", 41⟩)
+    "duplicate" "uniqueness violation is typed, not a raw sqlite error"
+
+/-! ## Importer: what it reports as not carried (§5.3 — partial support is
+fine, *silent* partiality is not). `planOf` is pure, so this drives it
+over a hand-built schema rather than a database file. -/
+
+section Importer
+open LeanDb.Import
+
+/-- A table whose DDL *looks* like it has UNIQUE and CHECK but does not, and
+    which `PRAGMA index_list` correctly reports as index-free. -/
+private def phantomTable : RawTable :=
+  { name := "phantom"
+    createSql :=
+      "CREATE TABLE phantom (\n" ++
+      "  id INTEGER PRIMARY KEY,\n" ++
+      "  check_digit TEXT NOT NULL,          -- looks like CHECK but is not\n" ++
+      "  unique_ref TEXT,                    -- looks like UNIQUE but is not\n" ++
+      "  label TEXT NOT NULL DEFAULT 'UNIQUE and CHECK live here',\n" ++
+      "  \"CHECK\" TEXT,\n" ++
+      "  [unique] TEXT\n" ++
+      "  /* a comment that says UNIQUE and CHECK */\n" ++
+      ")"
+    columns := #[
+      { name := "id", declType := "INTEGER", notnull := true, pkIndex := 1,
+        defaultSql := none },
+      { name := "check_digit", declType := "TEXT", notnull := true,
+        pkIndex := 0, defaultSql := none },
+      { name := "unique_ref", declType := "TEXT", notnull := false,
+        pkIndex := 0, defaultSql := none }]
+    fks := #[]
+    indexes := #[] }
+
+/-- Real constraints: an inline `UNIQUE`, a named `CONSTRAINT ... CHECK`,
+    an unnamed inline `CHECK`, and a table-level `UNIQUE (sku, qty)`. -/
+private def realTable : RawTable :=
+  { name := "real_constraints"
+    createSql :=
+      "CREATE TABLE real_constraints (\n" ++
+      "  id INTEGER PRIMARY KEY,\n" ++
+      "  sku TEXT NOT NULL UNIQUE,\n" ++
+      "  qty INT NOT NULL CHECK (qty > 0),\n" ++
+      "  grade TEXT,\n" ++
+      "  CONSTRAINT grade_range CHECK (grade IN ('a','b')),\n" ++
+      "  CONSTRAINT sku_qty_uq UNIQUE (sku, qty)\n" ++
+      ")"
+    columns := #[
+      { name := "id", declType := "INTEGER", notnull := true, pkIndex := 1,
+        defaultSql := none },
+      { name := "sku", declType := "TEXT", notnull := true, pkIndex := 0,
+        defaultSql := none },
+      { name := "qty", declType := "INT", notnull := true, pkIndex := 0,
+        defaultSql := none },
+      { name := "grade", declType := "TEXT", notnull := false, pkIndex := 0,
+        defaultSql := none }]
+    fks := #[]
+    indexes := #[
+      { name := "uq_grade", isUnique := true, origin := "c",
+        isPartial := false, columns := #[some "grade"] },
+      { name := "sqlite_autoindex_real_constraints_2", isUnique := true,
+        origin := "u", isPartial := false,
+        columns := #[some "sku", some "qty"] },
+      { name := "sqlite_autoindex_real_constraints_1", isUnique := true,
+        origin := "u", isPartial := false, columns := #[some "sku"] }] }
+
+private def testImportNotCarried : IO Unit := do
+  let raw : RawSchema :=
+    { tables := #[phantomTable, realTable], views := #[], triggers := #[],
+      indexes := #["uq_grade"] }
+  let plan := planOf "adv" "Adv" raw
+  let names := plan.notCarried.map fun e => (e.kind, e.name)
+  -- No phantom: a `check_digit` column, a `'UNIQUE and CHECK'` default, a
+  -- `"CHECK"` identifier and a comment must not invent constraints.
+  check (!names.contains ("unique constraint", "phantom"))
+    "phantom table must not report a UNIQUE constraint"
+  check (!names.contains ("check", "phantom"))
+    "phantom table must not report a CHECK constraint"
+  check (plan.notCarried.all fun e => !e.name.startsWith "phantom(")
+    "phantom table must not report any UNIQUE constraint by columns"
+  -- Real constraints are still reported, now named by column list.
+  check (names.contains ("unique constraint", "real_constraints(sku)"))
+    "inline UNIQUE is reported by column"
+  check (names.contains ("unique constraint", "real_constraints(sku, qty)"))
+    "table-level UNIQUE is reported by column list"
+  -- `origin = "c"` is a CREATE INDEX: reported once, as an index.
+  check (!names.contains ("unique constraint", "real_constraints(grade)"))
+    "a CREATE UNIQUE INDEX is not double-reported as a UNIQUE constraint"
+  check (names.contains ("index", "uq_grade")) "the unique index is reported"
+  check ((plan.notCarried.find? fun e => e.name == "uq_grade").any fun e =>
+      (e.reason.splitOn "UNIQUE").length > 1)
+    "a UNIQUE index says so in its reason"
+  -- CHECKs: the named one by name, the unnamed one counted on the table.
+  check (names.contains ("check", "real_constraints.grade_range"))
+    "a CONSTRAINT-named CHECK is reported by name"
+  check ((plan.notCarried.find? fun e =>
+      e.kind == "check" && e.name == "real_constraints").any fun e =>
+      (e.reason.splitOn "1 unnamed").length > 1)
+    "the unnamed CHECK is reported with a count"
+
+end Importer
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -483,5 +687,8 @@ def main : IO UInt32 := do
   testMigrations
   testSqlQuoting
   testEmptyEntity
+  testBlobColumn
+  testUniqueConstraint
+  testImportNotCarried
   IO.println "all engine tests passed"
   return 0
