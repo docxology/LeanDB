@@ -1,0 +1,17 @@
+name = "eats"
+defaultTargets = ["eats_tests"]
+
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "Eats"
+
+[[lean_exe]]
+name = "eats"
+root = "Main"
+
+[[lean_exe]]
+name = "eats_tests"
+root = "EatsTests"
