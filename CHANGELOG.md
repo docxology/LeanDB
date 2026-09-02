@@ -78,6 +78,16 @@ names and types (`help` shows them); `seed` is a verb derived from the
 base's declared seed (`query seed` still works). The importer generates
 the same shape.
 
+One handler: `Base.handle` is the only place argv meets an open instance;
+the one-shot CLI and `serve` are two framings of it. `openDb` splits into
+`openDbRaw` (file + bookkeeping tables) and `Conn.verify` (fingerprint,
+DDL, drift scan); `migrateOn`/`instanceInfoOn` run on a live connection.
+A `Session` gates the base's verbs while the instance is drifted, so
+`serve` now stays up on a drifted file: `version` and `migrate` answer,
+every other verb returns `schema_mismatch` until `["migrate","apply"]`
+succeeds in the same session. Exit codes derive from the response's
+`code`.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

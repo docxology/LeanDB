@@ -176,18 +176,103 @@ private def command (b : Base) : List String → Except String (DbM Json)
       | none => .error s!"unknown query {String.quote name}; queries: {queryNames b}"
   | args => .error s!"unrecognized command {args}"
 
-/-- Served mode: JSON-lines over stdio against one persistent connection.
-    Each request line is a JSON array of argv strings; each response is one
-    JSON object line. EOF ends the session. -/
-def serve (b : Base) (inst : Instance) : IO UInt32 := do
-  let specs := b.specs
+private def usageErr (m : String) : Json :=
+  Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"), ("message", Json.str m)]
+
+/-- The `version` report: code vs instance fingerprint, version, sync. -/
+private def versionJson (b : Base) (info : Option (Option String × Option Nat)) : Json :=
+  let codeFp := fingerprint b.specs
+  let (instFp, instVer) := match info with
+    | none => (Json.null, Json.null)
+    | some (fp, ver) =>
+        (fp.map Json.str |>.getD Json.null, (ver.map fun v => Lean.toJson v).getD Json.null)
+  Json.mkObj [("ok", Json.bool true),
+    ("code_fingerprint", Json.str codeFp),
+    ("instance_fingerprint", instFp),
+    ("schema_version", instVer),
+    ("in_sync", Json.bool (instFp == Json.str codeFp))]
+
+/-- An open instance as a server sees it: the connection, and a gate that
+    is `none` when the base's verbs are admitted and `some e` while
+    `Conn.verify` refuses them (fingerprint drift, enum drift). `version`
+    and `migrate` work either way; a successful `migrate apply` re-verifies
+    and opens the gate. -/
+structure Session where
+  conn : Conn
+  gate : IO.Ref (Option DbError)
+
+def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := do
   if let some parent := inst.path.parent then
     IO.FS.createDirAll parent
-  match ← openDb inst.path specs with
+  match ← openDbRaw inst.path with
+  | .error e => return .error e
+  | .ok conn =>
+      let gate ← IO.mkRef (match ← conn.verify b.specs with | .ok () => none | .error e => some e)
+      return .ok { conn, gate }
+
+private def migrateJson (b : Base) (sess : Session) (rest : List String) : IO Json := do
+  let mode := match rest with
+    | ["status"] => some (false, false)
+    | ["apply"] => some (true, false)
+    | ["apply", "--allow-destructive"] => some (true, true)
+    | _ => none
+  match mode with
+  | none => return usageErr "migrate status | apply [--allow-destructive]"
+  | some (apply, allowDestructive) =>
+      match ← migrateOn sess.conn b.specs apply allowDestructive with
+      | .error e => return e.toJson
+      | .ok (plan?, report?) =>
+          if apply then
+            -- the instance now matches the code (or says why not)
+            sess.gate.set (match ← sess.conn.verify b.specs with | .ok () => none | .error e => some e)
+          match report? with
+          | some r => return r.toJson
+          | none =>
+              let plan := plan?.getD {}
+              return Json.mkObj [("ok", Json.bool true),
+                ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
+                ("destructive", Json.bool plan.isDestructive),
+                ("notes", Json.arr (plan.notes.map Json.str).toArray)]
+
+/-- The one place argv meets an open instance: every transport (one-shot
+    CLI, JSON-lines `serve`, and the servers built on it) sends argv here
+    and gets one JSON value back. `ok:false` responses carry a `code`
+    (`usage`, or a `DbError` code) from which exit codes derive. -/
+def _root_.LeanDb.Base.handle (b : Base) (inst : Instance) (sess : Session) : List String → IO Json
+  | [] | ["help"] | ["--help"] => return usageJson b inst
+  | ["schema"] => return schemaJson b.name b.specs
+  | ["version"] => return versionJson b (some (← instanceInfoOn sess.conn))
+  | "migrate" :: rest => migrateJson b sess rest
+  | args => do
+      match command b args with
+      | .error m => return usageErr m
+      | .ok act =>
+          match ← sess.gate.get with
+          | some e => return e.toJson
+          | none =>
+              match ← act.run sess.conn with
+              | .ok j => return j
+              | .error e => return e.toJson
+
+/-- Exit code for a `handle` response: 0 ok, 3 usage, 4 schema mismatch,
+    2 any other typed error. -/
+def exitCodeOf (j : Json) : UInt32 :=
+  if (j.getObjValAs? Bool "ok").toOption == some true then 0
+  else match (j.getObjValAs? String "code").toOption with
+    | some "usage" => 3
+    | some "schema_mismatch" => 4
+    | _ => 2
+
+/-- Served mode: JSON-lines over stdio against one persistent connection.
+    Each request line is a JSON array of argv strings; each response is one
+    JSON object line. EOF ends the session. A drifted instance is served
+    too: verbs answer `schema_mismatch` until `["migrate","apply"]`. -/
+def serve (b : Base) (inst : Instance) : IO UInt32 := do
+  match ← Session.open b inst with
   | .error e =>
       IO.eprintln e.toJson.compress
       return e.exitCode
-  | .ok conn =>
+  | .ok sess =>
       let stdin ← IO.getStdin
       let out ← IO.getStdout
       repeat
@@ -200,99 +285,43 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
           arr.toList.mapM (·.getStr?)
         match argv? with
         | .error m =>
-            out.putStrLn (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
-              ("message", Json.str s!"expected a JSON array of argv strings: {m}")]).compress
-        | .ok ["schema"] =>
-            out.putStrLn (schemaJson b.name specs).compress
+            out.putStrLn (usageErr s!"expected a JSON array of argv strings: {m}").compress
         | .ok argv =>
-            match command b argv with
-            | .error m =>
-                out.putStrLn (Json.mkObj [("ok", Json.bool false),
-                  ("code", Json.str "usage"), ("message", Json.str m)]).compress
-            | .ok act =>
-                match ← act.run conn with
-                | .ok j => out.putStrLn j.compress
-                | .error e => out.putStrLn e.toJson.compress
+            out.putStrLn (← b.handle inst sess argv).compress
         out.flush
       return 0
 
-/-- Run one command against a resolved instance. -/
+/-- Run one command against a resolved instance. `help`, `schema` and
+    `version` touch no file; everything else opens a session. -/
 def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
-  let specs := b.specs
   match args with
   | ["serve"] => serve b inst
   | [] | ["help"] | ["--help"] =>
       IO.println (usageJson b inst).compress
       return 0
   | ["schema"] =>
-      IO.println (schemaJson b.name specs).compress
+      IO.println (schemaJson b.name b.specs).compress
       return 0
   | ["version"] =>
-      let codeFp := fingerprint specs
-      let (instFp, instVer) ← do
-        match ← instanceInfo inst.path with
-        | none => pure (Json.null, Json.null)
-        | some (fp, ver) =>
-            pure (fp.map Json.str |>.getD Json.null,
-              (ver.map fun v => Lean.toJson v).getD Json.null)
-      IO.println (Json.mkObj [("ok", Json.bool true),
-        ("code_fingerprint", Json.str codeFp),
-        ("instance_fingerprint", instFp),
-        ("schema_version", instVer),
-        ("in_sync", Json.bool (instFp == Json.str codeFp))]).compress
+      IO.println (versionJson b (← instanceInfo inst.path)).compress
       return 0
-  | "migrate" :: rest =>
-      let apply ← match rest with
-        | ["status"] => pure (some (false, false))
-        | ["apply"] => pure (some (true, false))
-        | ["apply", "--allow-destructive"] => pure (some (true, true))
-        | _ => pure none
-      match apply with
-      | none =>
-          IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
-            ("message", Json.str "migrate status | apply [--allow-destructive]")]).compress
-          return 3
-      | some (apply, allowDestructive) =>
-          if let some parent := inst.path.parent then
-            IO.FS.createDirAll parent
-          match ← migrate inst.path specs apply allowDestructive with
-          | .error e =>
-              IO.eprintln e.toJson.compress
-              return 2
-          | .ok (plan?, report?) =>
-              match report? with
-              | some r => IO.println r.toJson.compress
-              | none =>
-                  let plan := plan?.getD {}
-                  IO.println (Json.mkObj [("ok", Json.bool true),
-                    ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
-                    ("destructive", Json.bool plan.isDestructive),
-                    ("notes", Json.arr (plan.notes.map Json.str).toArray)]).compress
-              return 0
   | args =>
-      match command b args with
-      | .error msg =>
-          IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
-            ("message", Json.str msg)]).compress
-          return 3
-      | .ok act =>
-          if let some parent := inst.path.parent then
-            IO.FS.createDirAll parent
-          match ← withDb inst.path specs act with
-          | .ok j =>
-              IO.println j.compress
-              return 0
-          | .error e =>
-              IO.eprintln e.toJson.compress
-              return e.exitCode
+      match ← Session.open b inst with
+      | .error e =>
+          IO.eprintln e.toJson.compress
+          return e.exitCode
+      | .ok sess =>
+          let j ← b.handle inst sess args
+          let code := exitCodeOf j
+          if code == 0 then IO.println j.compress else IO.eprintln j.compress
+          return code
 
 /-- The base's `main`: resolve the instance (`--db`, `$LEANDB_DB`, default)
     and run the command. -/
 def run (b : Base) (args : List String) : IO UInt32 := do
   match ← Instance.resolve b args with
   | .error m =>
-      IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
-        ("message", Json.str m)]).compress
+      IO.eprintln (usageErr m).compress
       return 3
   | .ok (inst, args) => runOn b inst args
 

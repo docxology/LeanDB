@@ -496,17 +496,29 @@ def writeMeta (db : SQLite) (key value : String) : IO Unit := do
   stmt.bindText 2 value
   stmt.exec
 
-/-- Open (creating if absent) an instance for the given schema. Applies
-    DDL idempotently and refuses to open an instance whose fingerprint
-    disagrees with the code's — drift is an error, not a surprise. -/
-def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbError Conn) := do
-  if let .error e := validateSchema specs then return .error e
+/-- Open the file (creating it if absent) and make sure the engine's own
+    bookkeeping tables exist — nothing about the base's schema is checked
+    or applied. A server holds a connection opened this way so it can
+    answer `version`/`migrate` on a drifted instance; `Conn.verify` is the
+    step that admits the base's verbs. -/
+def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
   try
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
     db.exec metaDdl
     db.exec logDdl
     db.exec migrationsDdl
+    return .ok ⟨db⟩
+  catch e =>
+    return .error (.sqlite (toString e))
+
+/-- Check the open instance against the code's schema: refuse fingerprint
+    drift, apply DDL idempotently, scan stored closed-world values for
+    drift, and record the schema. Drift is an error, not a surprise. -/
+def Conn.verify (conn : Conn) (specs : List TableSpec) : IO (Except DbError Unit) := do
+  if let .error e := validateSchema specs then return .error e
+  try
+    let db := conn.raw
     let fp := fingerprint specs
     match ← readMeta db "schema_fingerprint" with
     | some stored =>
@@ -538,9 +550,20 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
     writeMeta db "schema_json" (specsToJson specs).compress
     if (← readMeta db "schema_version").isNone then
       writeMeta db "schema_version" "1"
-    return .ok ⟨db⟩
+    return .ok ()
   catch e =>
     return .error (.sqlite (toString e))
+
+/-- Open (creating if absent) an instance for the given schema: `openDbRaw`
+    then `Conn.verify`. Refuses to open an instance whose fingerprint
+    disagrees with the code's. -/
+def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbError Conn) := do
+  match ← openDbRaw path with
+  | .error e => return .error e
+  | .ok conn =>
+      match ← conn.verify specs with
+      | .error e => return .error e
+      | .ok () => return .ok conn
 
 /-- Recent query-log entries, newest first, as JSON rows. -/
 def readLog (limit : Nat) : DbM (Array Lean.Json) := sqlite fun db => do

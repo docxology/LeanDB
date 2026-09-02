@@ -2599,9 +2599,44 @@ private def testBaseSpecs : IO Unit := do
   | .ok _ => throw <| IO.userError "FAIL: --db without a path must be refused"
   | .error _ => pure ()
 
+/-! ## Sessions: a drifted instance is served, gated, and admitted after migrate -/
+
+private def sessDbPath : System.FilePath := ".lake" / "leandb_test_session.sqlite"
+
+private def testSession : IO Unit := do
+  if ← sessDbPath.pathExists then IO.FS.removeFile sessDbPath
+  -- an instance shaped by an older code: `author` had an extra nullable column
+  let older : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer,
+    col "nick" .text (nullable := true)]⟩
+  discard <| expectOk (← withDb sessDbPath [older] (pure ())) "create older"
+  (← SQLite.open sessDbPath).exec "INSERT INTO author (name, age, nick) VALUES ('Ada', 36, 'A')"
+  let b : Base := { name := "s", tables := [CliTable.of Author] }
+  let inst := Instance.ofPath sessDbPath
+  let sess ← expectOk (← Cli.Session.open b inst) "open a drifted instance"
+  let code := fun (j : Lean.Json) => (j.getObjValAs? String "code").toOption.getD ""
+  -- verbs are held back with the typed reason; version and migrate answer
+  let r ← b.handle inst sess ["rows", "author"]
+  check (code r == "schema_mismatch" && Cli.exitCodeOf r == 4) "drifted: rows is gated"
+  let v ← b.handle inst sess ["version"]
+  check ((v.getObjValAs? Bool "in_sync").toOption == some false) "drifted: version says out of sync"
+  let st ← b.handle inst sess ["migrate", "status"]
+  check ((st.getObjValAs? Bool "destructive").toOption == some true) "drifted: plan is destructive"
+  let refused ← b.handle inst sess ["migrate", "apply"]
+  check (code refused == "migrate" && Cli.exitCodeOf refused == 2) "destructive apply refused"
+  check (code (← b.handle inst sess ["rows", "author"]) == "schema_mismatch") "still gated after refusal"
+  let applied ← b.handle inst sess ["migrate", "apply", "--allow-destructive"]
+  check ((applied.getObjValAs? Bool "ok").toOption == some true) "apply with the flag"
+  let rows ← b.handle inst sess ["rows", "author"]
+  check ((rows.getObjValAs? Nat "count").toOption == some 1) "admitted after apply, data kept"
+  let v ← b.handle inst sess ["version"]
+  check ((v.getObjValAs? Bool "in_sync").toOption == some true
+    && (v.getObjValAs? Nat "schema_version").toOption == some 2) "in sync at version 2"
+  check (Cli.exitCodeOf (← b.handle inst sess ["frobnicate"]) == 3) "usage exit code"
+
 def main : IO UInt32 := do
   testCodecs
   testBaseSpecs
+  testSession
   testDerivedSpec
   testSortBy
   testPlans

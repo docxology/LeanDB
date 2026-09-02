@@ -386,13 +386,15 @@ private def writeStoredSchema (db : SQLite) (specs : List TableSpec) : IO Unit :
   stmt.exec
 
 /-- Plan (and optionally apply) the migration from an instance's stored
-    schema to the code's schema. `apply := false` only reports. -/
-def migrate (path : System.FilePath) (specs : List TableSpec)
+    schema to the code's schema, on an open connection (`openDbRaw` is
+    enough — the connection need not verify). `apply := false` only
+    reports. -/
+def migrateOn (conn : Conn) (specs : List TableSpec)
     (apply : Bool) (allowDestructive : Bool := false) :
     IO (Except DbError (Option MigPlan × Option MigrateReport)) := do
   if let .error e := validateSchema specs then return .error e
   try
-    let db ← SQLite.open path
+    let db := conn.raw
     db.exec "PRAGMA foreign_keys = ON"
     db.exec "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     db.exec migrationsDdl
@@ -443,15 +445,31 @@ def migrate (path : System.FilePath) (specs : List TableSpec)
   catch e =>
     return .error (.sqlite (toString e))
 
-/-- What an instance says about itself, readable even when drifted:
-    (fingerprint, schema_version). `none` = file or meta absent. -/
+/-- `migrateOn` against a file: the one-shot form for scripts and tests. -/
+def migrate (path : System.FilePath) (specs : List TableSpec)
+    (apply : Bool) (allowDestructive : Bool := false) :
+    IO (Except DbError (Option MigPlan × Option MigrateReport)) := do
+  match ← openDbRaw path with
+  | .error e => return .error e
+  | .ok conn => migrateOn conn specs apply allowDestructive
+
+/-- What an open instance says about itself, readable even when drifted:
+    (fingerprint, schema_version). -/
+def instanceInfoOn (conn : Conn) : IO (Option String × Option Nat) := do
+  try
+    let fp ← readMeta conn.raw "schema_fingerprint"
+    let ver ← readMeta conn.raw "schema_version"
+    return (fp, ver.bind (·.toNat?))
+  catch _ =>
+    return (none, none)
+
+/-- `instanceInfoOn` against a file. `none` = file absent (nothing is
+    created). -/
 def instanceInfo (path : System.FilePath) : IO (Option (Option String × Option Nat)) := do
   if !(← path.pathExists) then return none
   try
     let db ← SQLite.open path
-    let fp ← readMeta db "schema_fingerprint"
-    let ver ← readMeta db "schema_version"
-    return some (fp, ver.bind (·.toNat?))
+    return some (← instanceInfoOn ⟨db⟩)
   catch _ =>
     return some (none, none)
 
