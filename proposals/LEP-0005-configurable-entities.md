@@ -274,6 +274,48 @@ The engine pieces, each motivated by a specific line above:
 4. **`EnumSet`** for multi-select option groups ("extras"). LEP-0003 A,
    already scheduled.
 
+## Vocabulary growth: what the compiler sees, what the migration sees
+
+The reason to put queries, data and migrations in one universe is that an
+edit to the vocabulary has an *impact you can see* — not only on stored
+data, but on how the data is used. Add `Milk.pistachio` and:
+
+1. **Facts that are functions in code** — `EspressoConfig.ingredients`,
+   `Diet.forbids`, gpumarket's `Gpu.spec` — are `match`es over the closed
+   world. The build fails until each one says what pistachio is. The
+   compiler walks you to every table of facts that must learn about it.
+   This is what LeanDB already does.
+
+2. **Facts that are rows** — a café's `PriceRule` — are data, and data
+   has no `match`. A rule that never mentions pistachio does not fail; it
+   prices pistachio at `base + size`, silently — the modifier-groups bug
+   wearing a type. What saves it is that the configuration space is
+   finite *and typed*: growing `Milk` changes the CHECK on every milk
+   column, which is already a fingerprint mismatch and a rebuild in
+   `migrate status`, and that same step can evaluate every stored rule
+   over the new configurations and report **"3 offers price `pistachio`
+   by omission; 1 declares it unavailable"**. That is impact-on-usage at
+   migrate time, possible only because the rule is a typed value over the
+   same `Milk` the column is checked against, not a JSON blob of strings.
+   This is the **rule-coverage check**, engine stage 2 of this proposal:
+   `planMigration` learns that a closed-world growth on a configuration
+   type touches every `PriceRule` column over that type, and the report
+   names the rows that price the new variant by omission.
+
+3. **The tabulation** has the safe default for free: no `OfferPrice` row
+   for pistachio means `quote` refuses with a typed error. Absence is a
+   refusal, never an invented price. Regenerating the tabulation after the
+   rule is edited (derived child rows, engine stage 3) is what makes the
+   new variant sellable — deliberately, per offer.
+
+4. **Queries**, once they are data too (R5, study §5): `migrate status`
+   can say the third thing — "these four queries case-split on `Milk`;
+   their plans change" — and replay them before `apply`.
+
+One edit, three reports, one universe. The compiler covers what is code;
+the migration covers what is rows; the finite, typed configuration space
+is what lets the second be as total as the first.
+
 ## The general pattern, stated once
 
 > **Stored function over a finite type.** A field whose value means
