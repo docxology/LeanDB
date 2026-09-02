@@ -15,7 +15,7 @@ has the query that needs it.
 | R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
 | R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
-| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done; LEP-0003 A, B, C, D done 2026-09-01 |
+| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
 ---
