@@ -3,9 +3,10 @@ import Kernels
 /-! Tests for the kernels base: the typed-composition property at compile
 time (`#check_failure`), the `KernelSig` boundary (codec round trip, `make`
 refusals, CLI-path insert of a malformed signature), the derived search
-columns (LEP-0003 B3: recomputed on write, checked on read), and every
-query over seed data. The four headline `kernels log` plans are printed,
-not asserted — they are the evidence the README quotes. -/
+columns (LEP-0003 B3: recomputed on write, checked on read), the inline
+fields (LEP-0003 C: flattened columns, both JSON spellings, pushdown),
+and every query over seed data. The five headline `kernels log` plans
+are printed, not asserted — they are the evidence the README quotes. -/
 
 open LeanDb Kernels
 open GpuMarket (Gpu)
@@ -82,19 +83,23 @@ private def malformedRow : Lean.Json :=
   let sig := "{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}},{\"var\":{\"v\":\"K\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}"
   Lean.Json.mkObj [("name", "bad-sig"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
     ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
-    ("launch", "{\"block\":256,\"smemBytes\":0,\"stages\":1}"), ("deterministic", true),
-    ("accum", "f32"), ("fuses", Lean.Json.arr #[]), ("license", "mit"),
+    ("launch", Lean.Json.mkObj [("block", 256), ("smemBytes", 0), ("stages", 1)]),
+    ("numeric", Lean.Json.mkObj [("deterministic", true), ("accum", "f32")]),
+    ("fuses", Lean.Json.arr #[]), ("license", "mit"),
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "bf16"), ("outDtype0", "bf16"), ("rank0", 2)]
 
 /-- Same row, well-formed signature, search columns that contradict it.
-    They are derived now: the supplied values are ignored and recomputed. -/
+    They are derived now: the supplied values are ignored and recomputed.
+    The inline fields come in the *flat* spelling here (`launch_block`,
+    `numeric_accum`, …), `stages` omitted — it has a column default. -/
 private def lyingRow : Lean.Json :=
   let sig := "{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}"
   Lean.Json.mkObj [("name", "lying-columns"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
     ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
-    ("launch", "{\"block\":256,\"smemBytes\":0,\"stages\":1}"), ("deterministic", true),
-    ("accum", "f32"), ("fuses", Lean.Json.arr #["silu", "gelu"]), ("license", "mit"),
+    ("launch_block", 256), ("launch_smemBytes", 0),
+    ("numeric_deterministic", true), ("numeric_accum", "f32"),
+    ("fuses", Lean.Json.arr #["silu", "gelu"]), ("license", "mit"),
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "f64"), ("outDtype0", "f64"), ("rank0", 7)]
 
@@ -128,6 +133,9 @@ private def pureChecks : IO Unit := do
   | .ok k =>
       check (k.inDtype0 == .bf16 && k.outDtype0 == .bf16 && k.rank0 == 1)
         "CLI insert recomputes the derived search columns from sig"
+      -- the inline fields arrived flat; the omitted `launch_stages` took its default (C)
+      check (k.launch == { block := 256, smemBytes := 0, stages := 1 } && k.numeric == ⟨true, .f32⟩)
+        "flat spelling of the inline fields decodes; omitted sub-column takes its default"
       -- the EnumSet column comes in as names (LEP-0003 A)
       check (k.fuses == EnumSet.ofList [.silu, .gelu] && k.fuses.names == ["silu", "gelu"])
         "fuses decodes from an array of names"
@@ -160,9 +168,27 @@ private def pureChecks : IO Unit := do
   let sigShape := (Entity.columns Kernel).find? (·.name == "sig") |>.bind (·.shape)
   check (sigShape.isSome && (sigShape.getD "").startsWith "KernelSig{vars:[String],ins:[TensorTy{dtype:<f64|")
     s!"sig column carries the KernelSig shape, got {sigShape}"
-  check (((Entity.columns Kernel).find? (·.name == "launch") |>.bind (·.shape)) ==
-      some "LaunchConfig{block:Nat,smemBytes:Nat,stages:Nat=}")
-    "launch column carries the LaunchConfig shape"
+  -- C: the inline fields are sibling columns, grouped, with no column of their own
+  check (((Entity.columns Kernel).find? (·.name == "launch")).isNone && ((Entity.columns Kernel).find? (·.name == "numeric")).isNone)
+    "no column for an inline field as a whole"
+  check (((Entity.columns Kernel).filter (·.group == some "launch")).map (·.name) == #["launch_block", "launch_smemBytes", "launch_stages"])
+    "launch flattens to three grouped columns"
+  check (((Entity.columns Kernel).filter (·.group == some "numeric")).map (·.name) == #["numeric_deterministic", "numeric_accum"])
+    "numeric flattens to two grouped columns"
+  check (((Entity.columns Kernel).find? (·.name == "launch_stages") |>.bind (·.dflt)) == some (.int 1))
+    "the sub-field default is the column DEFAULT"
+  check (((Entity.columns Kernel).find? (·.name == "numeric_accum") |>.bind (·.enum)) == some (ClosedEnum.variants DType))
+    "the flattened closed-enum column keeps its CHECK"
+  check ((Entity.fieldOfName? Kernel "launch_smemBytes").isSome) "rows --eq can name a flattened column"
+  -- the nested spelling, and an unknown sub-field refused by name
+  match rowOfJson Kernel malformedRow with
+  | .error (.decode "kernel" "sig" _) => pure ()
+  | _ => throw <| IO.userError "FAIL: nested inline spelling changed the outcome"
+  match rowOfJson Kernel (Lean.Json.mkObj (lyingRow.getObj?.toOption.map (·.toList.map fun (k, v) =>
+      if k == "launch_block" then ("launch", Lean.Json.mkObj [("block", 256), ("grid", 4)]) else (k, v)) |>.getD [])) with
+  | .error (.decode "kernel" "launch_grid" _) => pure ()
+  | .error e => throw <| IO.userError s!"FAIL: unknown inline sub-field: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: an unknown inline sub-field was accepted"
   check (((Entity.columns Kernel).find? (·.name == "inDtype0") |>.bind (·.shape)).isNone)
     "a closed-enum column has no shape"
   -- instantiate / constraints
@@ -223,6 +249,21 @@ private def runQueries : DbM (Array Lean.Json) := do
   checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
       some "kernel | pushed: ((t0.\"fuses\" & ?) = 0), residual conjuncts: 0")
     s!"negated fusing plan, got {← readLog 1}"
+  -- fitsSmem: the inline sub-field pushes as its flattened column (LEP-0003 C)
+  let small ← fitsSmem 100000
+  checkD (small.size == 10 && small.all (·.val.launch.smemBytes ≤ 100000)) s!"ten kernels fit in 100000 bytes, got {small.size}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: t0.\"launch_smemBytes\" <= ?, residual conjuncts: 0")
+    s!"fitsSmem plan, got {← readLog 1}"
+  checkD ((small.map fun k => (rowJson Kernel k).compress).all fun j =>
+      (j.splitOn "\"launch\":{\"block\":").length == 2 && (j.splitOn "\"numeric\":{\"accum\":").length == 2)
+    "row JSON nests launch and numeric"
+  let repro ← reproducible .f32
+  checkD (repro.size == 11 && repro.all fun k => k.val.numeric.deterministic && k.val.numeric.accum == .f32)
+    s!"eleven deterministic f32 kernels, got {repro.size}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: (t0.\"numeric_deterministic\" IS ? AND t0.\"numeric_accum\" IS ?), residual conjuncts: 0")
+    s!"reproducible plan, got {← readLog 1}"
   -- fastest: join + canonical binding TEXT
   let some (k, m) ← fastest .gemm .h100Sxm g1 | throw (.sqlite "FAIL: fastest found nothing")
   checkD (k.val.name.raw == "gemm-cutlass-sm90-bf16-bf16out" && m.val.latency.us == 168)
@@ -292,13 +333,14 @@ private def runQueries : DbM (Array Lean.Json) := do
   discard <| fastest .gemm .h100Sxm g1
   discard <| regressions .h100Sxm
   discard <| fusing .silu
-  readLog 4
+  discard <| fitsSmem 100000
+  readLog 5
 
 def main : IO UInt32 := do
   pureChecks
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   let log ← expectOk (← withDb dbPath schema runQueries) "seed + queries"
-  IO.println "kernels log — the four headline plans:"
+  IO.println "kernels log — the five headline plans:"
   for entry in log.reverse do
     IO.println s!"  {(entry.getObjValAs? String "detail").toOption.getD "?"}"
   -- data persists across reopen; the JSON column decodes on the way back,

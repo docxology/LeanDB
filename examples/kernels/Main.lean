@@ -20,6 +20,8 @@ def main (args : List String) : IO UInt32 := do
       query% candidates,
       query% forArch,
       query% fusing,
+      query% fitsSmem,
+      query% reproducible,
       query% highRank,
       query% fastest,
       query% regressions,

@@ -5,9 +5,10 @@ import GpuMarket.Arch
 
 Every docstring says what pushes and what stays residual; `kernels log`
 is the proof. The pattern throughout: SQL narrows on the flat columns
-(enums, search columns, the canonical `binding` TEXT, `Ref`s), Lean does
-everything that looks *inside* `sig` — instantiation, unification,
-composition — because that column is opaque to SQL. -/
+(enums, search columns, the inline `launch_*`/`numeric_*` columns, the
+canonical `binding` TEXT, `Ref`s), Lean does everything that looks
+*inside* `sig` — instantiation, unification, composition — because that
+column is opaque to SQL. -/
 
 namespace Kernels
 
@@ -55,6 +56,22 @@ def forArch (op : OpKind) (arch : Arch) : DbM (Array (Stored Kernel)) :=
     the canonical-TEXT encoding it replaced could not answer in SQL. -/
 def fusing (op : OpKind) : DbM (Array (Stored Kernel)) :=
   select [Kernel] (fun k => k.val.fuses.contains op) (.key (·.val.name))
+
+/-- Kernels whose dynamic shared memory fits in `n` bytes. `launch` is an
+    inline structure (LEP-0003 C): `k.val.launch.smemBytes` is the
+    flattened column `launch_smemBytes`, and the comparison pushes as
+    `t0."launch_smemBytes" <= ?`, residual 0 — the predicate the JSON
+    column could not answer in SQL. -/
+def fitsSmem (n : Nat) : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.launch.smemBytes ≤ n) (.key (·.val.name))
+
+/-- Deterministic kernels accumulating in `accum`. `numeric` is inline
+    too: both tests push as `IS` on `numeric_deterministic` and
+    `numeric_accum` — exactly what the hand-flattened columns gave, with
+    the grouping kept in the type and in row JSON. -/
+def reproducible (accum : DType) : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.numeric.deterministic && k.val.numeric.accum == accum)
+    (.key (·.val.name))
 
 /-- Kernels whose first input is rank ≥ 3 *and* whose signature says so —
     the search column pushes, the second test reads `sig` and is residual
@@ -235,6 +252,7 @@ def kernelInfo (n : KernelName) : DbM Json := do
     ("op", Json.str (ClosedEnum.encodeName k.val.op)),
     ("sig", Json.str k.val.sig.describe),
     ("launch", Lean.toJson k.val.launch),
+    ("numeric", Lean.toJson k.val.numeric),
     ("fuses", Lean.toJson k.val.fuses.names),
     ("inDtype0", Json.str (ClosedEnum.encodeName k.val.inDtype0)),
     ("outDtype0", Json.str (ClosedEnum.encodeName k.val.outDtype0)),

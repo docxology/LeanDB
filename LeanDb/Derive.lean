@@ -23,9 +23,28 @@ the recomputation and fails with `decode` naming the column if they
 differ, and the JSON boundary may omit it. Lean forbids attributes on
 structure fields, so the mark is the `derived` wrapper in the default.
 
+A field whose type has an `Inline` instance (LEP-0003 C) is **flattened**:
+`launch : LaunchConfig` contributes one column per inline sub-field,
+`launch_block`, `launch_smemBytes`, …, each a symbol of the parent's
+`Field` inductive (`Kernel.Field.launch_smemBytes`) with the sub-field's
+type and codec, its column spec under the prefixed name and
+`group := some "launch"`. `encode` splices the inline `encode`; `decode`
+slices the row and calls the inline `decode`, naming `launch_<sub>` on
+failure. A sub-field's own default is that column's default; a
+parent-level default for the whole value is evaluated at derive time and
+split. `Option` of an inline type is refused by name.
+
 Not supported (typed error, not a runtime surprise): parameterized
 structures, and fields whose types depend on earlier fields (proof fields —
 planned, Architecture §4.3).
+
+# `deriving LeanDb.Inline`
+
+For a small flat structure stored inside an entity's row: the same
+`Field`/`fieldTy`/`get`/`codec`/`fieldSpec`/`fields`/`encode`/`decode`
+surface as `Entity`, minus the table, plus `Inline.FieldOf`. One level
+only — a field of an `Inline` type inside an `Inline` structure is refused
+by name, as are `Option` of one and `derived` defaults.
 
 # `deriving LeanDb.DbJson`
 
@@ -119,29 +138,324 @@ private def defaultInfo? (declName fname : Name) (fields : Array Name) :
   let body ← lambdaBoundedTelescope value params.size fun _ body => pure body
   return some { value, params, isDerived := (stripIdMData body).isAppOf ``LeanDb.derived }
 
-def deriveEntity (declName : Name) : CommandElabM Bool := do
+/-! ## The field walk shared by `Entity` and `Inline`
+
+Both derives walk a structure's fields the same way — one column per
+scalar field, its symbol, type, getter, codec, spec, encoding and
+decoding — and differ only in what surrounds the walk: an entity has a
+table, derived columns and typed errors; an inline structure has none
+of those. An entity field whose type is `Inline` is *flattened* here:
+it contributes one column per inline sub-field, each a symbol of its
+own in the parent's `Field` inductive. -/
+
+/-- One generated column. -/
+private structure ColGen where
+  /-- The symbol constructor: `age`, or `launch_smemBytes` for a
+      flattened one. -/
+  symName : Name
+  colName : String
+  /-- The column's Lean type. -/
+  tyStx : Term
+  /-- `get`: the value read off `r`. -/
+  getStx : Term
+  codecStx : Term
+  specStx : Term
+  /-- `encode`: the column value off `r` (a derived column recomputes). -/
+  encStx : Term
+  /-- Derived (entity only): the reified recompute function and the
+      declared-field indices it is applied to. -/
+  recompute : Option (Term × Array Nat) := none
+  deriving Inhabited
+
+/-- How a declared field is encoded and decoded. -/
+private inductive FieldEnc where
+  /-- One column, decoded through its codec. -/
+  | plain (colName : String) (tyStx : Term) (col : Nat)
+  /-- An inline value: `len` columns from `start`, spliced by the inline
+      instance's `encode`/`decode`. -/
+  | inline (tyStx : Term) (start len : Nat)
+  deriving Inhabited
+
+/-- A declared field with the columns it contributes. -/
+private structure FieldGen where
+  fname : Name
+  cols : Array ColGen
+  enc : FieldEnc
+  deriving Inhabited
+
+/-- A sub-field of an inline structure, as the parent needs it. -/
+private structure SubField where
+  name : Name
+  ty : Expr
+  tyStx : Term
+  /-- The inline type's own symbol for it (`Dims.Field.w`). -/
+  sym : Name
+  deriving Inhabited
+
+/-- Does `ty` have an `Inline` instance? -/
+private def isInlineTy (ty : Expr) : MetaM Bool := do
+  try
+    return (← synthInstance? (mkApp (mkConst ``LeanDb.Inline) ty)).isSome
+  catch _ => return false
+
+/-- The sub-fields of the inline structure `τ`, in order, with the
+    symbols its `Inline` instance declares for them. -/
+private def inlineSubFields (who : String) (owner fname : Name) (τ : Expr) :
+    TermElabM (Array SubField) := do
   let env ← getEnv
-  unless isStructure env declName do
-    throwError "deriving LeanDb.Entity: {declName} is not a structure"
-  let indVal ← getConstInfoInduct declName
-  unless indVal.numParams == 0 && indVal.numIndices == 0 do
-    throwError "deriving LeanDb.Entity: {declName} must not have type parameters"
-  let ctorName := indVal.ctors.head!
-  let ctorInfo ← getConstInfoCtor ctorName
+  let .const iname _ := τ.getAppFn |
+    throwError "{who}: field '{fname}' of {owner} has the Inline type {τ}, which is not a plain structure"
+  unless isStructure env iname && τ.getAppNumArgs == 0 do
+    throwError "{who}: field '{fname}' of {owner} has the Inline type {τ}, which is not a plain structure"
+  let inst ← synthInstance (mkApp (mkConst ``LeanDb.Inline) τ)
+  let symTy ← whnf (mkApp2 (mkConst ``LeanDb.Inline.Field) τ inst)
+  let .const symTyName _ := symTy |
+    throwError "{who}: the Inline instance of {τ} has a symbol type that is not an inductive ({symTy})"
+  let ctorInfo ← getConstInfoCtor (← getConstInfoInduct iname).ctors.head!
+  let subs := getStructureFields env iname
+  forallTelescopeReducing ctorInfo.type fun ys _ => do
+    unless ys.size == subs.size do
+      throwError "{who}: unexpected constructor arity for {iname}"
+    let mut out := #[]
+    for j in [0:subs.size] do
+      let g := subs[j]!
+      let ty ← inferType ys[j]!
+      if (Array.ofSubarray ys[0:j]).any (fun y => ty.containsFVar y.fvarId!) then
+        throwError "{who}: field '{g}' of the inline type {iname} depends on an earlier field; not supported"
+      let sym := symTyName ++ g
+      unless env.contains sym do
+        throwError "{who}: the Inline instance of {iname} declares no symbol '{sym}' for field '{g}'"
+      out := out.push { name := g, ty, tyStx := ← delab ty, sym }
+    return out
+
+/-- Walk the fields of `declName` (inside its constructor's telescope) into
+    the columns they generate. `entity` says whether derived columns and
+    inline flattening are allowed (they are entity notions). -/
+private def walkFields (who : String) (declName : Name) (entity : Bool) :
+    TermElabM (Array FieldGen) := do
+  let env ← getEnv
+  let ctorInfo ← getConstInfoCtor (← getConstInfoInduct declName).ctors.head!
   let fields := getStructureFields env declName
-  let tblName := tableNameOf declName
-  if tblName.startsWith "_leandb_" then
-    throwError "deriving LeanDb.Entity: table name '{tblName}' uses the reserved _leandb_ prefix"
-  if fields.any (·.getString! == "id") then
-    throwError "deriving LeanDb.Entity: field 'id' is reserved for LeanDB row identity"
+  forallTelescopeReducing ctorInfo.type fun xs _ => do
+    unless xs.size == fields.size do
+      throwError "{who}: unexpected constructor arity for {declName}"
+    let mut gens : Array FieldGen := #[]
+    let mut nextCol := 0
+    for i in [0:fields.size] do
+      let fname := fields[i]!
+      let ftype := (← instantiateMVars (← inferType xs[i]!)).consumeMData
+      if (Array.ofSubarray xs[0:i]).any (fun x => ftype.containsFVar x.fvarId!) then
+        throwError "{who}: field '{fname}' of {declName} depends on an earlier field; proof/dependent fields are not supported yet"
+      let tyStx ← delab ftype
+      -- `Option` of an inline value is refused: "every sub-column NULL" is
+      -- ambiguous once a sub-field is itself nullable
+      if ftype.isAppOfArity ``Option 1 then
+        if ← isInlineTy (ftype.getArg! 0) then
+          throwError "{who}: field '{fname}' of {declName} is `Option {ftype.getArg! 0}` where {ftype.getArg! 0} is an Inline structure; an optional inline value is not supported (all sub-columns NULL is ambiguous once a sub-field is itself nullable) — store it as a JSON column (ColCodec.json) if it must be optional"
+      let dflt? ← defaultInfo? declName fname fields
+      if ← isInlineTy ftype then
+        -- an inline field: flattened into one column per sub-field
+        unless entity do
+          throwError "{who}: field '{fname}' of {declName} has type {ftype}, which is itself an Inline structure; nesting inline structures is not supported yet (one level only)"
+        if dflt?.any (·.isDerived) then
+          throwError "{who}: field '{fname}' of {declName} is marked `derived` but has an Inline type; a derived column must be a scalar"
+        let subs ← inlineSubFields who declName fname ftype
+        -- a parent-level default for the whole value is evaluated here and
+        -- split into per-column defaults; a sub-field's own default comes
+        -- with its `fieldSpec`
+        let mut splitDflt : Array (Option Term) := subs.map fun _ => none
+        match dflt? with
+        | some d =>
+            if d.params.isEmpty then
+              try
+                let mut acc := #[]
+                for sub in subs do
+                  let v ← evalCol (← mkAppM ``LeanDb.ColCodec.toCol #[← mkProjection d.value sub.name])
+                  acc := acc.push (some (← colLitStx v))
+                splitDflt := acc
+              catch ex =>
+                logWarning m!"{who}: default of '{declName}.{fname}' could not be evaluated ({ex.toMessageData}) — JSON inserts must supply it"
+            else
+              logWarning m!"{who}: default of '{declName}.{fname}' depends on other fields and is not reified — JSON inserts must supply it"
+        | none => pure ()
+        let mut cols : Array ColGen := #[]
+        for j in [0:subs.size] do
+          let sub := subs[j]!
+          let colName := s!"{fname}_{sub.name}"
+          let getStx ← `($(mkCIdent (ftype.getAppFn.constName! ++ sub.name)) ($(mkCIdent (declName ++ fname)) r))
+          let base ← `(LeanDb.Inline.fieldSpec (α := $tyStx) $(mkCIdent sub.sym))
+          let specStx ← match splitDflt[j]! with
+            | some lit => `({ $base with name := $(quote colName), group := some $(quote fname.toString), dflt := some $lit })
+            | none => `({ $base with name := $(quote colName), group := some $(quote fname.toString) })
+          cols := cols.push {
+            symName := Name.mkSimple colName, colName, tyStx := sub.tyStx, getStx
+            codecStx := ← `((inferInstance : LeanDb.ColCodec $(sub.tyStx)))
+            specStx
+            encStx := ← `(LeanDb.ColCodec.toCol $getStx) }
+        gens := gens.push { fname, cols, enc := .inline tyStx nextCol subs.size }
+        nextCol := nextCol + subs.size
+        continue
+      -- a scalar field: one column. Its `:= default` is reified by
+      -- EVALUATING it here, at elaboration time, with its definition-site
+      -- instances — then the literal is embedded in the column spec (DDL
+      -- DEFAULT, JSON omission, migration backfill all read it from there).
+      -- A `derived` default is reified as a *function* of its sources.
+      let mut recompute : Option (Term × Array Nat) := none
+      let dfltStx : Term ← do
+        match dflt? with
+        | some d =>
+            if d.params.isEmpty then
+              if d.isDerived then
+                throwError "{who}: field '{fname}' of {declName} is marked `derived` but its default does not depend on other fields"
+              try
+                let v ← evalCol (← mkAppM ``LeanDb.ColCodec.toCol #[d.value])
+                `(some $(← colLitStx v))
+              catch ex =>
+                logWarning m!"{who}: default of '{declName}.{fname}' could not be evaluated ({ex.toMessageData}) — JSON inserts must supply it"
+                `((none : Option LeanDb.Col))
+            else if d.isDerived then
+              unless entity do
+                throwError "{who}: field '{fname}' of {declName} is marked `derived`; derived columns belong to entities, not inline structures"
+              let idxs ← d.params.mapM fun p => do
+                match fields.findIdx? (· == p) with
+                | some j => if j < i then pure j else
+                    throwError "{who}: derived field '{fname}' of {declName} depends on '{p}', which is not an earlier field"
+                | none => throwError "{who}: derived field '{fname}' of {declName} depends on '{p}', which is not a field"
+              recompute := some (← delabFull d.value, idxs)
+              `((none : Option LeanDb.Col))
+            else
+              logWarning m!"{who}: default of '{declName}.{fname}' depends on other fields and is not reified — JSON inserts must supply it{if entity then " (mark it `derived` to have LeanDB compute it)" else ""}"
+              `((none : Option LeanDb.Col))
+        | none => `((none : Option LeanDb.Col))
+      let getStx ← `($(mkCIdent (declName ++ fname)) r)
+      let encStx ← match recompute with
+        | some (fn, idxs) =>
+            let args ← idxs.mapM fun j => `($(mkCIdent (declName ++ fields[j]!)) r)
+            `(LeanDb.ColCodec.toCol (($fn) $args*))
+        | none => `(LeanDb.ColCodec.toCol $getStx)
+      let col : ColGen := {
+        symName := fname, colName := fname.toString, tyStx, getStx
+        codecStx := ← `((inferInstance : LeanDb.ColCodec $tyStx))
+        specStx := ← `(LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx)
+        encStx, recompute }
+      gens := gens.push { fname, cols := #[col], enc := .plain fname.toString tyStx nextCol }
+      nextCol := nextCol + 1
+    -- flattened names must not collide with anything else
+    let names := gens.foldl (fun acc g => acc ++ g.cols.map (·.colName)) #[]
+    for n in names, k in [0:names.size] do
+      if (names.extract 0 k).contains n then
+        throwError "{who}: {declName} generates column '{n}' twice (a flattened inline column collides with another field)"
+    return gens
+
+/-- Everything the two instance bodies share, built from the walk. -/
+private structure Built where
+  fieldTyFn : Term
+  getFn : Term
+  codecFn : Term
+  specFn : Term
+  derivedFn : Term
+  syms : Array Term
+  encode : Term
+  /-- Number of columns. -/
+  n : Nat
+
+private def buildShared (declName : Name) (gens : Array FieldGen) : TermElabM Built := do
   let fieldTyName := declName ++ `Field
-  if env.contains fieldTyName then
-    throwError "deriving LeanDb.Entity: {declName} already declares '{fieldTyName}'; LeanDB generates the field symbols under that name"
-  -- 1. The field symbols. Declared under `_root_` so the current namespace
-  --    is not prepended; a private structure gets a private symbol type
-  --    (re-mangled to exactly `declName ++ Field` — same module).
-  let symId := rootIdent (declName ++ `Field)
-  let ctors ← fields.mapM fun f => `(Lean.Parser.Command.ctor| | $(mkIdent f):ident)
+  let cols := gens.foldl (fun acc g => acc ++ g.cols) #[]
+  let mut tyAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+  let mut getAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+  let mut codecAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+  let mut specAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+  let mut derivedAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+  let mut syms : Array Term := #[]
+  for c in cols do
+    let sym : Ident := mkCIdent (fieldTyName ++ c.symName)
+    syms := syms.push sym
+    tyAlts := tyAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(c.tyStx)))
+    getAlts := getAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(c.getStx)))
+    codecAlts := codecAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(c.codecStx)))
+    specAlts := specAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(c.specStx)))
+    derivedAlts := derivedAlts.push
+      (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(quote c.recompute.isSome)))
+  -- A zero-field structure has an empty symbol type: every function over
+  -- it is `nomatch`.
+  let bySym (alts : Array (TSyntax ``Lean.Parser.Term.matchAlt)) : TermElabM Term :=
+    if cols.isEmpty then `(fun f => nomatch f)
+    else `(fun f => match f with $alts:matchAlt*)
+  let getFn ←
+    if cols.isEmpty then `(fun f _ => nomatch f)
+    else `(fun f r => match f with $getAlts:matchAlt*)
+  -- encode: literal runs of scalar columns, inline values spliced in
+  let mut pieces : Array Term := #[]
+  let mut run : Array Term := #[]
+  for g in gens do
+    match g.enc with
+    | .plain .. => run := run.push g.cols[0]!.encStx
+    | .inline tyStx _ _ =>
+        unless run.isEmpty do pieces := pieces.push (← `(#[$run,*])); run := #[]
+        pieces := pieces.push (← `(LeanDb.Inline.encode (α := $tyStx) ($(mkCIdent (declName ++ g.fname)) r)))
+  if pieces.isEmpty || !run.isEmpty then pieces := pieces.push (← `(#[$run,*]))
+  let mut encode := pieces[0]!
+  for p in pieces[1:] do encode ← `($encode ++ $p)
+  return { fieldTyFn := ← bySym tyAlts, getFn, codecFn := ← bySym codecAlts
+           specFn := ← bySym specAlts, derivedFn := ← bySym derivedAlts, syms
+           encode := ← `(fun r => $encode), n := cols.size }
+
+/-- The decode body: a right fold of per-field binds ending in the
+    constructor. `table = some t` is an entity (typed `DbError`s; with
+    `checking`, a derived column is decoded and compared with its
+    recomputation, otherwise recomputed and the stored value ignored);
+    `none` is an inline structure (`String` errors of the form
+    `"<field>: <message>"`). -/
+private def mkDecodeBody (declName : Name) (gens : Array FieldGen) (table : Option String)
+    (checking : Bool) : TermElabM Term := do
+  let ctorName := (← getConstInfoInduct declName).ctors.head!
+  let ctorArgs := (Array.range gens.size).map fun i => (fieldBinder i : Term)
+  let recomputed (fn : Term) (idxs : Array Nat) : TermElabM Term :=
+    let args : Array Term := idxs.map fun j => (fieldBinder j : Term)
+    `(($fn) $args*)
+  let mut body : Term ← `(Except.ok ($(mkCIdent ctorName) $ctorArgs*))
+  if checking then
+    if let some tbl := table then
+      for i in (List.range gens.size).reverse do
+        if let some (fn, idxs) := gens[i]!.cols[0]!.recompute then
+          body ← `(if $(fieldBinder i) == $(← recomputed fn idxs) then $body
+                   else Except.error (LeanDb.DbError.decode $(quote tbl)
+                     $(quote gens[i]!.fname.toString) "derived column disagrees with its source"))
+  for i in (List.range gens.size).reverse do
+    let g := gens[i]!
+    match g.enc, table with
+    | .inline tyStx start len, some tbl =>
+        body ← `(Except.mapError (LeanDb.inlineDecodeError $(quote tbl) $(quote g.fname.toString))
+                   (LeanDb.Inline.decode (α := $tyStx) (row.extract $(quote start) $(quote (start + len))))
+                 >>= fun $(fieldBinder i) => $body)
+    | .inline .., none => throwError "deriving LeanDb.Inline: internal error — inline field inside an inline structure"
+    | .plain colName tyStx col, some tbl =>
+        match g.cols[0]!.recompute with
+        | some (fn, idxs) =>
+            if checking then
+              body ← `(LeanDb.decodeField $(quote tbl) $(quote colName) $tyStx (row.getD $(quote col) .null)
+                         >>= fun $(fieldBinder i) => $body)
+            else
+              body ← `(let $(fieldBinder i) : $tyStx := $(← recomputed fn idxs); $body)
+        | none =>
+            body ← `(LeanDb.decodeField $(quote tbl) $(quote colName) $tyStx (row.getD $(quote col) .null)
+                       >>= fun $(fieldBinder i) => $body)
+    | .plain colName tyStx col, none =>
+        body ← `(LeanDb.decodeFieldStr $(quote colName) $tyStx (row.getD $(quote col) .null)
+                   >>= fun $(fieldBinder i) => $body)
+  return body
+
+/-- Declare the symbol inductive `declName.Field` with one constructor per
+    generated column. Under `_root_` so the current namespace is not
+    prepended; a private structure gets a private symbol type (re-mangled
+    to exactly `declName ++ Field` — same module). -/
+private def declareSymbols (who : String) (declName : Name) (gens : Array FieldGen) :
+    CommandElabM Unit := do
+  let fieldTyName := declName ++ `Field
+  let symId := rootIdent fieldTyName
+  let cols := gens.foldl (fun acc g => acc ++ g.cols) #[]
+  let ctors ← cols.mapM fun c => `(Lean.Parser.Command.ctor| | $(mkIdent c.symName):ident)
   let symCmd ←
     if isPrivateName declName then
       `(private inductive $symId:ident where $ctors* deriving DecidableEq, Repr)
@@ -149,138 +463,58 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
       `(inductive $symId:ident where $ctors* deriving DecidableEq, Repr)
   elabCommand symCmd
   unless (← getEnv).contains fieldTyName do
-    throwError "deriving LeanDb.Entity: failed to declare '{fieldTyName}'"
+    throwError "{who}: failed to declare '{fieldTyName}'"
+
+/-- The checks both derives make before anything is declared. -/
+private def checkStructure (who : String) (declName : Name) : CommandElabM Unit := do
+  let env ← getEnv
+  unless isStructure env declName do
+    throwError "{who}: {declName} is not a structure"
+  let indVal ← getConstInfoInduct declName
+  unless indVal.numParams == 0 && indVal.numIndices == 0 do
+    throwError "{who}: {declName} must not have type parameters"
+  let fieldTyName := declName ++ `Field
+  if env.contains fieldTyName then
+    throwError "{who}: {declName} already declares '{fieldTyName}'; LeanDB generates the field symbols under that name"
+
+def deriveEntity (declName : Name) : CommandElabM Bool := do
+  let who := "deriving LeanDb.Entity"
+  checkStructure who declName
+  let env ← getEnv
+  let fields := getStructureFields env declName
+  let tblName := tableNameOf declName
+  if tblName.startsWith "_leandb_" then
+    throwError "{who}: table name '{tblName}' uses the reserved _leandb_ prefix"
+  if fields.any (·.getString! == "id") then
+    throwError "{who}: field 'id' is reserved for LeanDB row identity"
+  let fieldTyName := declName ++ `Field
+  -- 1. The walk, then the field symbols (one per column: an inline field
+  --    contributes `field_sub` for each of its sub-fields).
+  let gens ← liftTermElabM (walkFields who declName (entity := true))
+  declareSymbols who declName gens
   -- 2. The instances.
-  let cmds ← liftTermElabM <| forallTelescopeReducing ctorInfo.type fun xs _ => do
-    unless xs.size == fields.size do
-      throwError "deriving LeanDb.Entity: unexpected constructor arity for {declName}"
-    let mut tyAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
-    let mut getAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
-    let mut codecAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
-    let mut specAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
-    let mut derivedAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
-    let mut syms : Array Term := #[]
-    let mut encs : Array Term := #[]
-    let mut fieldTys : Array Term := #[]
-    -- derived fields: (index, reified default fn, parameter field indices)
-    let mut derivedFields : Array (Nat × Term × Array Nat) := #[]
-    for i in [0:fields.size] do
-      let fname := fields[i]!
-      let ftype ← inferType xs[i]!
-      if (Array.ofSubarray xs[0:i]).any (fun x => ftype.containsFVar x.fvarId!) then
-        throwError "deriving LeanDb.Entity: field '{fname}' of {declName} depends on an earlier field; proof/dependent fields are not supported yet"
-      let tyStx ← delab ftype
-      fieldTys := fieldTys.push tyStx
-      -- Reify a `:= default` field value by EVALUATING it here, at
-      -- elaboration time, with its definition-site instances — then embed
-      -- the literal in the column spec (DDL DEFAULT, JSON omission,
-      -- migration backfill all read it from there). A `derived` default
-      -- is reified as a *function* of its source fields instead.
-      let mut recompute : Option (Term × Array Nat) := none
-      let dfltStx : Term ← do
-        match ← defaultInfo? declName fname fields with
-        | some d =>
-            if d.params.isEmpty then
-              if d.isDerived then
-                throwError "deriving LeanDb.Entity: field '{fname}' of {declName} is marked `derived` but its default does not depend on other fields"
-              try
-                let v ← evalCol (← mkAppM ``LeanDb.ColCodec.toCol #[d.value])
-                `(some $(← colLitStx v))
-              catch ex =>
-                logWarning m!"deriving LeanDb.Entity: default of '{declName}.{fname}' could not be evaluated ({ex.toMessageData}) — JSON inserts must supply it"
-                `((none : Option LeanDb.Col))
-            else if d.isDerived then
-              let idxs ← d.params.mapM fun p => do
-                match fields.findIdx? (· == p) with
-                | some j => if j < i then pure j else
-                    throwError "deriving LeanDb.Entity: derived field '{fname}' of {declName} depends on '{p}', which is not an earlier field"
-                | none => throwError "deriving LeanDb.Entity: derived field '{fname}' of {declName} depends on '{p}', which is not a field"
-              recompute := some (← delabFull d.value, idxs)
-              `((none : Option LeanDb.Col))
-            else
-              logWarning m!"deriving LeanDb.Entity: default of '{declName}.{fname}' depends on other fields and is not reified — JSON inserts must supply it (mark it `derived` to have LeanDB compute it)"
-              `((none : Option LeanDb.Col))
-        | none => `((none : Option LeanDb.Col))
-      let sym : Ident := mkCIdent (fieldTyName ++ fname)
-      syms := syms.push sym
-      tyAlts := tyAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $tyStx))
-      getAlts := getAlts.push
-        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(mkCIdent (declName ++ fname)) r))
-      codecAlts := codecAlts.push
-        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => (inferInstance : LeanDb.ColCodec $tyStx)))
-      specAlts := specAlts.push
-        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident =>
-              LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx))
-      derivedAlts := derivedAlts.push
-        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(quote recompute.isSome)))
-      match recompute with
-      | some (fn, idxs) =>
-          derivedFields := derivedFields.push (i, fn, idxs)
-          -- encode recomputes from the record's source fields
-          let args ← idxs.mapM fun j => `($(mkCIdent (declName ++ fields[j]!)) r)
-          encs := encs.push (← `(LeanDb.ColCodec.toCol (($fn) $args*)))
-      | none =>
-          encs := encs.push
-            (← `(LeanDb.ColCodec.toCol ($(mkCIdent (declName ++ fname)) r)))
-    -- A zero-field structure has an empty symbol type: every function
-    -- over it is `nomatch`.
-    let bySym (alts : Array (TSyntax ``Lean.Parser.Term.matchAlt)) : TermElabM Term :=
-      if fields.isEmpty then `(fun f => nomatch f)
-      else `(fun f => match f with $alts:matchAlt*)
-    let fieldTyFn ← bySym tyAlts
-    let codecFn ← bySym codecAlts
-    let specFn ← bySym specAlts
-    let derivedFn ← bySym derivedAlts
-    let getFn ←
-      if fields.isEmpty then `(fun f _ => nomatch f)
-      else `(fun f r => match f with $getAlts:matchAlt*)
-    -- decode: right fold of decodeField binds ending in the constructor.
-    -- `checking`: a derived column is decoded and compared with its
-    -- recomputation; otherwise it is recomputed and the stored value ignored.
-    let ctorArgs := (Array.range fields.size).map fun i => (fieldBinder i : Term)
-    let recomputed (fn : Term) (idxs : Array Nat) : TermElabM Term :=
-      let args : Array Term := idxs.map fun j => (fieldBinder j : Term)
-      `(($fn) $args*)
-    let mkDecode (checking : Bool) : TermElabM Term := do
-      let mut body : Term ← `(Except.ok ($(mkCIdent ctorName) $ctorArgs*))
-      if checking then
-        for (i, fn, idxs) in derivedFields.reverse do
-          body ← `(if $(fieldBinder i) == $(← recomputed fn idxs) then $body
-                   else Except.error (LeanDb.DbError.decode $(quote tblName)
-                     $(quote fields[i]!.toString) "derived column disagrees with its source"))
-      for i in (List.range fields.size).reverse do
-        let fname := fields[i]!
-        match derivedFields.find? (·.1 == i) with
-        | some (_, fn, idxs) =>
-            if checking then
-              body ← `(LeanDb.decodeField $(quote tblName) $(quote fname.toString)
-                         $(fieldTys[i]!) (row.getD $(quote i) .null) >>= fun $(fieldBinder i) => $body)
-            else
-              body ← `(let $(fieldBinder i) : $(fieldTys[i]!) := $(← recomputed fn idxs); $body)
-        | none =>
-            body ← `(LeanDb.decodeField $(quote tblName) $(quote fname.toString)
-                       $(fieldTys[i]!) (row.getD $(quote i) .null) >>= fun $(fieldBinder i) => $body)
-      return body
-    let bodyCheck ← mkDecode true
-    let bodyRecompute ← mkDecode false
-    let n := quote fields.size
+  let cmds ← liftTermElabM do
+    let b ← buildShared declName gens
+    let bodyCheck ← mkDecodeBody declName gens (some tblName) (checking := true)
+    let bodyRecompute ← mkDecodeBody declName gens (some tblName) (checking := false)
+    let n := quote b.n
     -- `@[reducible]`: instance lookup only sees through `Entity.fieldTy f`
     -- to the field's type if the instance unfolds at reducible transparency
     -- (see `LeanDb.Entity`).
     let entityCmd : TSyntax `command ← `(@[reducible] instance : LeanDb.Entity $(mkCIdent declName) where
         Field := $(mkCIdent fieldTyName)
-        fieldTy := $fieldTyFn
-        get := $getFn
-        codec := $codecFn
-        fieldSpec := $specFn
-        fields := #[$syms,*]
+        fieldTy := $(b.fieldTyFn)
+        get := $(b.getFn)
+        codec := $(b.codecFn)
+        fieldSpec := $(b.specFn)
+        fields := #[$(b.syms),*]
         tableName := $(quote tblName)
-        encode := fun r => #[$encs,*]
+        encode := $(b.encode)
         decode := fun row =>
           if row.size == $n then $bodyCheck
           else Except.error (LeanDb.DbError.decode $(quote tblName) "*"
                  s!"expected {$n} columns, found {row.size}")
-        isDerived := $derivedFn
+        isDerived := $(b.derivedFn)
         decodeRecomputing := fun row =>
           if row.size == $n then $bodyRecompute
           else Except.error (LeanDb.DbError.decode $(quote tblName) "*"
@@ -298,6 +532,43 @@ def entityHandler : DerivingHandler := fun declNames => do
   return true
 
 initialize registerDerivingHandler ``LeanDb.Entity entityHandler
+
+/-! ## `deriving LeanDb.Inline` -/
+
+def deriveInline (declName : Name) : CommandElabM Bool := do
+  let who := "deriving LeanDb.Inline"
+  checkStructure who declName
+  let fieldTyName := declName ++ `Field
+  let gens ← liftTermElabM (walkFields who declName (entity := false))
+  declareSymbols who declName gens
+  let cmds ← liftTermElabM do
+    let b ← buildShared declName gens
+    let body ← mkDecodeBody declName gens none (checking := false)
+    let n := quote b.n
+    let inlineCmd : TSyntax `command ← `(@[reducible] instance : LeanDb.Inline $(mkCIdent declName) where
+        Field := $(mkCIdent fieldTyName)
+        fieldTy := $(b.fieldTyFn)
+        get := $(b.getFn)
+        codec := $(b.codecFn)
+        fieldSpec := $(b.specFn)
+        fields := #[$(b.syms),*]
+        encode := $(b.encode)
+        decode := fun row =>
+          if row.size == $n then $body
+          else Except.error s!"*: expected {$n} columns, found {row.size}")
+    let fieldOfCmd : TSyntax `command ← `(@[reducible] instance :
+        LeanDb.Inline.FieldOf $(mkCIdent fieldTyName) $(mkCIdent declName) := ⟨fun f => f⟩)
+    return (inlineCmd, fieldOfCmd)
+  elabCommand cmds.1
+  elabCommand cmds.2
+  return true
+
+def inlineHandler : DerivingHandler := fun declNames => do
+  for declName in declNames do
+    discard <| deriveInline declName
+  return true
+
+initialize registerDerivingHandler ``LeanDb.Inline inlineHandler
 
 /-! ## `deriving LeanDb.ClosedEnum` -/
 

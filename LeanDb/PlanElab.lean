@@ -245,6 +245,9 @@ private partial def colOf? (ctx : Ctx) (e : Expr) (fuel : Nat := 8) :
         let some info := getStructureInfo? (← getEnv) s | return none
         let some fname := info.fieldNames[i]? | return none
         return ← fieldCol ctx k s fname.toString
+      if let some info := getStructureInfo? (← getEnv) s then
+        if let some fname := info.fieldNames[i]? then
+          if let some r ← inlineCol? x fname.toString then return some r
       throughCodec? x e fun a => .proj s i a
   | _ =>
       let .const declName _ := e.getAppFn | return none
@@ -256,6 +259,7 @@ private partial def colOf? (ctx : Ctx) (e : Expr) (fuel : Nat := 8) :
       let some x := args.back? | return none
       if let some k ← storedValComp? x then
         return ← fieldCol ctx k declName.getPrefix declName.getString!
+      if let some r ← inlineCol? x declName.getString! then return some r
       throughCodec? x e fun a => mkAppN e.getAppFn (args.set! (args.size - 1) a)
 where
   compIdx? (x : Expr) : MetaM (Option Nat) := do
@@ -267,6 +271,37 @@ where
     match x with
     | .proj s 1 c => if s == ``Stored then compIdx? c else return none
     | _ => return none
+  /-- `x` as a structure projection `f y`, in either spelling:
+      (structure, field name, `y`). -/
+  projOf? (x : Expr) : MetaM (Option (Name × String × Expr)) := do
+    let x ← whnfR x
+    match x with
+    | .proj s i y =>
+        let some info := getStructureInfo? (← getEnv) s | return none
+        let some fname := info.fieldNames[i]? | return none
+        return some (s, fname.toString, y)
+    | _ =>
+        let .const declName _ := x.getAppFn | return none
+        let some _ := (← getEnv).getProjectionFnInfo? declName | return none
+        let some y := x.getAppArgs.back? | return none
+        return some (declName.getPrefix, declName.getString!, y)
+  /-- The projection of an inline field (LEP-0003 C): `whole` is `g x`
+      and `x` is itself `f y` with `y` a `Stored.val` component and `f` a
+      field of its entity whose type has an `Inline` instance. The entity
+      flattened that field into one column per sub-field, each with its
+      own symbol, so `g` of it is the declared column `f_g` of the same
+      table — `Col.here Entity.Field.f_g`, nothing composed. A `via`
+      newtype among the sub-fields unwraps on top of this, through
+      `throughCodec?`, exactly as for a plain column. -/
+  inlineCol? (x : Expr) (g : String) : MetaM (Option (Expr × Nat)) := do
+    let some (s, f, y) ← projOf? x | return none
+    let some k ← storedValComp? y | return none
+    let τ ← instantiateMVars (← inferType x)
+    let isInline ← try
+        pure (← synthInstance? (mkApp (mkConst ``LeanDb.Inline) τ)).isSome
+      catch _ => pure false
+    unless isInline do return none
+    fieldCol ctx k s s!"{f}_{g}"
   /-- `whole` is `f x` for a projection `f : α → β`, and `x` resolves to a
       column of type `α`. Push through `f` exactly when `f` *is* that
       column's encoding: `Col.via c f (fun a => rfl)` elaborates iff

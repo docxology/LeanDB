@@ -40,6 +40,11 @@ LEP-0003 A landed: `EnumSet α` bitmask columns over a closed world —
 mask CHECK, open-time drift scan, JSON as an array of names, `Pred.bit`
 so membership pushes; kernels' `fuses`.
 
+LEP-0003 C landed: `deriving LeanDb.Inline` — small fixed structures
+flatten into prefixed columns with flat field symbols, nested row JSON
+(both spellings accepted), split defaults, and full pushdown through the
+projection; kernels' `LaunchConfig`/`NumericProps`.
+
 Pushdown: a captured `Option α` parameter over a closed world case-splits
 (`none` and each `some c`), so "filter by X if given" pushes in both the
 `isNone ||` and the `match` spelling; `some a == some b` unwraps.

@@ -8,11 +8,12 @@ values three different ways, deliberately, so the base can report on each:
 
 - `sig : KernelSig` — one JSON TEXT column with a declared shape
   (`ColCodec.json`, LEP-0003 B2); SQL can test it only for equality.
-- `launch : LaunchConfig` — three scalars, *also* stored as one JSON
-  column (the inline-flatten candidate, kept nested to show what that
-  costs: `smemBytes ≤ 100000` is residual).
-- `deterministic`/`accum` — `NumericProps` inline-flattened by hand into
-  sibling columns; both push.
+- `launch : LaunchConfig` and `numeric : NumericProps` — small fixed
+  structures, **inline-flattened** by the derive (LEP-0003 C): one
+  column per field (`launch_block`, `launch_smemBytes`, `launch_stages`,
+  `numeric_deterministic`, `numeric_accum`), one symbol per column
+  (`Kernel.Field.launch_smemBytes`), so every field pushes and migrations
+  see each. Row JSON nests them back (`"launch": {…}`).
 - `fuses : EnumSet OpKind` — a set of a closed world as an INTEGER
   bitmask (LEP-0003 A): membership pushes as a bit test, the DDL CHECK
   bounds the mask, row JSON shows the names.
@@ -30,14 +31,18 @@ namespace Kernels
 open LeanDb
 
 /-- Launch shape: threads per block, dynamic shared memory in bytes,
-    pipeline stages. Small and fixed — the study's inline-flatten
-    candidate — stored here as one JSON column on purpose. -/
+    pipeline stages. Small and fixed — stored inline as three sibling
+    columns of `kernel` (LEP-0003 C); `stages` has a column DEFAULT. -/
 structure LaunchConfig where
   block     : Nat
   smemBytes : Nat
   stages    : Nat := 1
-  deriving Repr, DecidableEq, LeanDb.DbJson
+  deriving Repr, DecidableEq, Lean.ToJson, LeanDb.Inline
 
+/-- The constructor the base uses: a block that is a positive multiple of
+    32 up to 1024, shared memory that fits some supported arch, a
+    positive stage count. (The column boundary checks each field's
+    *type*; this whole-value check is the Lean side's.) -/
 def LaunchConfig.make (block smemBytes : Nat) (stages : Nat := 1) : Except String LaunchConfig := do
   if block == 0 || block > 1024 || block % 32 != 0 then
     throw s!"block must be a positive multiple of 32 up to 1024, got {block}"
@@ -45,10 +50,13 @@ def LaunchConfig.make (block smemBytes : Nat) (stages : Nat := 1) : Except Strin
   if stages == 0 then throw "stages must be positive"
   return { block, smemBytes, stages }
 
-/-- Validated through `make` at the column boundary; JSON may omit
-    `stages` (its default is 1). -/
-instance : ColCodec LaunchConfig :=
-  ColCodec.json LaunchConfig fun c => LaunchConfig.make c.block c.smemBytes c.stages
+/-- Numeric properties: bitwise-reproducible across runs, and the
+    accumulation dtype. Inline, like `LaunchConfig` — the two columns the
+    base used to flatten by hand. -/
+structure NumericProps where
+  deterministic : Bool
+  accum         : DType
+  deriving Repr, DecidableEq, Lean.ToJson, LeanDb.Inline
 
 structure Kernel where
   name          : KernelName
@@ -59,10 +67,7 @@ structure Kernel where
   minArch       : Arch
   maxArch       : Option Arch
   launch        : LaunchConfig
-  /-- `NumericProps`, flattened: bitwise-reproducible across runs? -/
-  deterministic : Bool
-  /-- `NumericProps`, flattened: accumulation dtype. -/
-  accum         : DType
+  numeric       : NumericProps
   fuses         : EnumSet OpKind
   source        : SourceHash
   license       : License
@@ -79,13 +84,12 @@ structure Kernel where
     derived columns need no help: their defaults compute them. -/
 def Kernel.make (name : KernelName) (op : OpKind) (lang : Lang) (variant : Variant)
     (sig : KernelSig) (minArch : Arch) (maxArch : Option Arch) (launch : LaunchConfig)
-    (deterministic : Bool) (accum : DType) (fuses : EnumSet OpKind) (source : SourceHash)
+    (numeric : NumericProps) (fuses : EnumSet OpKind) (source : SourceHash)
     (license : License) : Except String Kernel := do
   if let some mx := maxArch then
     unless mx.supports minArch do
       throw s!"maxArch {LeanDb.ClosedEnum.encodeName mx} does not support minArch {LeanDb.ClosedEnum.encodeName minArch}"
-  return { name, op, lang, variant, sig, minArch, maxArch, launch, deterministic, accum,
-           fuses, source, license }
+  return { name, op, lang, variant, sig, minArch, maxArch, launch, numeric, fuses, source, license }
 
 /-- One measurement. `sku` is gpumarket's closed world: the CHECK over its
     vocabulary and `Gpu.spec` come with the type. -/

@@ -56,7 +56,7 @@ private def kernel! (name : String) (op : OpKind) (lang : Lang) (variant : Strin
     (license : License := .bsd3) : DbM (Stored Kernel) := do
   let k ← seedM name do
     Kernel.make (← KernelName.make name) op lang (← Variant.make variant) (← s)
-      minArch maxArch (← LaunchConfig.make block smem stages) deterministic accum
+      minArch maxArch (← LaunchConfig.make block smem stages) { deterministic, accum }
       (EnumSet.ofList fuses) (← SourceHash.make (fakeHash name)) license
   insert Kernel k
 

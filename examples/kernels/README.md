@@ -2,12 +2,14 @@
 
 The base from `proposals/stress-domains-kernels-restaurants.md` §1, built
 against the engine as it is (ROADMAP R2), then moved onto LEP-0003 stages
-B and A as they landed. Its job is to make the nested-values decision
+B, A and C as they landed. Its job is to make the nested-values decision
 concrete: `KernelSig` lives in **one JSON column with a declared shape**,
 the common filters go through **derived search columns** the engine
 recomputes and checks, the fused-op set is an **`EnumSet` bitmask** whose
-membership pushes, and everything that looks *inside* a signature —
-instantiation, unification, composition into `Prog ins outs` — is Lean.
+membership pushes, the launch configuration and numeric properties are
+**inline structures** flattened into sibling columns by the derive, and
+everything that looks *inside* a signature — instantiation, unification,
+composition into `Prog ins outs` — is Lean.
 `Bench.sku` is gpumarket's `Gpu`: the first cross-base type reuse, and
 its datasheet (`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
 
@@ -15,9 +17,9 @@ its datasheet (`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
 Kernels/Enums.lean     DType OpKind Lang Arch MemSpace License; Arch.supports (@[db]), Arch.ofGpu
 Kernels/Scalars.lean   Micros MilliTflops Permille KernelName Variant SourceHash … DimVar DimBinding
 Kernels/Sig.lean       Dim Layout TensorTy DimConstraint KernelSig (make, codec, instantiate), unify
-Kernels/Entities.lean  Kernel (fuses : EnumSet OpKind) Bench Program ProgramNode ProgramEdge; LaunchConfig; Kernel.make
+Kernels/Entities.lean  Kernel (launch/numeric inline, fuses : EnumSet OpKind) Bench Program ProgramNode ProgramEdge; LaunchConfig NumericProps; Kernel.make
 Kernels/Prog.lean      Prog ins outs; launches, estimate, emit (skeleton), ofRows (the gate)
-Kernels/Queries.lean   candidates fusing fastest composable synthesize regressions roofline program kernelInfo
+Kernels/Queries.lean   candidates fusing fitsSmem reproducible fastest composable synthesize regressions roofline program kernelInfo
 Kernels/Seed.lean      14 kernels, 19 benches (illustrative), one stored program
 ```
 
@@ -29,7 +31,8 @@ $k query seed
 $k query synthesize gemm,rmsNorm h100Sxm M=4096,N=4096,K=4096
 $k query regressions h100Sxm
 $k query fusing silu
-$k log 4
+$k query fitsSmem 100000
+$k log 5
 ```
 
 `CLI_TRANSCRIPT.md` is the full session from a fresh `data/` dir. The
@@ -54,7 +57,13 @@ about gpumarket's own `defaultTargets` needed changing.
   *k*-th constructor — with `CHECK (("fuses" & ~1048575) = 0)` in the
   DDL, an open-time scan for bits outside the world, the names in the
   fingerprint, and `["silu"]` in row JSON; `k.val.fuses.contains op`
-  pushes as `("fuses" & ?) != 0`.
+  pushes as `("fuses" & ?) != 0`. `launch : LaunchConfig` and `numeric :
+  NumericProps` are `deriving LeanDb.Inline`: the entity derive flattens
+  them into `launch_block`/`launch_smemBytes`/`launch_stages` and
+  `numeric_deterministic`/`numeric_accum`, each a symbol of
+  `Kernel.Field`, so `k.val.launch.smemBytes ≤ n` pushes as
+  `launch_smemBytes <= ?`; row JSON shows `"launch": {…}` and takes
+  either spelling.
 - **Program layer.** `Prog : List TensorTy → List TensorTy → Type` with
   `kernel` (a `Stored Kernel`, a binding, and a proof that the signature
   instantiates to the node's edge types), `id`, `seq`, `par`, `swap`,
@@ -81,8 +90,9 @@ about gpumarket's own `defaultTargets` needed changing.
 Everything below was measured on this base (`set_option leandb.explain
 true`, `kernels log`); residual counts are from the tactic. The first
 three paragraphs are the record as it was measured against the R2
-engine; **"What stage B changed"** and **"What stage A changed"** at the
-end of the section say which of it no longer holds.
+engine; **"What stage B changed"**, **"What stage A changed"** and
+**"What stage C changed"** at the end of the section say which of it no
+longer holds.
 
 **Predicates I wanted over `sig` and could not push.** Each is one
 `select [Kernel]` conjunct that reads the JSON column; each is `residual
@@ -140,7 +150,8 @@ look *inside* `sig` or `launch` at all — only a byte-exact
 `--eq sig=<compressed JSON>` would match — so "first input is bf16" is
 answerable only because `inDtype0` exists as a column.
 
-**Inline-flattening `LaunchConfig`/`NumericProps`: yes, both.** The base
+**Inline-flattening `LaunchConfig`/`NumericProps`: yes, both.** (As
+measured on R2; both are inline since stage C, below.) The base
 did one of each on purpose. `NumericProps` is flattened by hand
 (`deterministic`, `accum`): `k.val.deterministic && k.val.accum == .f32`
 pushes as two `IS` tests. `LaunchConfig` is a second JSON column:
@@ -188,8 +199,9 @@ column all worked unchanged.
 **What stage B changed (LEP-0003 B1–B3, this base rebuilt on it).**
 
 - *B1 — `deriving LeanDb.DbJson`.* `Dim`, `Layout`, `TensorTy`,
-  `DimConstraint`, `KernelSig` and `LaunchConfig` derive it instead of
-  `Lean.ToJson`/`Lean.FromJson`. The encoding is byte-identical to Lean's
+  `DimConstraint` and `KernelSig` derive it instead of
+  `Lean.ToJson`/`Lean.FromJson` (`LaunchConfig` did too, until stage C
+  made it inline). The encoding is byte-identical to Lean's
   (the seed rows and the transcript's `sig` strings did not change), but
   an omitted field with a structure default now takes the default:
   `{"dtype":"bf16","shape":[]}` decodes as a `TensorTy` with
@@ -271,11 +283,59 @@ bought, each shown in the transcript and pinned in `KernelsTests`:
   bit 20 is not in the closed world (20 variants)`). The `FusedOps`
   scalar, its codec and its `make` are deleted.
 
+**What stage C changed (LEP-0003 C, inline flatten).** `LaunchConfig`
+and `NumericProps` are `deriving LeanDb.Inline`; `Kernel` has `launch :
+LaunchConfig` and `numeric : NumericProps`, and the hand-flattened
+`deterministic`/`accum` fields are gone. The entity derive flattens both
+at derive time — it synthesizes `Inline` for each field's type — into
+sibling columns `launch_block`, `launch_smemBytes`, `launch_stages`,
+`numeric_deterministic`, `numeric_accum`, one symbol each
+(`Kernel.Field.launch_smemBytes`), with the sub-field's type, codec and
+default (`launch_stages INTEGER NOT NULL DEFAULT 1`; `numeric_accum`
+keeps `DType`'s CHECK) and a `group` naming the parent field. What that
+bought, each in the transcript and pinned in `KernelsTests`:
+
+- *The JSON column's residual is gone.* `fitsSmem n` is `select [Kernel]
+  (fun k => k.val.launch.smemBytes ≤ n)`; the log line is `kernel |
+  pushed: t0."launch_smemBytes" <= ?, residual conjuncts: 0`. The tactic
+  learned one shape — a projection of a field whose type is `Inline` is
+  the flattened symbol — and nothing else: `Col.here` of a generated
+  symbol, so the `via` newtype machinery composes on top unchanged (the
+  engine tests push `b.val.size.w.v ≤ 5` through a newtype sub-field).
+  `reproducible accum` is `k.val.numeric.deterministic &&
+  k.val.numeric.accum == accum`, pushed as two `IS` tests — what the
+  hand-flattening gave, with the grouping kept in the type.
+- *Migrations, DDL and `rows --eq` see plain columns.* `--eq
+  launch_smemBytes=232448` finds the fp8 GEMM; adding an inline field to
+  an entity is one `add column` per sub-field (engine test); the
+  fingerprint is the DDL's — the group is not material, so every other
+  base's fingerprint is unchanged and this base's moved from
+  `12236197873572621045` to the transcript's because the columns did.
+- *Row JSON keeps the grouping.* Output nests `"launch": {"block": 384,
+  "smemBytes": 232448, "stages": 4}` and `"numeric": {…}`; `insert` and
+  `update` take the nested object or the flat keys (`launch_block`), a
+  sub-field omitted in either form takes its column default, a column
+  given in both forms is refused naming it (`kernel.launch_block: given
+  twice`), an unknown sub-field by name (`kernel.launch_grid`). `schema`
+  shows `"group":"launch"` on each flattened column.
+- *What moved off the codec.* `LaunchConfig.make` (block a positive
+  multiple of 32 up to 1024, shared memory that fits some arch, positive
+  stages) is no longer run by a codec — an inline value has no codec of
+  its own; each sub-column is checked by its *type*. The base's own
+  writes go through `make`; a CLI insert of `{"block": 7}` is accepted
+  as a row. Making those checks column-level is a matter of giving the
+  fields validated newtypes, which the flattening supports (the engine
+  test's `Dims.w : Milli`); the base keeps plain `Nat`s so the pushed
+  predicate reads as `smemBytes ≤ n`.
+- *Refused by name at derive time:* `Option LaunchConfig` ("all
+  sub-columns NULL" is ambiguous once a sub-field is nullable — use a
+  JSON column), an `Inline` field inside an `Inline` structure (one level
+  for now), a `derived` default of an inline type.
+
 **What still stands.** Every per-input question in the first paragraph
 — "exactly two inputs", "any input column-major", per-input rank — is
 still residual: a derived column carries one fact about the *first*
 input, and a fixed set of columns still cannot describe a list. That is
 stage D's (child tables, after LEP-0004). `rows --eq` still cannot look
-inside `sig` or `launch`; `smemBytes ≤ 100000` is still residual until
-stage C flattens `LaunchConfig`. And a *refused* shape change is
-refused, not migrated: typed value transformations are a later LEP.
+inside `sig`. And a *refused* shape change is refused, not migrated:
+typed value transformations are a later LEP.

@@ -449,11 +449,19 @@ structure ColumnSpec where
       Not DDL — the column is TEXT either way — but part of the
       fingerprint and of what `migrate` diffs. -/
   shape : Option String := none
+  /-- The parent field this column was flattened out of (LEP-0003 C): a
+      field `launch : LaunchConfig` of an `Inline` type contributes the
+      columns `launch_block`, `launch_smemBytes`, … each with
+      `group := some "launch"`. Row JSON nests them back under that key;
+      `schema` JSON shows it. Not DDL and not part of the fingerprint —
+      the table has plain columns either way. -/
+  group : Option String := none
   deriving Repr, BEq, Inhabited
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
 def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
-    [ColCodec α] [RefTarget α] [ColEnum α] [ColEnumSet α] : ColumnSpec where
+    [ColCodec α] [RefTarget α] [ColEnum α] [ColEnumSet α]
+    (group : Option String := none) : ColumnSpec where
   name := name
   sqlType := ColCodec.sqlType α
   nullable := ColCodec.nullable α
@@ -462,6 +470,7 @@ def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
   enumSet := ColEnumSet.variants α
   dflt := dflt
   shape := ColCodec.shape α
+  group := group
 
 structure TableSpec where
   name : String
@@ -473,5 +482,14 @@ def decodeField (table field : String) (α : Type) [ColCodec α] (c : Col) : Exc
   match fromCol c with
   | .ok a => .ok a
   | .error msg => .error (.decode table field msg)
+
+/-- `decodeField` for a value that has no table of its own (an `Inline`
+    structure's field): the failure is a `String` of the form
+    `"<field>: <message>"`, which the parent entity's `decode` turns into
+    `DbError.decode table "<parent>_<field>"` (`inlineDecodeError`). -/
+def decodeFieldStr (field : String) (α : Type) [ColCodec α] (c : Col) : Except String α :=
+  match fromCol c with
+  | .ok a => .ok a
+  | .error msg => .error s!"{field}: {msg}"
 
 end LeanDb

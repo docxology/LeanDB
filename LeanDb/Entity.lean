@@ -53,6 +53,64 @@ class Entity (α : Type) where
    these are the projections that appear in types. -/
 attribute [reducible] Entity.Field Entity.fieldTy Entity.codec
 
+/-! ## Inline structures (LEP-0003 C)
+
+A small flat structure (`LaunchConfig`) stored *inside* an entity's row
+as one column per field, not in a table of its own. `deriving
+LeanDb.Inline` generates the `Entity` surface minus the table; the
+entity that holds a field of an `Inline` type flattens it at derive time
+into columns `<field>_<sub>` with one symbol per column
+(`Kernel.Field.launch_smemBytes`), so the planner, DDL, migrations and
+`rows --eq` see plain columns. Row JSON nests them back under the field
+name (`ColumnSpec.group`). An `Inline` type is not an entity: no id, no
+table, no `Ref` to it. -/
+
+class Inline (α : Type) where
+  /-- The field symbols, one per field in declaration order. -/
+  Field : Type
+  fieldTy : Field → Type
+  get : (f : Field) → α → fieldTy f
+  codec : (f : Field) → ColCodec (fieldTy f)
+  /-- The column as it would stand alone (name = the field name, no
+      group); the parent renames it `<field>_<sub>` and sets the group. -/
+  fieldSpec : Field → ColumnSpec
+  fields : Array Field
+  /-- Field values in declaration order. -/
+  encode : α → Array Col
+  /-- Inverse of `encode` over honest data. Failure is a `String` of the
+      form `"<sub>: <message>"` (`"*: …"` for an arity mismatch): the
+      value has no table, so the parent supplies that context. -/
+  decode : Array Col → Except String α
+
+attribute [reducible] Inline.Field Inline.fieldTy Inline.codec
+
+/-- The symbol type of an `Inline` structure determines it — the
+    `FieldOf` of inline types, generated with every `deriving
+    LeanDb.Inline`. (`FieldOf` itself is keyed on `Entity`, and an inline
+    type is not one.) -/
+class Inline.FieldOf (F : Type) (α : outParam Type) [Inline α] where
+  sym : F → Inline.Field α
+
+attribute [reducible] Inline.FieldOf.sym
+
+/-- The stand-alone column specs of an inline structure, in declaration order. -/
+def Inline.columns (α : Type) [Inline α] : Array ColumnSpec :=
+  (Inline.fields (α := α)).map fun f => Inline.fieldSpec f
+
+/-- The stand-alone column name of an inline field symbol. -/
+def Inline.fieldName [Inline α] (f : Inline.Field α) : String :=
+  (Inline.fieldSpec f).name
+
+/-- The `Inline.decode` failure of the value in field `field` of `table`,
+    as the parent's typed error: `"<sub>: <message>"` names the column
+    `<field>_<sub>`, anything else the whole group `<field>_*`. -/
+def inlineDecodeError (table field : String) (msg : String) : DbError :=
+  match msg.splitOn ": " with
+  | sub :: rest@(_ :: _) =>
+      let sub := if sub == "*" || sub.isEmpty then "*" else sub
+      .decode table s!"{field}_{sub}" (String.intercalate ": " rest)
+  | _ => .decode table s!"{field}_*" msg
+
 /-- The symbol type determines its entity. Unification cannot invert
     `Entity.Field ?α =?= Ticket.Field`, so a column reference written from
     the symbol alone (`Col.here Ticket.Field.title`) recovers the entity

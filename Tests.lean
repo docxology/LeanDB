@@ -1852,6 +1852,259 @@ private def testOptionalParamEndToEnd : IO Unit := do
                    #["lentils", "tofu"], #["pork", "salmon"]])
     s!"optional filter rows: {rows}"
 
+/-! ## LEP-0003 C: inline flatten — an `Inline` structure stored as sibling columns -/
+
+namespace InlineC
+
+/-- Two fields: a `via` newtype (the root `Milli`, whose codec is its
+    projection) and a scalar with a default. -/
+structure Dims where
+  w : Milli
+  h : Nat := 1
+  deriving Repr, DecidableEq, LeanDb.Inline
+
+/-- `size` has no parent-level default (its `h` still has the sub-field's);
+    `pad` has one for the whole value, split into per-column defaults. -/
+structure Box where
+  label : String
+  size : Dims
+  pad : Dims := ⟨⟨7⟩, 2⟩
+  deriving Repr, LeanDb.Entity
+
+-- The refusals, at derive time and by name.
+/--
+error: deriving LeanDb.Entity: field 'd' of InlineC.OptBox is `Option Dims` where Dims is an Inline structure; an optional inline value is not supported (all sub-columns NULL is ambiguous once a sub-field is itself nullable) — store it as a JSON column (ColCodec.json) if it must be optional
+-/
+#guard_msgs in
+structure OptBox where
+  d : Option Dims
+  deriving LeanDb.Entity
+
+/--
+error: deriving LeanDb.Inline: field 'd' of InlineC.Nested has type Dims, which is itself an Inline structure; nesting inline structures is not supported yet (one level only)
+-/
+#guard_msgs in
+structure Nested where
+  d : Dims
+  deriving LeanDb.Inline
+
+/--
+error: deriving LeanDb.Inline: field 'd' of InlineC.OptInner is `Option Dims` where Dims is an Inline structure; an optional inline value is not supported (all sub-columns NULL is ambiguous once a sub-field is itself nullable) — store it as a JSON column (ColCodec.json) if it must be optional
+-/
+#guard_msgs in
+structure OptInner where
+  d : Option Dims
+  deriving LeanDb.Inline
+
+/--
+error: deriving LeanDb.Entity: field 'd' of InlineC.DerivedInline is marked `derived` but has an Inline type; a derived column must be a scalar
+-/
+#guard_msgs in
+structure DerivedInline where
+  n : Nat
+  d : Dims := derived ⟨⟨n⟩, n⟩
+  deriving LeanDb.Entity
+
+-- the flattened symbol is a column reference like any other, typed by
+-- the sub-field
+#check (Pred.Col.here Box.Field.size_w : Pred.Col [Box] Milli _)
+#check (Pred.ord (.here Box.Field.size_h) .le 5 : Pred [Box])
+-- …and there is no symbol for the inline field as a whole
+#check_failure Box.Field.size
+
+private def pj (s : String) : IO Lean.Json :=
+  match Lean.Json.parse s with
+  | .ok j => pure j
+  | .error e => throw <| IO.userError s!"FAIL: bad test JSON: {e}"
+
+private def box (label : String) (w h : Nat) : Box := { label, size := ⟨⟨w⟩, h⟩ }
+
+private def testDerived : IO Unit := do
+  -- the inline instance: the Entity surface minus the table
+  check ((Inline.fields (α := Dims)).map Inline.fieldName == #["w", "h"]) "inline symbols in order"
+  check ((Inline.columns Dims).map (·.dflt) == #[none, some (.int 1)]) "inline sub-field default is its column's"
+  check ((Inline.columns Dims).all (·.group.isNone)) "an inline structure's own columns carry no group"
+  check (Inline.encode (⟨⟨5⟩, 9⟩ : Dims) == #[.int 5, .int 9]) "inline encode"
+  check ((Inline.decode #[.int 5, .int 9] : Except String Dims).toOption == some ⟨⟨5⟩, 9⟩) "inline decode"
+  let strErr (r : Except String Dims) : Option String := match r with | .error m => some m | .ok _ => none
+  check (strErr (Inline.decode #[.text "x", .int 9]) == some "w: expected INTEGER, found TEXT \"x\"")
+    "inline decode names the sub-field"
+  check (strErr (Inline.decode #[.int 5]) == some "*: expected 2 columns, found 1")
+    "inline decode names the arity"
+  -- the parent: one symbol and one column per sub-field, in order
+  check (Entity.fields (α := Box) == #[.label, .size_w, .size_h, .pad_w, .pad_h]) "flattened symbols"
+  check ((Entity.columns Box).map (·.name) == #["label", "size_w", "size_h", "pad_w", "pad_h"]) "flattened columns"
+  check ((Entity.columns Box).map (·.group) == #[none, some "size", some "size", some "pad", some "pad"])
+    "flattened columns carry their group"
+  check ((Entity.columns Box).map (·.dflt) == #[none, none, some (.int 1), some (.int 7), some (.int 2)])
+    "sub-field default kept; parent-level default split per column"
+  check ((Entity.fields (α := Box)).all fun f => !Entity.isDerived f) "flattened columns are not derived"
+  check (Entity.fieldOfName? Box "size_w" == some .size_w) "fieldOfName? finds a flattened column"
+  check ((Entity.fieldOfName? Box "size").isNone) "the inline field itself is not a column"
+  check (Entity.get (α := Box) Box.Field.size_h (box "b" 5 9) == 9) "get composes through the inline value"
+  check ((Entity.spec Box).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"box\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"label\" TEXT NOT NULL, \"size_w\" INTEGER NOT NULL, \"size_h\" INTEGER NOT NULL DEFAULT 1, \"pad_w\" INTEGER NOT NULL DEFAULT 7, \"pad_h\" INTEGER NOT NULL DEFAULT 2)")
+    s!"box DDL golden, got {(Entity.spec Box).ddl}"
+  -- encode splices, decode slices; errors name the flattened column
+  check (Entity.encode (box "b" 5 9) == #[.text "b", .int 5, .int 9, .int 7, .int 2]) "encode splices the inline values"
+  match (Entity.decode #[.text "b", .int 5, .int 9, .int 7, .int 2] : Except DbError Box) with
+  | .ok b => check (b.label == "b" && b.size == ⟨⟨5⟩, 9⟩ && b.pad == ⟨⟨7⟩, 2⟩) "decode round trip"
+  | .error e => throw <| IO.userError s!"FAIL: decode: {e}"
+  match (Entity.decode #[.text "b", .text "bad", .int 9, .int 7, .int 2] : Except DbError Box) with
+  | .error (.decode "box" "size_w" m) => check (m == "expected INTEGER, found TEXT \"bad\"") s!"wrapped message, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: wrong error for a bad sub-column: {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a bad sub-column decoded"
+  match (Entity.decode #[.text "b", .int 5, .int 9, .int 7] : Except DbError Box) with
+  | .error (.decode "box" "*" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: wrong result for a short row: {repr (r.toOption.map (·.label))}"
+  -- the group is not DDL and not fingerprint material
+  let ungrouped : TableSpec := ⟨"box", (Entity.columns Box).map fun c => { c with group := none }⟩
+  check (fingerprint [Entity.spec Box] == fingerprint [ungrouped]) "group is not part of the fingerprint"
+  check (fingerprint [Entity.spec Box] == toString (hash (Entity.spec Box).ddl)) "an inline schema fingerprints its DDL"
+  -- entities without inline fields: nothing moved (value pinned before this change)
+  check ((Entity.columns Author).all (·.group.isNone) && (Entity.columns Book).all (·.group.isNone))
+    "plain entities have no groups"
+  check (fingerprint schema == "13729757873300583215")
+    s!"author+book fingerprint unchanged by stage C, got {fingerprint schema}"
+
+private def testJson : IO Unit := do
+  let b : Stored Box := ⟨⟨1⟩, box "b" 5 9⟩
+  check ((rowJson Box b).compress == "{\"id\":1,\"label\":\"b\",\"pad\":{\"h\":2,\"w\":7},\"size\":{\"h\":9,\"w\":5}}")
+    s!"row JSON nests the groups, got {(rowJson Box b).compress}"
+  -- in: nested, flat, mixed across groups; an omitted sub-field takes its default
+  let nested ← expectOk (rowOfJson Box (← pj "{\"label\":\"x\",\"size\":{\"w\":5,\"h\":9}}")) "nested in"
+  check (nested.size == ⟨⟨5⟩, 9⟩ && nested.pad == ⟨⟨7⟩, 2⟩) "nested spelling decodes; omitted group takes the split default"
+  let flat ← expectOk (rowOfJson Box (← pj "{\"label\":\"x\",\"size_w\":5,\"size_h\":9,\"pad_h\":4}")) "flat in"
+  check (flat.size == ⟨⟨5⟩, 9⟩ && flat.pad == ⟨⟨7⟩, 4⟩) "flat spelling decodes"
+  let partial_ ← expectOk (rowOfJson Box (← pj "{\"label\":\"x\",\"size\":{\"w\":5}}")) "partial group in"
+  check (partial_.size == ⟨⟨5⟩, 1⟩) "an omitted sub-field inside the group takes the sub-field default"
+  -- refusals, by name
+  match rowOfJson Box (← pj "{\"label\":\"x\",\"size_w\":5,\"size\":{\"w\":6}}") with
+  | .error (.decode "box" "size_w" m) => check ((m.splitOn "given twice").length == 2) s!"both-spellings message, got {m}"
+  | r => throw <| IO.userError s!"FAIL: a column given in both spellings was not refused: {repr (r.toOption.map (·.label))}"
+  match rowOfJson Box (← pj "{\"label\":\"x\",\"size\":{\"w\":6,\"depth\":1}}") with
+  | .error (.decode "box" "size_depth" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: an unknown sub-field was not refused: {repr (r.toOption.map (·.label))}"
+  match rowOfJson Box (← pj "{\"label\":\"x\",\"size\":5}") with
+  | .error (.decode "box" "size" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a non-object group was not refused: {repr (r.toOption.map (·.label))}"
+  match rowOfJson Box (← pj "{\"label\":\"x\"}") with
+  | .error (.decode "box" "size_w" "missing required field") => pure ()
+  | r => throw <| IO.userError s!"FAIL: a missing required sub-column was not refused: {repr (r.toOption.map (·.label))}"
+  match rowOfJson Box (← pj "{\"label\":\"x\",\"size\":{\"w\":\"five\"}}") with
+  | .error (.decode "box" "size_w" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a mistyped nested value was not refused: {repr (r.toOption.map (·.label))}"
+  -- merge: a nested object overlays only the sub-fields it names
+  let merged ← expectOk (rowMergeJson Box b.val (← pj "{\"size\":{\"h\":3}}")) "nested merge"
+  check (merged.size == ⟨⟨5⟩, 3⟩ && merged.label == "b") "nested merge overlays one sub-field"
+  let mergedFlat ← expectOk (rowMergeJson Box b.val (← pj "{\"pad_w\":1}")) "flat merge"
+  check (mergedFlat.pad == ⟨⟨1⟩, 2⟩) "flat merge overlays one column"
+  check ((rowMergeJson Box b.val (← pj "{\"size_h\":3,\"size\":{\"h\":4}}")).isOk == false)
+    "merge refuses both spellings of one column"
+  -- schema JSON carries the group and round-trips it
+  for c in Entity.columns Box do
+    check ((ColumnSpec.fromJson? c.toJson).toOption == some c) s!"ColumnSpec JSON round trip for {c.name}"
+  check ((specsFromJson? (specsToJson [Entity.spec Box])).toOption == some [Entity.spec Box])
+    "schema JSON round trip with groups"
+  check (((Entity.spec Box).toJson.compress.splitOn "\"group\":\"size\"").length == 3)
+    "schema JSON shows the group on both of its columns"
+  check (((Entity.spec Author).toJson.compress.splitOn "group").length == 1)
+    "schema JSON of a plain entity mentions no group"
+
+/-! The tactic: a projection of an inline field is the flattened column,
+    a `via` sub-field unwraps on top, negation stays exact. -/
+
+private def sizeHPlan : PlanFor (ts := [Box]) (fun (b : Stored Box) => b.val.size.h ≤ 5) := by leandb_plan
+private def sizeWPlan : PlanFor (ts := [Box]) (fun (b : Stored Box) => b.val.size.w.v ≤ 5) := by leandb_plan
+private def sizeWCapturedPlan (n : Nat) : PlanFor (ts := [Box]) (fun (b : Stored Box) =>
+    b.val.size.w.v ≥ n) := by leandb_plan
+private def negPlan : PlanFor (ts := [Box]) (fun (b : Stored Box) => !(b.val.pad.h == 2)) := by leandb_plan
+private def bothPlan (n : Nat) : PlanFor (ts := [Box]) (fun (b : Stored Box) =>
+    b.val.size.h ≤ n && b.val.size.w.v ≥ 3) := by leandb_plan
+private def eqWholePlan (d : Dims) : PlanFor (ts := [Box]) (fun (b : Stored Box) =>
+    b.val.size == d) := by leandb_plan
+private def sizeWLitPlan : PlanFor (ts := [Box]) (fun (b : Stored Box) => b.val.size.w == ⟨5⟩) := by leandb_plan
+
+private def testPlans : IO Unit := do
+  checkPlan sizeHPlan "t0.\"size_h\" <= ?" #[.int 5] 0 "projection of an inline field pushes as the flattened column"
+  checkPlan sizeWPlan "t0.\"size_w\" <= ?" #[.int 5] 0 "a via newtype sub-field unwraps on top of the flattening"
+  checkPlan (sizeWCapturedPlan 3) "t0.\"size_w\" >= ?" #[.int 3] 0 "captured bound through the flattened newtype"
+  checkPlan negPlan "t0.\"pad_h\" IS NOT ?" #[.int 2] 0 "negation over a flattened column is exact"
+  checkPlan (bothPlan 5) "(t0.\"size_h\" <= ? AND t0.\"size_w\" >= ?)" #[.int 5, .int 3] 0 "both sub-fields push"
+  checkPlan (eqWholePlan ⟨⟨1⟩, 1⟩) "1" #[] 1 "equality against the whole inline value is residual (no column for it)"
+  checkPlan sizeWLitPlan "t0.\"size_w\" IS ?" #[.int 5] 0 "equality on a newtype sub-field pushes through its codec"
+  -- coherence: the plan means what the lambda means
+  let boxes : Array (Stored Box) := #[⟨⟨1⟩, box "a" 5 9⟩, ⟨⟨2⟩, box "b" 2 3⟩, ⟨⟨3⟩, { box "c" 3 5 with pad := ⟨⟨1⟩, 5⟩ }⟩]
+  checkCoherent sizeHPlan boxes "sizeHPlan"
+  checkCoherent sizeWPlan boxes "sizeWPlan"
+  checkCoherent negPlan boxes "negPlan"
+  checkCoherent (bothPlan 5) boxes "bothPlan 5"
+
+private def dbPath : System.FilePath := ".lake" / "leandb_test_inline.sqlite"
+
+private def testEndToEnd : IO Unit := do
+  if ← dbPath.pathExists then IO.FS.removeFile dbPath
+  let r ← withDb dbPath [Entity.spec Box] do
+    let a ← insert Box (box "a" 5 9)
+    discard <| insert Box (box "b" 2 3)
+    discard <| insert Box { box "c" 3 5 with pad := ⟨⟨1⟩, 5⟩ }
+    let byLabel : SortBy (Stored Box) := .key (·.val.label)
+    let planned ← select [Box] (fun b => b.val.size.h ≤ 5 && b.val.size.w.v ≥ 3) byLabel
+    let reference ← selectUnplanned [Box] (fun b => b.val.size.h ≤ 5 && b.val.size.w.v ≥ 3) byLabel
+    unless planned.map (·.val.label) == reference.map (·.val.label) do
+      throw (.sqlite s!"FAIL: planned {planned.map (·.val.label)} ≠ unplanned {reference.map (·.val.label)}")
+    unless planned.map (·.val.label) == #["c"] do
+      throw (.sqlite s!"FAIL: expected [c], got {planned.map (·.val.label)}")
+    let log ← readLog 2
+    let details := log.map fun e => (e.getObjValAs? String "detail").toOption.getD "?"
+    unless details.contains "box | pushed: (t0.\"size_h\" <= ? AND t0.\"size_w\" >= ?), residual conjuncts: 0" do
+      throw (.sqlite s!"FAIL: log lacks the pushed plan: {details}")
+    -- update through the JSON boundary with the nested spelling
+    let a' ← DbM.ofExcept (rowMergeJson Box a.val (Lean.Json.mkObj [("size", Lean.Json.mkObj [("h", 1)])]))
+    discard <| update a a'
+    fetchAll Box
+  let rows ← expectOk r "inline end to end"
+  check (rows.map (·.val.size.h) == #[1, 3, 5] && rows.map (·.val.pad.h) == #[2, 2, 5]) "rows read back through the slices"
+  -- the file holds plain columns: a raw write to one sub-column is one column
+  let db ← SQLite.open dbPath
+  db.exec "UPDATE box SET size_w = 'oops' WHERE label = 'b'"
+  match ← withDb dbPath [Entity.spec Box] (fetchAll Box) with
+  | .error (.decode "box" "size_w" _) => pure ()
+  | .error e => throw <| IO.userError s!"FAIL: raw-SQL corruption of a sub-column: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a corrupted sub-column was read back"
+
+private def migPath : System.FilePath := ".lake" / "leandb_test_inline_mig.sqlite"
+
+/-- `Box` before `pad` existed. -/
+private def boxV1 : TableSpec :=
+  ⟨"box", (Entity.columns Box).filter fun c => c.group != some "pad"⟩
+
+private def testMigration : IO Unit := do
+  -- adding an inline field is one addColumn per sub-column
+  match planMigration [boxV1] [Entity.spec Box] with
+  | .ok plan =>
+      check (plan.steps.map (·.describe) == ["add column \"box\".\"pad_w\"", "add column \"box\".\"pad_h\""])
+        s!"adding an inline field plans N addColumn steps, got {plan.steps.map (·.describe)}"
+  | .error e => throw <| IO.userError s!"FAIL: planMigration: {e}"
+  if ← migPath.pathExists then IO.FS.removeFile migPath
+  discard <| expectOk (← withDb migPath [boxV1] (pure ())) "create at v1"
+  let db ← SQLite.open migPath
+  db.exec "INSERT INTO box (label, size_w, size_h) VALUES ('old', 4, 4)"
+  let (_, report?) ← expectOk (← migrate migPath [Entity.spec Box] (apply := true)) "additive migrate"
+  check ((report?.map (·.applied)).getD [] == ["add column \"box\".\"pad_w\"", "add column \"box\".\"pad_h\""])
+    "both sub-columns added"
+  let rows ← expectOk (← withDb migPath [Entity.spec Box] (fetchAll Box)) "open after migrate"
+  check (rows.map (·.val.pad) == #[⟨⟨7⟩, 2⟩]) "existing rows took the split parent default"
+
+def run : IO Unit := do
+  testDerived
+  testJson
+  testPlans
+  testEndToEnd
+  testMigration
+
+end InlineC
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -1877,5 +2130,6 @@ def main : IO UInt32 := do
   EnumSetA.run
   testOptionalParamPlans
   testOptionalParamEndToEnd
+  InlineC.run
   IO.println "all engine tests passed"
   return 0
