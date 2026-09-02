@@ -2,24 +2,27 @@
 
 The base from `proposals/stress-domains-kernels-restaurants.md` §1, built
 against the engine as it is (ROADMAP R2), then moved onto LEP-0003 stages
-B, A and C as they landed. Its job is to make the nested-values decision
-concrete: `KernelSig` lives in **one JSON column with a declared shape**,
-the common filters go through **derived search columns** the engine
-recomputes and checks, the fused-op set is an **`EnumSet` bitmask** whose
-membership pushes, the launch configuration and numeric properties are
-**inline structures** flattened into sibling columns by the derive, and
-everything that looks *inside* a signature — instantiation, unification,
-composition into `Prog ins outs` — is Lean.
+B, A, C and D as they landed. Its job is to make the nested-values
+decision concrete: `KernelSig` (variables, scalars, constraints) lives in
+**one JSON column with a declared shape**, the inputs and outputs are
+**child tables** (`kernel_ins`/`kernel_outs`, one row per tensor, part of
+the kernel's value) over which per-input questions push as LEP-0004
+quantifiers, the common filters go through **derived search columns** the
+engine recomputes and checks, the fused-op set is an **`EnumSet` bitmask**
+whose membership pushes, the launch configuration and numeric properties
+are **inline structures** flattened into sibling columns by the derive,
+and everything that looks *inside* a tensor type — instantiation,
+unification, composition into `Prog ins outs` — is Lean.
 `Bench.sku` is gpumarket's `Gpu`: the first cross-base type reuse, and
 its datasheet (`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
 
 ```
 Kernels/Enums.lean     DType OpKind Lang Arch MemSpace License; Arch.supports (@[db]), Arch.ofGpu
 Kernels/Scalars.lean   Micros MilliTflops Permille KernelName Variant SourceHash … DimVar DimBinding
-Kernels/Sig.lean       Dim Layout TensorTy DimConstraint KernelSig (make, codec, instantiate), unify
-Kernels/Entities.lean  Kernel (launch/numeric inline, fuses : EnumSet OpKind) Bench Program ProgramNode ProgramEdge; LaunchConfig NumericProps; Kernel.make
+Kernels/Sig.lean       Dim Layout LayoutKind TensorTy DimConstraint KernelSig (make, codec, checkTensors, instantiate) KernelInput (Inline), unify
+Kernels/Entities.lean  Kernel (ins/outs child tables, launch/numeric inline, fuses : EnumSet OpKind) Bench Program ProgramNode ProgramEdge; LaunchConfig NumericProps; Kernel.make
 Kernels/Prog.lean      Prog ins outs; launches, estimate, emit (skeleton), ofRows (the gate)
-Kernels/Queries.lean   candidates fusing fitsSmem reproducible fastest composable synthesize regressions roofline program kernelInfo
+Kernels/Queries.lean   candidates fusing fitsSmem reproducible highRank allHighRank anyColMajor exactlyTwoInputs fastest composable synthesize regressions roofline program kernelInfo
 Kernels/Seed.lean      14 kernels, 19 benches (illustrative), one stored program
 ```
 
@@ -32,6 +35,8 @@ $k query synthesize gemm,rmsNorm h100Sxm M=4096,N=4096,K=4096
 $k query regressions h100Sxm
 $k query fusing silu
 $k query fitsSmem 100000
+$k query allHighRank 3
+$k query anyColMajor
 $k log 5
 ```
 
@@ -41,16 +46,28 @@ about gpumarket's own `defaultTargets` needed changing.
 
 ## What is typed where
 
-- **Row layer.** `Kernel.sig : KernelSig` is `ColCodec.json KernelSig
-  KernelSig.validate` — one `TEXT` column of compressed JSON whose
+- **Row layer.** `Kernel.sig : KernelSig` — the shape variables, scalar
+  arguments and constraints — is `ColCodec.json KernelSig
+  KernelSig.validate`: one `TEXT` column of compressed JSON whose
   *shape* (`JsonShape`, from `deriving LeanDb.DbJson`) is in the schema
   and the fingerprint. The codec validates through `KernelSig.make`, so a
-  signature that names an undeclared variable, or an output variable no
-  input binds, is refused by the SQLite codec and by the CLI's `insert`
-  alike (transcript: `kernel.sig: shape variable K is used but not
-  declared in vars`, exit 2). `inDtype0`/`outDtype0`/`rank0` are
-  `derived sig.…` fields: the engine recomputes them on every write and
-  checks them on every read. `DimBinding` is canonical TEXT
+  constraint over an undeclared variable is refused by the SQLite codec
+  and by the CLI's `insert` alike (transcript: `kernel.sig: shape
+  variable K is used but not declared in vars`, exit 2). `Kernel.ins`
+  and `Kernel.outs` are `List KernelInput` — **child tables**
+  `kernel_ins`/`kernel_outs` (LEP-0003 D): one row per tensor with
+  `parent` (a cascading FK), `position`, and the record's columns
+  `dtype`, `rank`, `layoutKind` (a closed world) and `full` (the whole
+  `TensorTy` as a JSON column). The lists are part of the value: every
+  read reattaches them, `insert`/`update` write them in the parent's
+  transaction, `delete` cascades. The cross-check between a signature and
+  its tensors (every variable declared, outputs determined, one of each)
+  spans parent and child rows and is `Kernel.make`'s
+  (`KernelSig.checkTensors`) — the engine has no whole-value validator
+  across tables. `inDtype0`/`outDtype0`/`rank0` are
+  `derived` from the first input: the engine recomputes them on every
+  write and checks them on every read, once the list is attached.
+  `DimBinding` is canonical TEXT
   (`K=4096,M=4096,N=4096`, sorted, no duplicates), so equality pushes as
   `binding IS ?` and the same binding typed in any order matches.
   `fuses : EnumSet OpKind` is an INTEGER bitmask — bit *k* is `OpKind`'s
@@ -76,7 +93,10 @@ about gpumarket's own `defaultTargets` needed changing.
 - **Queries.** `candidates` pushes every conjunct (`Arch.supports` becomes
   a case split over `minArch`, folded at plan build to the disjunction of
   the architectures the captured arch supports); `fusing` is one pushed
-  bit test; `fastest` is a pushed join sorted client-side;
+  bit test; `highRank`/`allHighRank`/`anyColMajor` are quantifiers over
+  `kernel_ins` (`.all` → `NOT EXISTS`, `.any` → `EXISTS`), residual 0;
+  `exactlyTwoInputs` (`ins.length == 2`) is an aggregate and stays
+  residual; `fastest` is a pushed join sorted client-side;
   `regressions` is a pushed self-join with the 10% arithmetic residual;
   `composable` narrows on `inDtype0` then unifies in Lean; `synthesize`
   searches candidates depth-first, threading edge types, and returns
@@ -90,9 +110,9 @@ about gpumarket's own `defaultTargets` needed changing.
 Everything below was measured on this base (`set_option leandb.explain
 true`, `kernels log`); residual counts are from the tactic. The first
 three paragraphs are the record as it was measured against the R2
-engine; **"What stage B changed"**, **"What stage A changed"** and
-**"What stage C changed"** at the end of the section say which of it no
-longer holds.
+engine; **"What stage B changed"**, **"What stage A changed"**, **"What
+stage C changed"** and **"What stage D changed"** at the end of the
+section say which of it no longer holds.
 
 **Predicates I wanted over `sig` and could not push.** Each is one
 `select [Kernel]` conjunct that reads the JSON column; each is `residual
@@ -172,9 +192,10 @@ which a derive can keep (`launch_block`, or a nested object on output).
 - *Inline flatten for `LaunchConfig` and `NumericProps`* — small, fixed,
   scalar fields; full pushdown and migration visibility for free.
 - *Child tables for `sig.ins`/`sig.outs`* (`KernelInput (kernel, position,
-  dtype, rank, layoutKind)`) — the only encoding under which "exactly two
-  inputs", "any input column-major" and per-input rank push, and they push
-  as LEP-0004's `exists`/`forall`. `ProgramEdge` already is one.
+  dtype, rank, layoutKind)`) — the only encoding under which "any input
+  column-major" and per-input rank push, and they push as LEP-0004's
+  `exists`/`forall`; landed as stage D (below). "Exactly two inputs" is
+  an aggregate and still does not. `ProgramEdge` already is one.
 - *`EnumSet` for `fuses`* — landed as stage A (below): the canonical-TEXT
   set was the cheapest thing that worked and the cheapest thing to
   replace; membership is the one question a set is for, and it pushes now.
@@ -332,10 +353,88 @@ bought, each in the transcript and pinned in `KernelsTests`:
   JSON column), an `Inline` field inside an `Inline` structure (one level
   for now), a `derived` default of an inline type.
 
-**What still stands.** Every per-input question in the first paragraph
-— "exactly two inputs", "any input column-major", per-input rank — is
-still residual: a derived column carries one fact about the *first*
-input, and a fixed set of columns still cannot describe a list. That is
-stage D's (child tables, after LEP-0004). `rows --eq` still cannot look
-inside `sig`. And a *refused* shape change is refused, not migrated:
-typed value transformations are a later LEP.
+**What stage D changed (LEP-0003 D, child tables).** `KernelSig` lost
+`ins`/`outs`; `Kernel` has `ins : List KernelInput` and `outs : List
+KernelInput`, where `KernelInput` is `deriving LeanDb.Inline` with
+`dtype`, `rank`, `layoutKind : LayoutKind` (a closed enum derived from
+`Layout`) and `full : TensorTy` (the whole type, a JSON column with a
+shape — an inline field may be one). The entity derive generated two
+child entities, `Kernel.Ins` and `Kernel.Outs` — tables `kernel_ins` and
+`kernel_outs` with `parent : Ref Kernel` (`ON DELETE CASCADE`, the one
+cascade in the engine), `position : Nat`, then the record's columns —
+and `Entity.specs Kernel` lists all three tables. What that bought, each
+in the transcript and pinned in `KernelsTests` and the engine tests:
+
+- *The per-input questions push.* `highRank n` is `k.val.rank0 ≥ n &&
+  k.val.ins.all (·.rank ≥ n)`; its log line is `kernel | pushed:
+  (t0."rank0" >= ? AND NOT EXISTS (SELECT 1 FROM "kernel_ins" AS s0 WHERE
+  s0."parent" IS t0."id" AND s0."rank" < ?)), residual conjuncts: 0` —
+  the "smallest honest example of the gap" (residual 1 above) has no
+  residual. `allHighRank n` is the quantifier alone; `anyColMajor` is
+  `k.val.ins.any (·.layoutKind == .colMajor)`, pushed as `EXISTS (… AND
+  s0."layoutKind" IS ?)`. The tactic learned one shape: `xs.any f` /
+  `xs.all f` with `xs` a child-list field reifies to LEP-0004's
+  `exists`/`forall` with the row's `Col.id` as parent, the child's
+  `parent` symbol as key, and the lambda body reified over `Kernel.Ins ::
+  ts` with `i` replaced by the record rebuilt from the child row — so
+  `i.rank` is the child's `rank` column and nothing else in `colOf?`
+  changed. The same plan written as data (`Pred.all (.here
+  Kernel.Ins.Field.parent) (pred% …)`) renders byte-identically and
+  returns the same rows (test). A body the tactic cannot translate makes
+  the whole quantifier one opaque leaf; the lambda decides over the
+  attached list.
+- *"Exactly two inputs" is still residual*, and says so in its docstring:
+  `ins.length == 2` is an aggregate over the child rows (`pushed: 1,
+  residual conjuncts: 1` in the transcript). LEP-0004 names the
+  expressible-but-ugly spelling; an aggregate verb is a later LEP.
+- *The list is part of the value.* `Stored Kernel` carries both lists on
+  every read path (`get`, `fetchAll`, the filtered fetch, the joined
+  executor): one engine-internal `SELECT … FROM kernel_ins WHERE parent
+  IN (…) ORDER BY parent, position` per child table per fetch, chunked at
+  500 ids — not one per row. `insert` writes the parent then the child
+  rows in one transaction (a dangling `Ref` inside a record rolls the
+  parent back); `update` keeps its CAS on the kernel's own columns and
+  then replaces both lists wholesale in the same transaction (the tests
+  swap a GEMM's lists for the RMSNorm's and read the derived columns
+  back recomputed); `delete` cascades to the child rows while a bench's
+  `Ref Kernel` still RESTRICTs (transcript: `delete kernel 15` takes its
+  two `kernel_ins` rows, `delete kernel 1` is `restricted`).
+- *The derived columns now read the first child.* `inDtype0 := derived
+  ((ins.head?.map (·.dtype)).getD .f32)` and so on. `encode` recomputes
+  them from the full value as before; `decode` cannot check them without
+  the list, so the check moved to the moment the list is attached
+  (`ChildLink.attach`) — the raw-SQL desync in the transcript is still
+  refused by name, one read later than the column itself.
+- *JSON and the CLI.* Row JSON carries `"ins": [{"dtype": …, "rank": …,
+  "layoutKind": …, "full": "…"}, …]` with the position implicit;
+  `insert` takes the arrays (omitted means empty), `update` replaces the
+  list when given; `rows kernel_ins --eq dtype=bf16` filters the child
+  table like any other, and `Main` lists `.of Kernel.Ins`/`.of
+  Kernel.Outs` beside `.of Kernel`. `schema` shows `"cascade":true` on
+  the `parent` column and the DDL says `ON DELETE CASCADE`, so the
+  fingerprint moved (child tables are ordinary tables; adding one is a
+  `createTable`, removing one is a destructive `dropTable` — engine
+  tests).
+- *What moved off the codec.* `KernelSig.make` used to refuse a signature
+  whose tensors name an undeclared variable, and the column codec ran it,
+  so the CLI refused such a row. The tensors are child rows now, and the
+  check spans the parent row and its children: it is
+  `KernelSig.checkTensors`, run by `Kernel.make` on the Lean side, and
+  the CLI insert of a tensor over an undeclared variable is accepted as
+  rows (the constraint-level check still runs through the codec:
+  transcript's `bad-sig`). A whole-value validator across tables is a
+  later hook, named here rather than approximated.
+- *Refused by name at derive time:* `List` of a non-`Inline` type without
+  a codec of its own, `Option (List R)`, a list inside an `Inline` record
+  (one level), a `derived` child list (LEP-0005's mechanism), and a
+  record field named `parent` or `position`.
+
+**What still stands.** "Exactly two inputs" and every other aggregate
+over the child rows is residual until an aggregate verb exists. `rows
+--eq` still cannot look inside `sig` or a tensor's `full`. The three
+search facts on a child row (`dtype`, `rank`, `layoutKind`) are kept
+consistent with `full` by `KernelInput.ofTensorTy`, not by the engine —
+an `Inline` record cannot carry a `derived` column, so a CLI insert can
+write a child row whose `rank` disagrees with its `full`. And a
+*refused* shape change is refused, not migrated: typed value
+transformations are a later LEP.

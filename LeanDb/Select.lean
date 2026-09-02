@@ -56,6 +56,12 @@ class RowsOf (ts : List Type) where
   /-- Decode one joined result row laid out as `id, cols…` per table,
       starting at `start`. -/
   decodeFrom : (cols : Array Col) → (start : Nat) → Except DbError (Rows ts)
+  /-- Map every table's column of rows through `f` (which must keep length
+      and order) and reassemble — how the executor attaches child lists
+      (LEP-0003 D) to joined results in one pass per table. -/
+  mapTables : {m : Type → Type} → [Monad m] →
+    (f : (α : Type) → [Entity α] → Array (Stored α) → m (Array (Stored α))) →
+    Array (Rows ts) → m (Array (Rows ts))
 
 /-- Decode `id, cols…` of a single entity from a slice of a joined row. -/
 private def decodeStored (α : Type) [Entity α] (cols : Array Col) (start : Nat) :
@@ -72,6 +78,7 @@ instance [Entity α] : RowsOf [α] where
   ids r := [r.id.toInt64]
   specs := [Entity.spec α]
   decodeFrom cols start := decodeStored α cols start
+  mapTables f rows := f α rows
 
 instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
   gather offset src := do
@@ -84,6 +91,10 @@ instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
     let h ← decodeStored α cols start
     let t ← RowsOf.decodeFrom (ts := β :: ts) cols (start + 1 + (Entity.fields (α := α)).size)
     return (h, t)
+  mapTables f rows := do
+    let hs ← f α (rows.map (·.1))
+    let ts ← RowsOf.mapTables (ts := β :: ts) f (rows.map (·.2))
+    return hs.zip ts
 
 private def compareIds : List Int64 → List Int64 → Ordering
   | [], [] => .eq

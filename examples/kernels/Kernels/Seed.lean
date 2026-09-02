@@ -35,12 +35,14 @@ private def ty (dt : DType) (shape : String) (layout : Layout := .rowMajor) :
     a literal name; `KernelSig.make` still refuses it unless declared. -/
 private def V (s : String) : Dim := .var ⟨s⟩
 
+/-- A signature with its tensors: the `KernelSig` column and the two
+    lists that become child rows. -/
 private def sig (vars : String) (ins outs : List (Except String TensorTy))
     (constraints : List DimConstraint := []) (scalars : List (String × DType) := []) :
-    Except String KernelSig := do
+    Except String (KernelSig × List TensorTy × List TensorTy) := do
   let vars ← (vars.splitOn " ").mapM DimVar.make
   let scalars ← scalars.mapM fun (n, dt) => (·, dt) <$> ScalarName.make n
-  KernelSig.make vars (← ins.mapM id) (← outs.mapM id) scalars constraints
+  return (← KernelSig.make vars scalars constraints, ← ins.mapM id, ← outs.mapM id)
 
 /-- A stand-in for sha256 of source we do not have: 64 hex chars derived
     from the name. -/
@@ -50,12 +52,13 @@ private def fakeHash (name : String) : String :=
   h ++ h ++ h ++ h
 
 private def kernel! (name : String) (op : OpKind) (lang : Lang) (variant : String)
-    (s : Except String KernelSig) (minArch : Arch) (maxArch : Option Arch := none)
-    (block : Nat := 256) (smem : Nat := 0) (stages : Nat := 1)
+    (s : Except String (KernelSig × List TensorTy × List TensorTy)) (minArch : Arch)
+    (maxArch : Option Arch := none) (block : Nat := 256) (smem : Nat := 0) (stages : Nat := 1)
     (deterministic : Bool := true) (accum : DType := .f32) (fuses : List OpKind := [])
     (license : License := .bsd3) : DbM (Stored Kernel) := do
   let k ← seedM name do
-    Kernel.make (← KernelName.make name) op lang (← Variant.make variant) (← s)
+    let (s, ins, outs) ← s
+    Kernel.make (← KernelName.make name) op lang (← Variant.make variant) s ins outs
       minArch maxArch (← LaunchConfig.make block smem stages) { deterministic, accum }
       (EnumSet.ofList fuses) (← SourceHash.make (fakeHash name)) license
   insert Kernel k

@@ -32,6 +32,14 @@ type cannot be emitted at all:
   a bit test `(col & ?) != 0`; negation flips it. With `a` a closed-enum
   *column* the case split below applies;
 - bare `Bool` columns; `@[db]`-tagged defs unfolded;
+- `row.val.ins.any (fun i => …)` / `.all` over a child-list field
+  (LEP-0003 D) as LEP-0004's `Pred.exists`/`Pred.forall` over the generated
+  child entity: the parent reference is the component's `Col.id`, the key
+  the child's `parent` symbol, and the body is reified over `child :: ts`
+  with `i` replaced by the record rebuilt from the child row's fields, so
+  `i.rank ≥ n` is the child's `rank` column. A body the tactic cannot
+  translate makes the whole quantifier one opaque leaf; `ins.length`,
+  `ins.head?` and other non-quantifier reads of the list stay residual;
 - `match` on a closed-enum column (directly or via an unfolded `@[db]`
   function like an SLA table) by *case-splitting on the closed world*:
   `⋁_c (col IS 'c' ∧ reify (conjunct[col := c]))` — total because the
@@ -455,6 +463,12 @@ private partial def strict (ctx : Ctx) (fuel : Nat) (e : Expr) :
         if let some p ← attempt (mkAppM ``Pred.bit #[c, ← instantiateMVars (e.getArg! 3), mkConst ``Bool.true]) then
           return some p
     return ← caseSplit fuel e
+  -- `List.any`/`List.all` over a child-list field (LEP-0003 D): a
+  -- quantifier over the generated child table
+  if e.isAppOfArity ``List.any 3 || e.isAppOfArity ``List.all 3 then
+    if let some q ← childQuantifier fuel (e.isAppOfArity ``List.any 3) (e.getArg! 1) (e.getArg! 2) then
+      return some q
+    return none
   -- bare Bool column
   if let some (c, _) ← colOf? ctx e then
     return ← attempt (mkCmp c .eq (mkConst ``Bool.true))
@@ -542,6 +556,78 @@ where
       let somes := (← enumWorld αName).map fun c => mkApp2 (mkConst ``Option.some us) α c
       return some (x, #[noneE] ++ somes)
     return none
+  /-- `xs.any f` / `xs.all f` with `xs` the child-list field `f` of a
+      `Stored.val` component (table `k`) whose entity generated the child
+      `Parent.F` (`childTypeName`): `Pred.exists`/`Pred.forall` with
+      `parent := Col.id` of table `k`, `fk := Col.here Parent.F.Field.parent`
+      and the body reified over `Parent.F :: ts` — a fresh component
+      `c : Stored Parent.F` at position 0, the lambda's binder replaced by
+      the record rebuilt from `c.val`'s fields (a projection of a
+      constructor reduces by `whnfR`, so `colOf?` needs nothing new).
+      `none` — the whole conjunct goes opaque — when the list is not a
+      child-list field or the body does not translate entirely. -/
+  childQuantifier (fuel : Nat) (isAny : Bool) (xs f : Expr) : MetaM (Option Expr) := do
+    let xs ← whnfR xs
+    let some (parentName, field, y) ← projOf? xs | return none
+    let some k ← storedValComp? y | return none
+    let env ← getEnv
+    let childName := childTypeName parentName (Name.mkSimple field)
+    let fkSym := (childName ++ `Field).str "parent"
+    unless env.contains childName && env.contains fkSym do return none
+    let some childInfo := getStructureInfo? env childName | return none
+    let some recordInfo := getStructureInfo? env (← recordTypeName xs) | return none
+    let childTy := mkConst childName
+    let storedChild := mkApp (mkConst ``Stored) childTy
+    withLocalDeclD `child storedChild fun c => do
+      -- the record, rebuilt from the child row: `R.mk c.val.f₁ … c.val.fₙ`
+      let cVal := mkApp2 (mkConst ``Stored.val) childTy c
+      let recordCtor := mkConst (recordInfo.structName ++ `mk)
+      let fieldsOfChild ← recordInfo.fieldNames.mapM fun fname => do
+        unless childInfo.fieldNames.contains fname do throwError "child field mismatch"
+        mkProjection cVal fname
+      let some record ← attempt (mkAppM' recordCtor fieldsOfChild) | return none
+      let body := (mkApp f record).headBeta
+      -- the body's context: the child at position 0, everything else shifted
+      let ts' := mkApp3 (mkConst ``List.cons [.succ .zero]) (mkSort (.succ .zero)) childTy ctx.ts
+      let ctx' : Ctx := { ts := ts', suffixes := #[ts'] ++ ctx.suffixes
+                          tys := #[childTy] ++ ctx.tys, comps := #[c] ++ ctx.comps }
+      let some bodyP ← strict ctx' fuel body | return none
+      let bodyP ← instantiateMVars bodyP
+      if bodyP.containsFVar c.fvarId! then return none
+      let some (parentCol, _) ← idCol ctx k | return none
+      let nil := mkApp (mkConst ``List.nil [.succ .zero]) (mkSort (.succ .zero))
+      attempt do
+        let fk ← mkAppOptM ``Pred.Col.here #[none, childTy, nil, none, none, mkConst fkSym]
+        let ctor := if isAny then ``Pred.«exists» else ``Pred.«forall»
+        mkAppOptM ctor #[ctx.ts, none, none, none, none, none, parentCol, fk, bodyP]
+  /-- The element type of a `List` expression, as a structure name. -/
+  recordTypeName (xs : Expr) : MetaM Name := do
+    let ty ← whnfR (← inferType xs)
+    unless ty.isAppOfArity ``List 1 do throwError "not a list"
+    let .const n _ := (← whnfR (ty.getArg! 0)).getAppFn | throwError "not a structure"
+    return n
+  /-- `x` as a structure projection `f y`, in either spelling. -/
+  projOf? (x : Expr) : MetaM (Option (Name × String × Expr)) := do
+    let x ← whnfR x
+    match x with
+    | .proj s i y =>
+        let some info := getStructureInfo? (← getEnv) s | return none
+        let some fname := info.fieldNames[i]? | return none
+        return some (s, fname.toString, y)
+    | _ =>
+        let .const declName _ := x.getAppFn | return none
+        let some _ := (← getEnv).getProjectionFnInfo? declName | return none
+        let some y := x.getAppArgs.back? | return none
+        return some (declName.getPrefix, declName.getString!, y)
+  storedValComp? (x : Expr) : MetaM (Option Nat) := do
+    let x ← whnfR x
+    if x.isAppOfArity ``Stored.val 2 then return ← compIdx? (x.getArg! 1)
+    match x with
+    | .proj s 1 c => if s == ``Stored then compIdx? c else return none
+    | _ => return none
+  compIdx? (x : Expr) : MetaM (Option Nat) := do
+    let x ← whnfR x
+    return ctx.comps.findIdx? (· == x)
   /-- The constructors of a closed enum, as terms. -/
   enumWorld (enumName : Name) : MetaM (Array Expr) :=
     return (← getConstInfoInduct enumName).ctors.toArray.map mkConst

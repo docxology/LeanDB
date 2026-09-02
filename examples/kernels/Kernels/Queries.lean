@@ -6,9 +6,11 @@ import GpuMarket.Arch
 Every docstring says what pushes and what stays residual; `kernels log`
 is the proof. The pattern throughout: SQL narrows on the flat columns
 (enums, search columns, the inline `launch_*`/`numeric_*` columns, the
-canonical `binding` TEXT, `Ref`s), Lean does everything that looks
-*inside* `sig` — instantiation, unification, composition — because that
-column is opaque to SQL. -/
+canonical `binding` TEXT, `Ref`s) and, since LEP-0003 D, on the *child
+rows* of `kernel_ins`/`kernel_outs` through `.any`/`.all` (LEP-0004
+quantifiers); Lean does everything that looks *inside* `sig` or a
+tensor's `full` type — instantiation, unification, composition — because
+those columns are opaque to SQL. -/
 
 namespace Kernels
 
@@ -73,13 +75,35 @@ def reproducible (accum : DType) : DbM (Array (Stored Kernel)) :=
   select [Kernel] (fun k => k.val.numeric.deterministic && k.val.numeric.accum == accum)
     (.key (·.val.name))
 
-/-- Kernels whose first input is rank ≥ 3 *and* whose signature says so —
-    the search column pushes, the second test reads `sig` and is residual
-    by nature. Kept as the smallest honest example of the gap. -/
+/-- Kernels whose first input is rank ≥ `minRank` *and* whose every input
+    is. Before stage D the second conjunct read `sig` and was the smallest
+    honest example of the gap (`residual conjuncts: 1`); now the inputs
+    are child rows and `k.val.ins.all …` is LEP-0004's `forall`, pushed as
+    `NOT EXISTS (SELECT 1 FROM "kernel_ins" AS s0 WHERE s0."parent" IS
+    t0."id" AND s0."rank" < ?)` beside the search column, residual 0. -/
 def highRank (minRank : Nat) : DbM (Array (Stored Kernel)) :=
   select [Kernel] (fun k =>
-      k.val.rank0 ≥ minRank && k.val.sig.ins.all (·.rank ≥ minRank))
+      k.val.rank0 ≥ minRank && k.val.ins.all (·.rank ≥ minRank))
     (.key (·.val.name))
+
+/-- "Every input has rank ≥ n": the quantifier alone, `NOT EXISTS` over
+    `kernel_ins`, residual 0. Vacuously true of a kernel with no inputs
+    (`Kernel.make` refuses one). -/
+def allHighRank (n : Nat) : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.ins.all (·.rank ≥ n)) (.key (·.val.name))
+
+/-- "Any input is column-major": `EXISTS` over `kernel_ins` on the closed
+    `layoutKind` column, residual 0. -/
+def anyColMajor : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.ins.any (·.layoutKind == .colMajor)) (.key (·.val.name))
+
+/-- "Exactly two inputs" **stays residual** (`pushed: 1, residual
+    conjuncts: 1`): `ins.length` is an aggregate over the child rows, and
+    the engine has no aggregate verb — LEP-0004 names `∃ position=0 ∧ ∃
+    position=1 ∧ ¬∃ position=2` as the expressible-but-ugly spelling until
+    one exists. The lambda decides over the attached list. -/
+def exactlyTwoInputs : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.ins.length == 2) (.key (·.val.name))
 
 /-! ## Performance -/
 
@@ -149,14 +173,15 @@ def roofline (sku : Gpu) : DbM Json := do
 
 /-- Kernels whose first input unifies with `n`'s first output. SQL narrows
     on the search column (`inDtype0 IS ?`); unification over the two
-    signatures is Lean over the opaque column — residual by nature, and
-    where every "rank/layout/shape" question ends up. -/
+    tensors' `full` types is Lean over the opaque column — residual by
+    nature, and where every symbolic-shape question ends up (rank and
+    layout kind, by contrast, are child columns now). -/
 def composable (n : KernelName) : DbM (Array (Stored Kernel)) := do
   let some k := (← select [Kernel] (fun c => c.val.name == n))[0]? | return #[]
   let cands ← select [Kernel] (fun c => c.val.inDtype0 == k.val.outDtype0) (.key (·.val.name))
   return cands.filter fun c =>
-    match k.val.sig.outs[0]?, c.val.sig.ins[0]? with
-    | some o, some i => (unify o i).isSome
+    match k.val.outs[0]?, c.val.ins[0]? with
+    | some o, some i => (unify o.full i.full).isSome
     | _, _ => false
 
 /-- Measured latency lookup on one SKU: the best sample per
@@ -190,7 +215,7 @@ private def extendChain (arch : Arch) (lookup : Ref Kernel → DimBinding → Op
       let mut result : Option SomeProg := none
       for k in rankBy lookup userB cands do
         if result.isSome then break
-        match bindByShape k.val.sig acc.outs userB >>= Prog.extend acc k with
+        match bindByShape k.val.sig k.val.tensorIns acc.outs userB >>= Prog.extend acc k with
         | .ok acc' => result ← extendChain arch lookup userB acc' rest
         | .error _ => pure ()
       return result
@@ -240,9 +265,10 @@ def program (n : ProgramName) : DbM Json := do
         ("prog", sp.toJson p.val.sku (sp.2.2.estimate lookup))]
 
 open Lean (Json) in
-/-- One kernel, with its signature pretty-printed. The search columns are
-    derived: a row that reached this point has them agreeing with `sig`,
-    because `decode` refused it otherwise — there is nothing to check here. -/
+/-- One kernel, with its signature pretty-printed from `sig` and the child
+    rows. The search columns are derived: a row that reached this point
+    has them agreeing with its first input, because `attach` refused it
+    otherwise — there is nothing to check here. -/
 def kernelInfo (n : KernelName) : DbM Json := do
   let some k := (← select [Kernel] (fun c => c.val.name == n))[0]?
     | throw (.notFound "kernel" 0)
@@ -250,7 +276,9 @@ def kernelInfo (n : KernelName) : DbM Json := do
     ("id", Lean.toJson k.id.toInt64.toInt),
     ("name", Json.str k.val.name.raw),
     ("op", Json.str (ClosedEnum.encodeName k.val.op)),
-    ("sig", Json.str k.val.sig.describe),
+    ("sig", Json.str k.val.describeSig),
+    ("ins", Json.arr (k.val.ins.map fun i => Json.str i.full.describe).toArray),
+    ("outs", Json.arr (k.val.outs.map fun o => Json.str o.full.describe).toArray),
     ("launch", Lean.toJson k.val.launch),
     ("numeric", Lean.toJson k.val.numeric),
     ("fuses", Lean.toJson k.val.fuses.names),

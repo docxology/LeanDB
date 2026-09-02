@@ -15,7 +15,7 @@ has the query that needs it.
 | R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
 | R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
-| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done; LEP-0003 A, B, C done 2026-09-01; D in progress |
+| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done; LEP-0003 A, B, C, D done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
 ---
@@ -123,7 +123,14 @@ Both written 2026-09-01 from R1/R2 evidence; implementation order below.
   JSON (both spellings accepted, both-at-once refused), split defaults,
   `colOf?` resolves `k.val.launch.smemBytes` to the flattened symbol;
   kernels' `LaunchConfig` and `NumericProps` inline. eats' `KindSet` is
-  now `EnumSet`. Open: D child tables.
+  now `EnumSet`. **D landed:** `List R` of an `Inline` record is a
+  generated child entity (`Parent.Ins`, table `parent_ins`, cascading
+  `parent`, `position`), attached on every read, written in the verb's
+  transaction, nested in row JSON; `.any`/`.all` over the list reify to
+  LEP-0004 quantifiers; derived-from-child columns checked at attach.
+  kernels' `ins`/`outs`; "every input has rank ≥ 3" and "any input
+  column-major" push, "exactly two inputs" stays residual (aggregate).
+  Baseline: identical everywhere but kernels.
 
 ## R4b — LEP-0005, configurable entities
 

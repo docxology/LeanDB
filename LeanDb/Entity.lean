@@ -5,14 +5,50 @@ namespace LeanDb
 /-! # Entities
 
 An entity is a flat structure whose fields are `ColCodec` scalars, `Option`s
-of them, or `Ref`s to other entities. Instances are produced by
-`deriving LeanDb.Entity` (see `LeanDb.Derive`) — the types are the schema's
-single source of truth, so nothing here is ever written by hand.
+of them, `Ref`s to other entities, `Inline` structures (flattened into
+sibling columns, LEP-0003 C) or `List`s of `Inline` records (child tables,
+LEP-0003 D). Instances are produced by `deriving LeanDb.Entity` (see
+`LeanDb.Derive`) — the types are the schema's single source of truth, so
+nothing here is ever written by hand.
 
 Each entity also gets a generated *field symbol* type (`Ticket.Field`),
 which is how the engine names a column; the column's string name is
 derived from the symbol (`Entity.fieldSpec`), never the reverse.
 -/
+
+/-- A child table of an entity (LEP-0003 D): the generated entity
+    `Parent.Ins` behind a field `ins : List R` of `Parent`, seen from the
+    parent's side. Everything is typed by the parent value and encoded
+    columns — no SQL, no monad — so the executor (`LeanDb.Db`) and the JSON
+    boundary (`LeanDb.Json`) share one description of what a child list
+    is. The child's first two columns are always `parent` (the FK, `ON
+    DELETE CASCADE`) and `position` (list order); the rest are the
+    record's columns, as its `Inline` instance encodes them. -/
+structure ChildLink (α : Type) where
+  /-- The parent's field name (`"ins"`): the key in row JSON. -/
+  field : String
+  /-- The child table's name (`"<parent_table>_<field>"`). -/
+  table : String
+  /-- The child table's spec: `parent`, `position`, then the record's columns. -/
+  spec : TableSpec
+  /-- Every child row's record columns (after `parent` and `position`), in
+      list order: the record's `Inline.encode`. -/
+  rows : α → Array (Array Col)
+  /-- Attach the list read back from the child table — `(position, record
+      columns)` pairs already filtered to this parent and sorted by
+      position — and *check* every derived column that is computed from
+      this list against its recomputation (the read-side half of a
+      derived column, which `decode` could not do without the list). -/
+  attach : Array (Nat × Array Col) → α → Except DbError α
+  /-- `attach` for the JSON boundary: derived columns computed from this
+      list are *recomputed* rather than checked (`decodeRecomputing` ran
+      with the list empty). -/
+  attachRecomputing : Array (Nat × Array Col) → α → Except DbError α
+
+/-- The record columns of a child table: everything after `parent` and
+    `position`. -/
+def ChildLink.recordColumns (l : ChildLink α) : Array ColumnSpec :=
+  l.spec.columns.extract 2 l.spec.columns.size
 
 class Entity (α : Type) where
   /-- The field symbols: a generated inductive with one constructor per
@@ -45,6 +81,11 @@ class Entity (α : Type) where
       their sources rather than read, so the input may omit them or carry
       a stale value (an `update` that changes the source). -/
   decodeRecomputing : Array Col → Except DbError α
+  /-- Child tables (LEP-0003 D): one per `List R` field with `R` an
+      `Inline` record — the generated child entity's table and spec, and
+      how to read the list off a value and attach it back. `decode`
+      leaves every child list empty; the executor attaches them. -/
+  children : List (ChildLink α) := []
 
 /- Instance lookup reduces types only at reducible transparency, so a type
    stated through a class projection (`SqlOrd (Entity.fieldTy f)`,
@@ -150,6 +191,32 @@ instance [Entity β] : RefTarget (Id β) := ⟨some (Entity.tableName β)⟩
 def Entity.spec (α : Type) [Entity α] : TableSpec :=
   ⟨Entity.tableName α, Entity.columns α⟩
 
+/-- Every table an entity contributes: its own, then its child tables
+    (LEP-0003 D) in field order. A base with child lists lists `specs`;
+    `spec` stays the parent's alone. -/
+def Entity.specs (α : Type) [Entity α] : List TableSpec :=
+  Entity.spec α :: (Entity.children (α := α)).map (·.spec)
+
+/-- The generated child entity's name for a parent's child-list field:
+    `Kernel.Ins` for `Kernel.ins` — the field capitalized, because the
+    field's own name is its projection function. Shared by the derive
+    (which declares it) and the plan tactic (which resolves `k.val.ins.all
+    …` to it). -/
+def childTypeName (parent field : Lean.Name) : Lean.Name :=
+  match field with
+  | .str _ s => parent ++ Lean.Name.mkSimple s.capitalize
+  | _ => parent ++ field
+
+/-- The `Inline.decode` failure of a child record, as the child table's
+    typed error: `"<sub>: <message>"` names the column `<sub>`, anything
+    else the whole row (`"*"`). -/
+def childDecodeError (table : String) (msg : String) : DbError :=
+  match msg.splitOn ": " with
+  | sub :: rest@(_ :: _) =>
+      let sub := if sub.isEmpty then "*" else sub
+      .decode table sub (String.intercalate ": " rest)
+  | _ => .decode table "*" msg
+
 /-- A column value as a SQL literal (for `DEFAULT` clauses). -/
 def Col.sqlLit : Col → String
   | .int v => toString v
@@ -181,7 +248,9 @@ def ColumnSpec.ddlFragment (c : ColumnSpec) : String :=
     | some vs => base ++ s!" CHECK (({quoteIdent c.name} & ~{enumSetMask vs.size}) = 0)"
     | none => base
   match c.fkTable with
-  | some fk => base ++ s!" REFERENCES {quoteIdent fk}(id) ON DELETE RESTRICT ON UPDATE RESTRICT"
+  | some fk =>
+      let onDelete := if c.cascade then "CASCADE" else "RESTRICT"
+      base ++ s!" REFERENCES {quoteIdent fk}(id) ON DELETE {onDelete} ON UPDATE RESTRICT"
   | none => base
 
 /-- CREATE TABLE DDL under an explicit table name (migration rebuilds
@@ -193,7 +262,9 @@ def TableSpec.ddlNamed (t : TableSpec) (name : String) (ifNotExists : Bool := tr
   s!"CREATE TABLE{guard} {quoteIdent name} ({body})"
 
 /-- Rendered DDL for one entity. Every table gets a rowid-backed `id`
-    primary key; references RESTRICT on delete — destruction is loud. -/
+    primary key; references RESTRICT on delete — destruction is loud —
+    except a child table's `parent` (LEP-0003 D), which CASCADEs: its rows
+    are part of the parent's value. -/
 def TableSpec.ddl (t : TableSpec) : String := t.ddlNamed t.name
 
 /-- Validate cross-table invariants that individual derived `Entity`

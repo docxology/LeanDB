@@ -34,6 +34,24 @@ failure. A sub-field's own default is that column's default; a
 parent-level default for the whole value is evaluated at derive time and
 split. `Option` of an inline type is refused by name.
 
+A field `ins : List R` whose element type `R` has an `Inline` instance
+(LEP-0003 D) is a **child table**: the derive declares a structure
+`Parent.Ins` — `parent : Ref Parent`, `position : Nat`, then `R`'s fields
+copied verbatim (names, types, defaults) — and derives `LeanDb.Entity` for
+it under the table name `<parent_table>_<field>`, with `parent` a
+cascading foreign key; plus `Parent.Ins.record : Parent.Ins → R` and
+`Parent.Ins.ofRecord`. (The field's own name is its projection function,
+so the entity is spelled with the field capitalized.) The parent's `Field`
+has no symbol for the list — it is not a column — and its `decode` leaves
+the list empty; `Entity.children` carries a `ChildLink` per list that
+reads the list off a value and attaches it back, which is what the
+executor and the JSON boundary use. A derived column may be computed from
+a child list; `decode` cannot check it without the list, so the link's
+`attach` does. Refused by name: `List` of a non-`Inline` type without a
+codec of its own, `Option (List R)`, a list inside an `Inline` record
+(one level), a `derived` child list (LEP-0005), and a record field named
+`parent` or `position`.
+
 Not supported (typed error, not a runtime surprise): parameterized
 structures, and fields whose types depend on earlier fields (proof fields —
 planned, Architecture §4.3).
@@ -44,7 +62,8 @@ For a small flat structure stored inside an entity's row: the same
 `Field`/`fieldTy`/`get`/`codec`/`fieldSpec`/`fields`/`encode`/`decode`
 surface as `Entity`, minus the table, plus `Inline.FieldOf`. One level
 only — a field of an `Inline` type inside an `Inline` structure is refused
-by name, as are `Option` of one and `derived` defaults.
+by name, as are a `List` field (a nested child table), `Option` of one and
+`derived` defaults.
 
 # `deriving LeanDb.DbJson`
 
@@ -174,7 +193,14 @@ private inductive FieldEnc where
   /-- An inline value: `len` columns from `start`, spliced by the inline
       instance's `encode`/`decode`. -/
   | inline (tyStx : Term) (start len : Nat)
+  /-- A child list (LEP-0003 D): no columns of its own; `decode` leaves it
+      empty and the parent's `ChildLink` attaches it. -/
+  | child (elemTy : Expr) (elemTyStx : Term)
   deriving Inhabited
+
+private def FieldEnc.isChild : FieldEnc → Bool
+  | .child .. => true
+  | _ => false
 
 /-- A declared field with the columns it contributes. -/
 private structure FieldGen where
@@ -196,6 +222,13 @@ private structure SubField where
 private def isInlineTy (ty : Expr) : MetaM Bool := do
   try
     return (← synthInstance? (mkApp (mkConst ``LeanDb.Inline) ty)).isSome
+  catch _ => return false
+
+/-- Does `ty` have a `ColCodec` instance? (A `List` with a codec of its own
+    is a scalar column, not a child table.) -/
+private def hasCodec (ty : Expr) : MetaM Bool := do
+  try
+    return (← synthInstance? (mkApp (mkConst ``LeanDb.ColCodec) ty)).isSome
   catch _ => return false
 
 /-- The sub-fields of the inline structure `τ`, in order, with the
@@ -229,10 +262,14 @@ private def inlineSubFields (who : String) (owner fname : Name) (τ : Expr) :
     return out
 
 /-- Walk the fields of `declName` (inside its constructor's telescope) into
-    the columns they generate. `entity` says whether derived columns and
-    inline flattening are allowed (they are entity notions). -/
-private def walkFields (who : String) (declName : Name) (entity : Bool) :
-    TermElabM (Array FieldGen) := do
+    the columns they generate. `entity` says whether derived columns,
+    inline flattening and child lists are allowed (they are entity
+    notions); `cascade` names the `Ref` fields whose foreign key cascades
+    on delete, with the table they reference (a generated child's
+    `parent` — the parent's `Entity` instance does not exist yet when the
+    child is derived, so `RefTarget` cannot name the table). -/
+private def walkFields (who : String) (declName : Name) (entity : Bool)
+    (cascade : Array (Name × String) := #[]) : TermElabM (Array FieldGen) := do
   let env ← getEnv
   let ctorInfo ← getConstInfoCtor (← getConstInfoInduct declName).ctors.head!
   let fields := getStructureFields env declName
@@ -252,7 +289,27 @@ private def walkFields (who : String) (declName : Name) (entity : Bool) :
       if ftype.isAppOfArity ``Option 1 then
         if ← isInlineTy (ftype.getArg! 0) then
           throwError "{who}: field '{fname}' of {declName} is `Option {ftype.getArg! 0}` where {ftype.getArg! 0} is an Inline structure; an optional inline value is not supported (all sub-columns NULL is ambiguous once a sub-field is itself nullable) — store it as a JSON column (ColCodec.json) if it must be optional"
+        -- …and so is an optional child list: absent and empty would be indistinguishable
+        let inner := ftype.getArg! 0
+        if inner.isAppOfArity ``List 1 then
+          if ← isInlineTy (inner.getArg! 0) then
+            throwError "{who}: field '{fname}' of {declName} is `Option (List {inner.getArg! 0})` where {inner.getArg! 0} is an Inline record; an optional child list is not supported (an absent list and an empty one would be the same rows) — use `List {inner.getArg! 0}` and let empty mean none"
       let dflt? ← defaultInfo? declName fname fields
+      -- a child list (LEP-0003 D): `List R` with `R` an Inline record
+      if ftype.isAppOfArity ``List 1 then
+        let elem := (ftype.getArg! 0).consumeMData
+        if ← isInlineTy elem then
+          unless entity do
+            throwError "{who}: field '{fname}' of {declName} is `List {elem}` where {elem} is an Inline record; an Inline record cannot itself contain a child list (nested child tables are not supported)"
+          if dflt?.any (·.isDerived) then
+            throwError "{who}: field '{fname}' of {declName} is a child list marked `derived`; derived child lists (a tabulated relation, LEP-0005) are not supported yet"
+          gens := gens.push { fname, cols := #[], enc := .child elem (← delabFull elem) }
+          continue
+        else if !(← hasCodec ftype) then
+          if entity then
+            throwError "{who}: field '{fname}' of {declName} is `List {elem}` but {elem} is not an Inline record; a child table needs `deriving LeanDb.Inline` on the element type (or give `List {elem}` a ColCodec of its own to store it as one column)"
+          else
+            throwError "{who}: field '{fname}' of {declName} is `List {elem}`; an Inline record cannot contain a list (nested child tables are not supported), and `List {elem}` has no ColCodec of its own"
       if ← isInlineTy ftype then
         -- an inline field: flattened into one column per sub-field
         unless entity do
@@ -333,11 +390,15 @@ private def walkFields (who : String) (declName : Name) (entity : Bool) :
             let args ← idxs.mapM fun j => `($(mkCIdent (declName ++ fields[j]!)) r)
             `(LeanDb.ColCodec.toCol (($fn) $args*))
         | none => `(LeanDb.ColCodec.toCol $getStx)
+      let specStx ← match cascade.find? (·.1 == fname) with
+        | some (_, target) =>
+            `({ LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx with
+                fkTable := some $(quote target), cascade := true })
+        | none => `(LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx)
       let col : ColGen := {
         symName := fname, colName := fname.toString, tyStx, getStx
         codecStx := ← `((inferInstance : LeanDb.ColCodec $tyStx))
-        specStx := ← `(LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx)
-        encStx, recompute }
+        specStx, encStx, recompute }
       gens := gens.push { fname, cols := #[col], enc := .plain fname.toString tyStx nextCol }
       nextCol := nextCol + 1
     -- flattened names must not collide with anything else
@@ -394,6 +455,7 @@ private def buildShared (declName : Name) (gens : Array FieldGen) : TermElabM Bu
     | .inline tyStx _ _ =>
         unless run.isEmpty do pieces := pieces.push (← `(#[$run,*])); run := #[]
         pieces := pieces.push (← `(LeanDb.Inline.encode (α := $tyStx) ($(mkCIdent (declName ++ g.fname)) r)))
+    | .child .. => pure ()   -- a child list is not a column
   if pieces.isEmpty || !run.isEmpty then pieces := pieces.push (← `(#[$run,*]))
   let mut encode := pieces[0]!
   for p in pieces[1:] do encode ← `($encode ++ $p)
@@ -418,13 +480,18 @@ private def mkDecodeBody (declName : Name) (gens : Array FieldGen) (table : Opti
   if checking then
     if let some tbl := table then
       for i in (List.range gens.size).reverse do
-        if let some (fn, idxs) := gens[i]!.cols[0]!.recompute then
+        if let some (fn, idxs) := gens[i]!.cols.getD 0 default |>.recompute then
+          -- a column computed from a child list cannot be checked here (the
+          -- list is attached later): its `ChildLink.attach` checks it
+          if idxs.any (fun j => gens[j]!.enc.isChild) then continue
           body ← `(if $(fieldBinder i) == $(← recomputed fn idxs) then $body
                    else Except.error (LeanDb.DbError.decode $(quote tbl)
                      $(quote gens[i]!.fname.toString) "derived column disagrees with its source"))
   for i in (List.range gens.size).reverse do
     let g := gens[i]!
     match g.enc, table with
+    | .child .., _ =>
+        body ← `(let $(fieldBinder i) := []; $body)
     | .inline tyStx start len, some tbl =>
         body ← `(Except.mapError (LeanDb.inlineDecodeError $(quote tbl) $(quote g.fname.toString))
                    (LeanDb.Inline.decode (α := $tyStx) (row.extract $(quote start) $(quote (start + len))))
@@ -477,26 +544,166 @@ private def checkStructure (who : String) (declName : Name) : CommandElabM Unit 
   if env.contains fieldTyName then
     throwError "{who}: {declName} already declares '{fieldTyName}'; LeanDB generates the field symbols under that name"
 
-def deriveEntity (declName : Name) : CommandElabM Bool := do
+/-! ## Child tables (LEP-0003 D)
+
+For a field `ins : List R` of `Parent` with `R` an `Inline` record, the
+derive declares the child entity and describes it to the parent. -/
+
+/-- The structure literal `{ r with f := v }` as syntax. -/
+private def withField (r : Term) (f : Name) (v : Term) : TermElabM Term :=
+  `({ $r with $(mkIdent f):ident := $v })
+
+/-- Declare `Parent.Ins` (`parent`, `position`, then `R`'s fields verbatim),
+    derive its entity under the table `<parentTable>_<field>` with a
+    cascading `parent`, and declare `record`/`ofRecord`. Returns the child
+    entity's name. `deriveChild` is what makes `deriveEntityCore` recursive:
+    a child has no children of its own (an `Inline` record refuses lists),
+    so the recursion is one level deep. -/
+private partial def deriveChild (who : String) (declName : Name) (tblName : String)
+    (fname : Name) (elemTy : Expr)
+    (deriveEntityCore : Name → Option String → Array (Name × String) → CommandElabM Bool) :
+    CommandElabM Name := do
+  let childName := childTypeName declName fname
+  let env ← getEnv
+  if env.contains childName then
+    throwError "{who}: field '{fname}' of {declName} is a child list, but '{childName}' already exists; LeanDB generates the child entity under that name"
+  let .const rname _ := elemTy.getAppFn |
+    throwError "{who}: field '{fname}' of {declName}: the record type {elemTy} is not a plain structure"
+  let subs ← liftTermElabM (inlineSubFields who declName fname elemTy)
+  for sub in subs do
+    if sub.name == `parent || sub.name == `position then
+      throwError "{who}: field '{fname}' of {declName}: the record {rname} has a field '{sub.name}', which is the name of the child table's key column; rename it"
+  let rFields := getStructureFields env rname
+  -- 1. the structure
+  let structCmd ← liftTermElabM do
+    let mut binders : Array (TSyntax ``Lean.Parser.Command.structSimpleBinder) := #[]
+    binders := binders.push (← `(Lean.Parser.Command.structSimpleBinder|
+      parent : LeanDb.Ref $(mkCIdent declName)))
+    binders := binders.push (← `(Lean.Parser.Command.structSimpleBinder| position : Nat))
+    for sub in subs do
+      let tyStx ← delabFull sub.ty
+      let fid := mkIdent sub.name
+      match ← defaultInfo? rname sub.name rFields with
+      | some d =>
+          let args : Array Term := d.params.map fun p => (mkIdent p : Term)
+          let dfltTerm : Term ← if args.isEmpty then delabFull (stripIdMData d.value)
+            else `(($(← delabFull d.value)) $args*)
+          binders := binders.push (← `(Lean.Parser.Command.structSimpleBinder| $fid:ident : $tyStx := $dfltTerm))
+      | none =>
+          binders := binders.push (← `(Lean.Parser.Command.structSimpleBinder| $fid:ident : $tyStx))
+    let childId := rootIdent childName
+    if isPrivateName declName then
+      `(private structure $childId:ident where $[$binders]*)
+    else
+      `(structure $childId:ident where $[$binders]*)
+  elabCommand structCmd
+  unless (← getEnv).contains childName do
+    throwError "{who}: failed to declare the child entity '{childName}'"
+  -- 2. its entity: the child's table, `parent` cascading
+  discard <| deriveEntityCore childName (some s!"{tblName}_{fname}") #[(`parent, tblName)]
+  -- 3. record ↔ child
+  let defs ← liftTermElabM do
+    let rCtor := (← getConstInfoInduct rname).ctors.head!
+    let cCtor := (← getConstInfoInduct childName).ctors.head!
+    let recordArgs ← subs.mapM fun sub => `($(mkCIdent (childName ++ sub.name)) c)
+    let ofRecordArgs ← subs.mapM fun sub => `($(mkCIdent (rname ++ sub.name)) r)
+    let rStx ← delabFull elemTy
+    let recordCmd ← `(def $(rootIdent (childName ++ `record)):ident (c : $(mkCIdent childName)) : $rStx :=
+      $(mkCIdent rCtor) $recordArgs*)
+    let ofRecordCmd ← `(def $(rootIdent (childName ++ `ofRecord)):ident
+        (parent : LeanDb.Ref $(mkCIdent declName)) (position : Nat) (r : $rStx) : $(mkCIdent childName) :=
+      $(mkCIdent cCtor) parent position $ofRecordArgs*)
+    pure (recordCmd, ofRecordCmd)
+  elabCommand defs.1
+  elabCommand defs.2
+  return childName
+
+/-- The `ChildLink` literal for the child list at field index `ci`. Derived
+    columns computed from child lists are checked (`attach`) or recomputed
+    (`attachRecomputing`) by the link of the *last* list they read, so
+    every list they need is attached by then. -/
+private def mkChildLink (declName : Name) (tblName : String) (gens : Array FieldGen)
+    (ci : Nat) (childName : Name) : TermElabM Term := do
+  let g := gens[ci]!
+  let .child _ elemStx := g.enc | throwError "deriving LeanDb.Entity: internal error — not a child field"
+  let fname := g.fname
+  let childTbl := s!"{tblName}_{fname}"
+  let proj := mkCIdent (declName ++ fname)
+  let rows ← `(fun r => (($proj r).map fun x => LeanDb.Inline.encode (α := $elemStx) x).toArray)
+  let decodeList ← `(rows.mapM fun p =>
+    Except.mapError (LeanDb.childDecodeError $(quote childTbl)) (LeanDb.Inline.decode (α := $elemStx) p.2))
+  -- the derived columns this link owns
+  let mut owned : Array (Nat × Term × Array Nat) := #[]
+  for j in [0:gens.size] do
+    if let some (fn, idxs) := (gens[j]!.cols.getD 0 default).recompute then
+      let childIdxs := idxs.filter fun k => gens[k]!.enc.isChild
+      if childIdxs.back? == some ci then owned := owned.push (j, fn, idxs)
+  let recomputeOf (fn : Term) (idxs : Array Nat) : TermElabM Term := do
+    let args ← idxs.mapM fun j => `($(mkCIdent (declName ++ gens[j]!.fname)) r)
+    `(($fn) $args*)
+  -- attach: set the list, check the owned derived columns
+  let attachBody ← do
+    let mut body : Term ← `(Except.ok r)
+    for (j, fn, idxs) in owned.reverse do
+      body ← `(if $(mkCIdent (declName ++ gens[j]!.fname)) r == $(← recomputeOf fn idxs) then $body
+               else Except.error (LeanDb.DbError.decode $(quote tblName)
+                 $(quote gens[j]!.fname.toString) "derived column disagrees with its source"))
+    let set ← withField (← `(r)) fname (← `(xs.toList))
+    `(fun rows r => $decodeList >>= fun xs =>
+        let r : $(mkCIdent declName) := $set
+        $body)
+  -- attachRecomputing: set the list, recompute the owned derived columns
+  let attachRecBody ← do
+    let mut body : Term ← `(Except.ok r)
+    for (j, fn, idxs) in owned.reverse do
+      let set ← withField (← `(r)) gens[j]!.fname (← recomputeOf fn idxs)
+      body ← `(let r : $(mkCIdent declName) := $set
+               $body)
+    let set ← withField (← `(r)) fname (← `(xs.toList))
+    `(fun rows r => $decodeList >>= fun xs =>
+        let r : $(mkCIdent declName) := $set
+        $body)
+  `({ field := $(quote fname.toString)
+      table := $(quote childTbl)
+      spec := LeanDb.Entity.spec $(mkCIdent childName)
+      rows := $rows
+      attach := $attachBody
+      attachRecomputing := $attachRecBody : LeanDb.ChildLink $(mkCIdent declName) })
+
+/-- `deriving LeanDb.Entity` for `declName`. `tableName?` overrides the
+    table name (a generated child's `<parent>_<field>`); `cascade` names
+    the `Ref` fields whose FK cascades and the table each references (a
+    child's `parent`). -/
+partial def deriveEntityCore (declName : Name) (tableName? : Option String := none)
+    (cascade : Array (Name × String) := #[]) : CommandElabM Bool := do
   let who := "deriving LeanDb.Entity"
   checkStructure who declName
   let env ← getEnv
   let fields := getStructureFields env declName
-  let tblName := tableNameOf declName
+  let tblName := tableName?.getD (tableNameOf declName)
   if tblName.startsWith "_leandb_" then
     throwError "{who}: table name '{tblName}' uses the reserved _leandb_ prefix"
   if fields.any (·.getString! == "id") then
     throwError "{who}: field 'id' is reserved for LeanDB row identity"
   let fieldTyName := declName ++ `Field
   -- 1. The walk, then the field symbols (one per column: an inline field
-  --    contributes `field_sub` for each of its sub-fields).
-  let gens ← liftTermElabM (walkFields who declName (entity := true))
+  --    contributes `field_sub` for each of its sub-fields; a child list none).
+  let gens ← liftTermElabM (walkFields who declName (entity := true) cascade)
   declareSymbols who declName gens
-  -- 2. The instances.
+  -- 2. The child entities, one per child list, each with its own symbols
+  --    and instance — declared before the parent's instance names them.
+  let mut childNames : Array (Nat × Name) := #[]
+  for i in [0:gens.size] do
+    if let .child elemTy _ := gens[i]!.enc then
+      let childName ← deriveChild who declName tblName gens[i]!.fname elemTy
+        (fun n t c => deriveEntityCore n t c)
+      childNames := childNames.push (i, childName)
+  -- 3. The instances.
   let cmds ← liftTermElabM do
     let b ← buildShared declName gens
     let bodyCheck ← mkDecodeBody declName gens (some tblName) (checking := true)
     let bodyRecompute ← mkDecodeBody declName gens (some tblName) (checking := false)
+    let links ← childNames.mapM fun (i, childName) => mkChildLink declName tblName gens i childName
     let n := quote b.n
     -- `@[reducible]`: instance lookup only sees through `Entity.fieldTy f`
     -- to the field's type if the instance unfolds at reducible transparency
@@ -518,13 +725,16 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
         decodeRecomputing := fun row =>
           if row.size == $n then $bodyRecompute
           else Except.error (LeanDb.DbError.decode $(quote tblName) "*"
-                 s!"expected {$n} columns, found {row.size}"))
+                 s!"expected {$n} columns, found {row.size}")
+        children := [$links,*])
     let fieldOfCmd : TSyntax `command ← `(@[reducible] instance :
         LeanDb.FieldOf $(mkCIdent fieldTyName) $(mkCIdent declName) := ⟨fun f => f⟩)
     return (entityCmd, fieldOfCmd)
   elabCommand cmds.1
   elabCommand cmds.2
   return true
+
+def deriveEntity (declName : Name) : CommandElabM Bool := deriveEntityCore declName
 
 def entityHandler : DerivingHandler := fun declNames => do
   for declName in declNames do

@@ -5,8 +5,10 @@ time (`#check_failure`), the `KernelSig` boundary (codec round trip, `make`
 refusals, CLI-path insert of a malformed signature), the derived search
 columns (LEP-0003 B3: recomputed on write, checked on read), the inline
 fields (LEP-0003 C: flattened columns, both JSON spellings, pushdown),
-and every query over seed data. The five headline `kernels log` plans
-are printed, not asserted — they are the evidence the README quotes. -/
+the child tables (LEP-0003 D: `ins`/`outs` as rows, attached on every
+read, replaced on update, cascaded on delete, quantified by `.all`/`.any`),
+and every query over seed data. The headline `kernels log` plans are
+printed, not asserted — they are the evidence the README quotes. -/
 
 open LeanDb Kernels
 open GpuMarket (Gpu)
@@ -27,7 +29,7 @@ private def dbPath : System.FilePath := ".lake" / "kernels_test.sqlite"
 -- Test-only: lets `Option.get!` unwrap smart-constructor results on
 -- literal inputs. The base itself has no `Inhabited` for these on
 -- purpose — nothing there should ever conjure a default value.
-deriving instance Inhabited for Kernels.DimVar, Kernels.DimBinding, Kernels.KernelName
+deriving instance Inhabited for Kernels.DimVar, Kernels.DimBinding, Kernels.KernelName, Kernels.KernelSig
 
 /-! ## Negative compile checks -/
 
@@ -40,6 +42,13 @@ deriving instance Inhabited for Kernels.DimVar, Kernels.DimBinding, Kernels.Kern
 #check (Pred.bit (.here Kernel.Field.fuses) .silu true : Pred [Kernel])
 -- …and over a column that is not an `EnumSet` it is not.
 #check_failure (Pred.bit (.here Kernel.Field.op) .silu true : Pred [Kernel])
+-- LEP-0003 D: the generated child entities are LEP-0004 relations of `Kernel`…
+#check (Pred.all (.here Kernel.Ins.Field.parent) (.ord (.here Kernel.Ins.Field.rank) .ge 3) : Pred [Kernel])
+#check (Pred.any (.here Kernel.Outs.Field.parent) (.eq (.here Kernel.Outs.Field.dtype) .eq .bf16) : Pred [Kernel])
+-- …the list itself is no column of the parent…
+#check_failure Kernel.Field.ins
+-- …and a child of `Kernel` is no relation of `Bench`.
+#check_failure (Pred.all (ts := [Bench]) (.here Kernel.Ins.Field.parent) .tt : Pred [Bench])
 
 /-! ## Typed composition
 
@@ -69,34 +78,47 @@ end TypedComposition
 
 /-! ## The signature boundary -/
 
-private def mkGemm : Except String KernelSig := do
+private def mkGemm : Except String (KernelSig × List TensorTy × List TensorTy) := do
   let m ← DimVar.make "M"; let n ← DimVar.make "N"; let k ← DimVar.make "K"
-  KernelSig.make [m, n, k]
-    [{ dtype := .bf16, shape := [.var m, .var k] },
+  let sig ← KernelSig.make [m, n, k] [] [.divides 64 (.var k)]
+  let ins := [{ dtype := .bf16, shape := [.var m, .var k] : TensorTy },
      { dtype := .bf16, shape := [.var k, .var n], layout := .colMajor }]
-    [{ dtype := .f32, shape := [.var m, .var n] }]
-    [] [.divides 64 (.var k)]
+  let outs := [{ dtype := .f32, shape := [.var m, .var n] : TensorTy }]
+  sig.checkTensors ins outs
+  return (sig, ins, outs)
 
-/-- The CLI-shaped row JSON, with a `sig` string that uses `K` without
-    declaring it. -/
+/-- A child row of `kernel_ins`/`kernel_outs` as the CLI spells it: the
+    record's columns, `full` a JSON string (its column is a JSON codec). -/
+private def inputRow (dt : String) (rank : Nat) (layout : String) (vars : List String) : Lean.Json :=
+  let shape := String.intercalate "," (vars.map fun v => s!"\{\"var\":\{\"v\":\"{v}\"}}")
+  Lean.Json.mkObj [("dtype", dt), ("rank", rank), ("layoutKind", layout),
+    ("full", Lean.Json.str s!"\{\"align\":16,\"dtype\":\"{dt}\",\"layout\":\"{layout}\",\"mem\":\"global\",\"shape\":[{shape}]}")]
+
+/-- The CLI-shaped row JSON, with a `sig` whose constraint uses `K`
+    without declaring it — what the column codec still refuses. -/
 private def malformedRow : Lean.Json :=
-  let sig := "{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}},{\"var\":{\"v\":\"K\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}"
+  let sig := "{\"vars\":[\"M\"],\"scalars\":[],\"constraints\":[{\"divides\":{\"k\":64,\"d\":{\"var\":{\"v\":\"K\"}}}}]}"
   Lean.Json.mkObj [("name", "bad-sig"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
-    ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
+    ("sig", sig), ("ins", Lean.Json.arr #[inputRow "bf16" 1 "rowMajor" ["M"]]),
+    ("outs", Lean.Json.arr #[inputRow "bf16" 1 "rowMajor" ["M"]]),
+    ("minArch", "sm90"), ("maxArch", Lean.Json.null),
     ("launch", Lean.Json.mkObj [("block", 256), ("smemBytes", 0), ("stages", 1)]),
     ("numeric", Lean.Json.mkObj [("deterministic", true), ("accum", "f32")]),
     ("fuses", Lean.Json.arr #[]), ("license", "mit"),
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "bf16"), ("outDtype0", "bf16"), ("rank0", 2)]
 
-/-- Same row, well-formed signature, search columns that contradict it.
-    They are derived now: the supplied values are ignored and recomputed.
-    The inline fields come in the *flat* spelling here (`launch_block`,
-    `numeric_accum`, …), `stages` omitted — it has a column default. -/
+/-- Same row, well-formed signature, search columns that contradict the
+    first input. They are derived now: the supplied values are ignored
+    and recomputed from the child list. The inline fields come in the
+    *flat* spelling here (`launch_block`, `numeric_accum`, …), `stages`
+    omitted — it has a column default. -/
 private def lyingRow : Lean.Json :=
-  let sig := "{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}"
+  let sig := "{\"vars\":[\"M\"],\"scalars\":[],\"constraints\":[]}"
   Lean.Json.mkObj [("name", "lying-columns"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
-    ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
+    ("sig", sig), ("ins", Lean.Json.arr #[inputRow "bf16" 1 "rowMajor" ["M"]]),
+    ("outs", Lean.Json.arr #[inputRow "bf16" 1 "rowMajor" ["M"]]),
+    ("minArch", "sm90"), ("maxArch", Lean.Json.null),
     ("launch_block", 256), ("launch_smemBytes", 0),
     ("numeric_deterministic", true), ("numeric_accum", "f32"),
     ("fuses", Lean.Json.arr #["silu", "gelu"]), ("license", "mit"),
@@ -105,34 +127,61 @@ private def lyingRow : Lean.Json :=
 
 private def pureChecks : IO Unit := do
   -- codec round trip through one TEXT column
-  let gemm ← match mkGemm with
+  let (gemm, gemmIns, gemmOuts) ← match mkGemm with
     | .ok s => pure s
     | .error e => throw <| IO.userError s!"FAIL: mkGemm: {e}"
   match (fromCol (toCol gemm) : Except String KernelSig) with
   | .ok s' => check (s' == gemm) "KernelSig round-trips through its codec"
   | .error e => throw <| IO.userError s!"FAIL: codec decode: {e}"
   check ((toCol gemm) matches Col.text _) "KernelSig is one TEXT column"
-  -- make refuses an unbound variable, an undetermined output, and no outputs
+  -- checkTensors refuses an unbound variable, an undetermined output, and no outputs
   let m := (DimVar.make "M").toOption.get!
   let k := (DimVar.make "K").toOption.get!
-  let unbound := KernelSig.make [m] [{ dtype := .bf16, shape := [.var m, .var k] }]
-    [{ dtype := .bf16, shape := [.var m] }]
-  check (unbound matches .error _) "KernelSig.make refuses an undeclared variable"
-  let undetermined := KernelSig.make [m, k] [{ dtype := .bf16, shape := [.var m] }]
-    [{ dtype := .bf16, shape := [.var m, .var k] }]
-  check (undetermined matches .error _) "KernelSig.make refuses an output variable no input binds"
-  check ((KernelSig.make [m] [{ dtype := .bf16, shape := [.var m] }] []) matches .error _)
-    "KernelSig.make refuses a signature with no outputs"
+  let sigM := (KernelSig.make [m]).toOption.get!
+  let sigMK := (KernelSig.make [m, k]).toOption.get!
+  check ((sigM.checkTensors [{ dtype := .bf16, shape := [.var m, .var k] }] [{ dtype := .bf16, shape := [.var m] }]) matches .error _)
+    "checkTensors refuses an undeclared variable"
+  check ((sigMK.checkTensors [{ dtype := .bf16, shape := [.var m] }] [{ dtype := .bf16, shape := [.var m, .var k] }]) matches .error _)
+    "checkTensors refuses an output variable no input binds"
+  check ((sigM.checkTensors [{ dtype := .bf16, shape := [.var m] }] []) matches .error _)
+    "checkTensors refuses a signature with no outputs"
+  check ((KernelSig.make [m] [] [.divides 2 (.var k)]) matches .error _)
+    "KernelSig.make refuses a constraint over an undeclared variable"
+  -- D: the child record is built from the tensor, and the child entity is a table of its own
+  let some b := gemmIns[1]? | throw <| IO.userError "FAIL: mkGemm has two inputs"
+  let inp := KernelInput.ofTensorTy b
+  check (inp.dtype == .bf16 && inp.rank == 2 && inp.layoutKind == .colMajor && inp.full == b)
+    "KernelInput.ofTensorTy carries the search facts beside the whole type"
+  check ((Entity.children (α := Kernel)).map (·.table) == ["kernel_ins", "kernel_outs"]) "two child links"
+  check ((Entity.specs Kernel).map (·.name) == ["kernel", "kernel_ins", "kernel_outs"]) "Entity.specs lists the children"
+  check ((Entity.columns Kernel.Ins).map (·.name) == #["parent", "position", "dtype", "rank", "layoutKind", "full"])
+    "child columns: keys, then the record verbatim"
+  check (((Entity.columns Kernel.Ins).getD 0 default).cascade && ((Entity.columns Kernel.Ins).getD 0 default).fkTable == some "kernel")
+    "parent cascades onto kernel"
+  check (((Entity.spec Kernel.Ins).ddl.splitOn "REFERENCES \"kernel\"(id) ON DELETE CASCADE").length == 2)
+    s!"kernel_ins DDL cascades, got {(Entity.spec Kernel.Ins).ddl}"
+  check (((Entity.columns Kernel.Ins).find? (·.name == "layoutKind") |>.bind (·.enum)) == some (ClosedEnum.variants LayoutKind))
+    "layoutKind is a closed-world column of the child"
+  check (((Entity.columns Kernel.Ins).find? (·.name == "full") |>.bind (·.shape)).isSome) "full is a JSON column with a shape"
+  check (((Entity.columns Kernel).find? (·.name == "ins")).isNone) "no column for the list on the parent"
+  check ((Entity.columns Kernel).map (·.name) == #["name", "op", "lang", "variant", "sig", "minArch", "maxArch",
+      "launch_block", "launch_smemBytes", "launch_stages", "numeric_deterministic", "numeric_accum", "fuses",
+      "source", "license", "inDtype0", "outDtype0", "rank0"])
+    "the kernel table's columns are unchanged by the child lists"
   -- the CLI path: JSON → columns → codecs; the malformed sig is a typed decode error
   match rowOfJson Kernel malformedRow with
   | .error (.decode "kernel" "sig" msg) => check (msg == "shape variable K is used but not declared in vars") s!"malformed sig message, got {msg}"
   | .error e => throw <| IO.userError s!"FAIL: malformed sig: wrong error {e}"
   | .ok _ => throw <| IO.userError "FAIL: malformed sig was accepted"
-  -- …and lying search columns are recomputed from sig (B3), not stored as supplied
+  -- …and lying search columns are recomputed from the first input (B3 over D), not stored as supplied
   match rowOfJson Kernel lyingRow with
   | .ok k =>
       check (k.inDtype0 == .bf16 && k.outDtype0 == .bf16 && k.rank0 == 1)
-        "CLI insert recomputes the derived search columns from sig"
+        "CLI insert recomputes the derived search columns from the child list"
+      check (k.ins.length == 1 && k.outs.length == 1 && k.ins.all (·.full.shape.length == 1))
+        "the child lists decode from JSON arrays, full included"
+      check (((rowJson Kernel ⟨⟨1⟩, k⟩).compress.splitOn "\"ins\":[{\"dtype\":\"bf16\",\"full\":\"").length == 2)
+        s!"row JSON nests the child list, got {(rowJson Kernel ⟨⟨1⟩, k⟩).compress}"
       -- the inline fields arrived flat; the omitted `launch_stages` took its default (C)
       check (k.launch == { block := 256, smemBytes := 0, stages := 1 } && k.numeric == ⟨true, .f32⟩)
         "flat spelling of the inline fields decodes; omitted sub-column takes its default"
@@ -166,7 +215,7 @@ private def pureChecks : IO Unit := do
   | .error e => throw <| IO.userError s!"FAIL: defaulted TensorTy fields: {e}"
   -- B2: the shape the fingerprint sees
   let sigShape := (Entity.columns Kernel).find? (·.name == "sig") |>.bind (·.shape)
-  check (sigShape.isSome && (sigShape.getD "").startsWith "KernelSig{vars:[String],ins:[TensorTy{dtype:<f64|")
+  check (sigShape.isSome && (sigShape.getD "").startsWith "KernelSig{vars:[String],scalars:[(String,<f64|")
     s!"sig column carries the KernelSig shape, got {sigShape}"
   -- C: the inline fields are sibling columns, grouped, with no column of their own
   check (((Entity.columns Kernel).find? (·.name == "launch")).isNone && ((Entity.columns Kernel).find? (·.name == "numeric")).isNone)
@@ -192,14 +241,14 @@ private def pureChecks : IO Unit := do
   check (((Entity.columns Kernel).find? (·.name == "inDtype0") |>.bind (·.shape)).isNone)
     "a closed-enum column has no shape"
   -- instantiate / constraints
-  match (DimBinding.decode "K=4096,M=4096,N=4096") >>= gemm.instantiate with
+  match (DimBinding.decode "K=4096,M=4096,N=4096") >>= gemm.instantiate gemmIns gemmOuts with
   | .ok (ins, outs) =>
       check (ins.map TensorTy.describe == ["bf16[4096,4096]", "bf16[4096,4096]:colMajor"]
         && outs.map TensorTy.describe == ["f32[4096,4096]"]) "instantiate at 4096³"
   | .error e => throw <| IO.userError s!"FAIL: instantiate: {e}"
-  check (((DimBinding.decode "K=100,M=4096,N=4096") >>= gemm.instantiate) matches .error _)
+  check (((DimBinding.decode "K=100,M=4096,N=4096") >>= gemm.instantiate gemmIns gemmOuts) matches .error _)
     "K % 64 = 0 is enforced by instantiate"
-  check (((DimBinding.decode "M=4096,N=4096") >>= gemm.instantiate) matches .error _)
+  check (((DimBinding.decode "M=4096,N=4096") >>= gemm.instantiate gemmIns gemmOuts) matches .error _)
     "an unbound K is refused by instantiate"
   -- canonical binding: order-independent TEXT, equal iff equal
   let b1 := (DimBinding.decode "N=1,M=2").toOption.get!
@@ -229,7 +278,42 @@ private def g1 : DimBinding := (DimBinding.decode Kernels.g1).toOption.get!
 
 private def runQueries : DbM (Array Lean.Json) := do
   seed
-  checkD ((← fetchAll Kernel).size == 14) "fourteen kernels seeded"
+  let seeded ← fetchAll Kernel
+  checkD (seeded.size == 14) "fourteen kernels seeded"
+  -- D: every kernel comes back with its inputs and outputs attached, in order
+  checkD (seeded.all fun k => !k.val.ins.isEmpty && !k.val.outs.isEmpty) "child lists attached on fetchAll"
+  let some gemm0 := seeded.find? (·.val.name.raw == "gemm-cutlass-sm90-bf16") | throw (.sqlite "FAIL: no gemm")
+  checkD (gemm0.val.tensorIns.map TensorTy.describe == ["bf16[M,K]", "bf16[K,N]:colMajor"]
+    && gemm0.val.tensorOuts.map TensorTy.describe == ["f32[M,N]"]) s!"the GEMM's tensors in position order, got {gemm0.val.describeSig}"
+  checkD ((← fetchAll Kernel.Ins).size == 29 && (← fetchAll Kernel.Outs).size == 14) "child rows: one per tensor"
+  -- highRank / allHighRank / anyColMajor push as quantifiers over kernel_ins; exactlyTwoInputs stays residual
+  let hr ← highRank 3
+  checkD (names hr == #["flash-attn-ck-gfx942-bf16", "flash-attn-sm90-bf16"]) s!"highRank 3 is the two attention kernels, got {names hr}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: (t0.\"rank0\" >= ? AND NOT EXISTS (SELECT 1 FROM \"kernel_ins\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"rank\" < ?)), residual conjuncts: 0")
+    s!"highRank plan, got {← readLog 1}"
+  let ahr ← allHighRank 2
+  let ahrRef ← selectUnplanned [Kernel] (fun k => k.val.ins.all (·.rank ≥ 2)) (.key (·.val.name))
+  checkD (names ahr == names ahrRef && ahr.size == 11 && !(names ahr).contains "gemv-cuda-sm80-bf16")
+    s!"allHighRank 2 agrees with the reference, got {names ahr}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: NOT EXISTS (SELECT 1 FROM \"kernel_ins\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"rank\" < ?), residual conjuncts: 0")
+    s!"allHighRank plan, got {← readLog 1}"
+  let cm ← anyColMajor
+  let cmRef ← selectUnplanned [Kernel] (fun k => k.val.ins.any (·.layoutKind == .colMajor)) (.key (·.val.name))
+  checkD (names cm == names cmRef && cm.size == 7 && cm.all (·.val.op == .gemm)) s!"anyColMajor is the seven GEMMs with a colMajor B, got {names cm}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: EXISTS (SELECT 1 FROM \"kernel_ins\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"layoutKind\" IS ?), residual conjuncts: 0")
+    s!"anyColMajor plan, got {← readLog 1}"
+  let two ← exactlyTwoInputs
+  checkD (two.size == 11 && two.all (·.val.ins.length == 2)) s!"exactlyTwoInputs, got {names two}"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: 1, residual conjuncts: 1")
+    s!"exactlyTwoInputs stays residual, got {← readLog 1}"
+  -- the data spelling of allHighRank is the same plan and the same rows
+  let ahrP ← selectP [Kernel] (Pred.all (.here Kernel.Ins.Field.parent)
+    (pred% [Kernel.Ins, Kernel] fun (i, _) => i.val.rank ≥ 2)) (.key (·.val.name))
+  checkD (names ahrP == names ahr) "selectP over kernel_ins agrees with the lambda"
   -- candidates: op + search column + Arch.supports case split + maxArch
   let c ← candidates .gemm .sm90 .bf16
   checkD (names c == #["gemm-cutlass-sm90-bf16", "gemm-cutlass-sm90-bf16-bf16out", "gemm-triton-sm80-bf16"])
@@ -319,14 +403,16 @@ private def runQueries : DbM (Array Lean.Json) := do
   -- …and refuses a mis-wired edge by name
   let broken := edges.map fun e => ⟨e.id, { e.val with fromOutput := 5 }⟩
   checkD ((Prog.ofRows p nodes broken kernelOf) matches .error _) "ofRows refuses a mis-wired edge"
-  -- update of sig alone: the derived search columns follow it (B3 closes §3.2)
+  -- update of the child lists alone: the rows are replaced wholesale and the
+  -- derived search columns follow them (B3 over D closes §3.2)
   let some rms := kernels.find? (·.val.name.raw == "rmsnorm-triton-sm80-bf16") | throw (.sqlite "FAIL: no rmsnorm")
   let some gemm := kernels.find? (·.val.name.raw == "gemm-cutlass-sm90-bf16") | throw (.sqlite "FAIL: no gemm")
-  let updated ← update gemm { gemm.val with sig := rms.val.sig }
+  let updated ← update gemm { gemm.val with sig := rms.val.sig, ins := rms.val.ins, outs := rms.val.outs }
   let some reread := (← fetchAll Kernel).find? (·.id == gemm.id) | throw (.sqlite "FAIL: updated gemm vanished")
-  checkD (reread.val.inDtype0 == rms.val.sig.inDtype0 && reread.val.rank0 == rms.val.sig.rank0
-    && reread.val.outDtype0 == rms.val.sig.outDtype0)
-    "update of sig alone recomputes the derived search columns"
+  checkD (reread.val.inDtype0 == rms.val.inDtype0 && reread.val.rank0 == rms.val.rank0
+    && reread.val.outDtype0 == rms.val.outDtype0 && reread.val.tensorIns == rms.val.tensorIns)
+    "update of the lists alone replaces the child rows and recomputes the derived search columns"
+  checkD ((← fetchAll Kernel.Ins).size == 29) "the replaced list has the same number of rows (2 → 2)"
   discard <| update updated gemm.val
   -- the plans, verbatim, for the README
   discard <| candidates .gemm .sm90 .bf16
@@ -334,13 +420,15 @@ private def runQueries : DbM (Array Lean.Json) := do
   discard <| regressions .h100Sxm
   discard <| fusing .silu
   discard <| fitsSmem 100000
-  readLog 5
+  discard <| highRank 3
+  discard <| anyColMajor
+  readLog 7
 
 def main : IO UInt32 := do
   pureChecks
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   let log ← expectOk (← withDb dbPath schema runQueries) "seed + queries"
-  IO.println "kernels log — the five headline plans:"
+  IO.println "kernels log — the seven headline plans:"
   for entry in log.reverse do
     IO.println s!"  {(entry.getObjValAs? String "detail").toOption.getD "?"}"
   -- data persists across reopen; the JSON column decodes on the way back,
@@ -359,5 +447,25 @@ def main : IO UInt32 := do
   | .ok _ => throw <| IO.userError "FAIL: a raw-SQL desync of inDtype0 was read back"
   db.exec "UPDATE kernel SET \"inDtype0\" = 'fp8e4m3' WHERE name = 'gemm-cutlass-sm90-fp8'"
   discard <| expectOk (← withDb dbPath schema (fetchAll Kernel)) "restored row reads again"
+  -- D: deleting a kernel takes its child rows with it (the one cascade); a
+  -- kernel with benches still refuses (RESTRICT from bench)
+  let childRows (name : String) : IO Int64 := do
+    let stmt ← db.prepare "SELECT count(*) FROM kernel_ins WHERE parent = (SELECT id FROM kernel WHERE name = ?)"
+    stmt.bindText 1 name
+    discard <| stmt.step
+    stmt.columnInt64 0
+  check ((← childRows "gemm-cutlass-sm80-f16") == 2) "the f16 GEMM has two input rows"
+  match ← withDb dbPath schema do
+      let some f16 := (← fetchAll Kernel).find? (·.val.name.raw == "gemm-cutlass-sm80-f16") | throw (.sqlite "FAIL: f16")
+      delete f16.id with
+  | .ok () => pure ()
+  | .error e => throw <| IO.userError s!"FAIL: delete of an unreferenced kernel: {e}"
+  check ((← childRows "gemm-cutlass-sm80-f16") == 0) "its child rows cascaded"
+  match ← withDb dbPath schema do
+      let some k := (← fetchAll Kernel).find? (·.val.name.raw == "gemm-cutlass-sm90-fp8") | throw (.sqlite "FAIL: fp8")
+      delete k.id with
+  | .error (.restricted "kernel" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a benched kernel should be restricted, got {repr (r.toOption.isSome)}"
+  check ((← childRows "gemm-cutlass-sm90-fp8") == 2) "a restricted delete left the child rows alone"
   IO.println "kernels base: all tests passed"
   return 0

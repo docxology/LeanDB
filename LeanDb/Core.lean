@@ -456,12 +456,18 @@ structure ColumnSpec where
       `schema` JSON shows it. Not DDL and not part of the fingerprint —
       the table has plain columns either way. -/
   group : Option String := none
+  /-- A foreign key that cascades on delete (LEP-0003 D): the `parent`
+      column of a generated child table, whose rows are *part of the
+      parent's value*, not references to it. The one cascade in the
+      engine; every other `Ref` column RESTRICTs. DDL and the fingerprint
+      see it; `schema` JSON carries it. -/
+  cascade : Bool := false
   deriving Repr, BEq, Inhabited
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
 def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
     [ColCodec α] [RefTarget α] [ColEnum α] [ColEnumSet α]
-    (group : Option String := none) : ColumnSpec where
+    (group : Option String := none) (cascade : Bool := false) : ColumnSpec where
   name := name
   sqlType := ColCodec.sqlType α
   nullable := ColCodec.nullable α
@@ -471,6 +477,7 @@ def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
   dflt := dflt
   shape := ColCodec.shape α
   group := group
+  cascade := cascade
 
 structure TableSpec where
   name : String

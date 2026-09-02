@@ -45,6 +45,17 @@ flatten into prefixed columns with flat field symbols, nested row JSON
 (both spellings accepted), split defaults, and full pushdown through the
 projection; kernels' `LaunchConfig`/`NumericProps`.
 
+LEP-0003 D landed: a field `ins : List R` with `R` an `Inline` record is
+a child table — the derive declares the entity `Parent.Ins` (`parent :
+Ref Parent` with `ON DELETE CASCADE`, `position`, the record's fields),
+`Entity.children` describes it (`ChildLink`) and `Entity.specs` lists it.
+The list is part of the value: every read attaches it (one `IN (…)`
+fetch per child table, chunked), `insert`/`update` write it in a
+transaction, `delete` cascades. Row JSON nests it as an array of records.
+`xs.any f`/`xs.all f` over a child-list field reify to LEP-0004's
+`exists`/`forall`. A derived column may read a child list; its check
+runs at attach time. `ColumnSpec.cascade`. kernels' `ins`/`outs`.
+
 Pushdown: a captured `Option α` parameter over a closed world case-splits
 (`none` and each `some c`), so "filter by X if given" pushes in both the
 `isNone ||` and the `match` spelling; `some a == some b` unwraps.

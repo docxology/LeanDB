@@ -2105,6 +2105,474 @@ def run : IO Unit := do
 
 end InlineC
 
+/-! ## LEP-0003 D: child tables — a `List` of `Inline` records as a table of its own -/
+
+namespace ChildD
+
+/-- The record: a name, a quantity with a default, and a `Ref` into another
+    table (a foreign key inside a child row). -/
+structure Item where
+  name : String
+  qty : Nat := 1
+  supplier : Option (Ref Author) := none
+  deriving Repr, LeanDb.Inline
+
+/-- The parent: one child list, and a derived column computed from it —
+    which `decode` cannot check without the list, so the link's `attach`
+    does. -/
+structure Order where
+  customer : String
+  items : List Item
+  total : Nat := derived (items.foldl (fun acc i => acc + i.qty) 0)
+  deriving Repr, LeanDb.Entity
+
+/-- Another table pointing at `Order` with an ordinary (RESTRICT) reference. -/
+structure Shipment where
+  order : Ref Order
+  carrier : String
+  deriving Repr, LeanDb.Entity
+
+-- The refusals, at derive time and by name.
+/--
+error: deriving LeanDb.Entity: field 'tags' of ChildD.BadList is `List Nat` but Nat is not an Inline record; a child table needs `deriving LeanDb.Inline` on the element type (or give `List Nat` a ColCodec of its own to store it as one column)
+-/
+#guard_msgs in
+structure BadList where
+  tags : List Nat
+  deriving LeanDb.Entity
+
+/--
+error: deriving LeanDb.Inline: field 'items' of ChildD.NestedList is `List Item` where Item is an Inline record; an Inline record cannot itself contain a child list (nested child tables are not supported)
+-/
+#guard_msgs in
+structure NestedList where
+  items : List Item
+  deriving LeanDb.Inline
+
+/--
+error: deriving LeanDb.Entity: field 'items' of ChildD.OptList is `Option (List Item)` where Item is an Inline record; an optional child list is not supported (an absent list and an empty one would be the same rows) — use `List Item` and let empty mean none
+-/
+#guard_msgs in
+structure OptList where
+  items : Option (List Item)
+  deriving LeanDb.Entity
+
+/--
+error: deriving LeanDb.Entity: field 'items' of ChildD.DerivedList is a child list marked `derived`; derived child lists (a tabulated relation, LEP-0005) are not supported yet
+-/
+#guard_msgs in
+structure DerivedList where
+  n : Nat
+  items : List Item := derived (List.replicate n ⟨"x", 1, none⟩)
+  deriving LeanDb.Entity
+
+structure KeyedRec where
+  parent : Nat
+  deriving Repr, LeanDb.Inline
+
+/--
+error: deriving LeanDb.Entity: field 'ks' of ChildD.KeyedParent: the record ChildD.KeyedRec has a field 'parent', which is the name of the child table's key column; rename it
+-/
+#guard_msgs in
+structure KeyedParent where
+  ks : List KeyedRec
+  deriving LeanDb.Entity
+
+-- The generated child is an ordinary entity: its key is a typed `Id Order`,
+-- so it is a valid LEP-0004 relation, and its record columns are its symbols.
+#check (Pred.forall (ts := [Order]) .id (.here Order.Items.Field.parent) .tt : Pred [Order])
+#check (Pred.Col.here Order.Items.Field.qty : Pred.Col [Order.Items] Nat _)
+#check (Order.Items.record : Order.Items → Item)
+#check (Order.Items.ofRecord : Ref Order → Nat → Item → Order.Items)
+-- …and the parent has no symbol for the list: it is not a column
+#check_failure Order.Field.items
+
+private def pj (s : String) : IO Lean.Json :=
+  match Lean.Json.parse s with
+  | .ok j => pure j
+  | .error e => throw <| IO.userError s!"FAIL: bad test JSON: {e}"
+
+private def item (name : String) (qty : Nat) : Item := { name, qty }
+private def order (customer : String) (items : List Item) : Order := { customer, items }
+
+instance : Inhabited (Stored Order) := ⟨⟨⟨0⟩, order "" []⟩⟩
+instance : Inhabited (Stored Shipment) := ⟨⟨⟨0⟩, ⟨⟨0⟩, ""⟩⟩⟩
+
+private def sameItem (a b : Item) : Bool :=
+  a.name == b.name && a.qty == b.qty && a.supplier == b.supplier
+private def sameItems (a b : List Item) : Bool :=
+  a.length == b.length && (a.zip b).all fun (x, y) => sameItem x y
+
+private def link : ChildLink Order := (Entity.children (α := Order)).headD
+  { field := "?", table := "?", spec := ⟨"?", #[]⟩, rows := fun _ => #[]
+    attach := fun _ a => .ok a, attachRecomputing := fun _ a => .ok a }
+
+private def testDerived : IO Unit := do
+  -- the parent: scalar columns only, the list is not one
+  check (Entity.fields (α := Order) == #[.customer, .total]) "the parent's symbols are its columns"
+  check ((Entity.columns Order).map (·.name) == #["customer", "total"]) "no column for the list"
+  check ((Entity.children (α := Order)).map (·.field) == ["items"]
+      && (Entity.children (α := Order)).map (·.table) == ["order_items"])
+    "one child link, named after the field and the parent table"
+  check ((Entity.specs Order).map (·.name) == ["order", "order_items"]) "specs: parent first, then children"
+  check ((Entity.specs Order).head? == some (Entity.spec Order)) "spec stays the parent's alone"
+  check ((Entity.specs Author).map (·.name) == ["author"]) "an entity without children has one spec"
+  -- the child: parent (cascading FK), position, then the record's columns verbatim
+  check (Entity.tableName Order.Items == "order_items") "child table name"
+  check ((Entity.columns Order.Items).map (·.name) == #["parent", "position", "name", "qty", "supplier"])
+    "child columns in order"
+  let parentCol := (Entity.columns Order.Items).getD 0 default
+  check (parentCol.fkTable == some "order" && parentCol.cascade && parentCol.sqlType == .integer && !parentCol.nullable)
+    s!"parent is a cascading FK onto the parent table, got {repr parentCol}"
+  let supplierCol := (Entity.columns Order.Items).getD 4 default
+  check (supplierCol.fkTable == some "author" && !supplierCol.cascade && supplierCol.nullable)
+    "a Ref inside the record is an ordinary RESTRICT FK"
+  check (((Entity.columns Order.Items).getD 3 default).dflt == some (.int 1)) "the record's default is the column's"
+  check (link.recordColumns.map (·.name) == #["name", "qty", "supplier"]) "recordColumns skips the keys"
+  check ((Entity.spec Order.Items).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"order_items\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"parent\" INTEGER NOT NULL REFERENCES \"order\"(id) ON DELETE CASCADE ON UPDATE RESTRICT, \"position\" INTEGER NOT NULL, \"name\" TEXT NOT NULL, \"qty\" INTEGER NOT NULL DEFAULT 1, \"supplier\" INTEGER DEFAULT NULL REFERENCES \"author\"(id) ON DELETE RESTRICT ON UPDATE RESTRICT)")
+    s!"child DDL golden, got {(Entity.spec Order.Items).ddl}"
+  check ((Entity.spec Order).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"order\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"customer\" TEXT NOT NULL, \"total\" INTEGER NOT NULL)")
+    s!"parent DDL golden, got {(Entity.spec Order).ddl}"
+  check (((Entity.spec Shipment).ddl.splitOn "ON DELETE RESTRICT").length == 2) "an ordinary Ref still restricts"
+  -- record ↔ child row
+  let c := Order.Items.ofRecord ⟨7⟩ 2 (item "a" 3)
+  check (c.parent == ⟨7⟩ && c.position == 2 && c.name == "a" && c.qty == 3 && sameItem c.record (item "a" 3))
+    "ofRecord/record round trip"
+  check (Entity.encode c == #[.int 7, .int 2, .text "a", .int 3, .null]) "child encode: keys then record"
+  -- encode/decode of the parent: the list is not encoded; decode leaves it empty
+  let o := order "c" [item "a" 2, item "b" 3]
+  check (Entity.encode o == #[.text "c", .int 5]) "parent encode recomputes the derived column from the list"
+  match (Entity.decode #[.text "c", .int 5] : Except DbError Order) with
+  | .ok o' => check (o'.customer == "c" && o'.items.isEmpty && o'.total == 5) "decode leaves the list empty, keeps the stored derived value"
+  | .error e => throw <| IO.userError s!"FAIL: decode: {e}"
+  -- the link: rows off a value, attach back (with the derived check)
+  check (link.rows o == #[#[.text "a", .int 2, .null], #[.text "b", .int 3, .null]]) "link.rows is the records' encode"
+  let bare : Order := { customer := "c", items := [], total := 5 }
+  match link.attach #[(0, #[.text "a", .int 2, .null]), (1, #[.text "b", .int 3, .null])] bare with
+  | .ok o' => check (sameItems o'.items o.items && o'.total == 5) "attach sets the list and the derived check passes"
+  | .error e => throw <| IO.userError s!"FAIL: attach: {e}"
+  match link.attach #[(0, #[.text "a", .int 2, .null])] bare with
+  | .error (.decode "order" "total" m) => check (m == "derived column disagrees with its source") s!"attach check message, got {m}"
+  | r => throw <| IO.userError s!"FAIL: attach did not check the derived column: {repr (r.toOption.map (·.total))}"
+  match link.attachRecomputing #[(0, #[.text "a", .int 2, .null])] bare with
+  | .ok o' => check (o'.total == 2 && o'.items.length == 1) "attachRecomputing recomputes the derived column"
+  | .error e => throw <| IO.userError s!"FAIL: attachRecomputing: {e}"
+  match link.attach #[(0, #[.text "a", .text "two", .null])] bare with
+  | .error (.decode "order_items" "qty" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a bad child column was not refused by name: {repr (r.toOption.map (·.total))}"
+  match link.attach #[(0, #[.text "a"])] bare with
+  | .error (.decode "order_items" "*" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a short child row was not refused: {repr (r.toOption.map (·.total))}"
+  -- cascade is DDL, so it is fingerprint material; the default (no cascade) changes nothing
+  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }⟩
+  check (fingerprint (Entity.specs Order) != fingerprint [Entity.spec Order, restricted]) "cascade is part of the fingerprint"
+  check (fingerprint schema == "13729757873300583215")
+    s!"author+book fingerprint unchanged by stage D, got {fingerprint schema}"
+  -- schema JSON carries the cascade and round-trips it
+  for c in Entity.columns Order.Items do
+    check ((ColumnSpec.fromJson? c.toJson).toOption == some c) s!"ColumnSpec JSON round trip for {c.name}"
+  check (((Entity.spec Order.Items).toJson.compress.splitOn "\"cascade\":true").length == 2)
+    "schema JSON shows the cascade on the parent column only"
+  check (((Entity.spec Book).toJson.compress.splitOn "cascade").length == 1) "an ordinary FK mentions no cascade"
+
+private def testJson : IO Unit := do
+  let o : Stored Order := ⟨⟨1⟩, order "c" [item "a" 2, item "b" 3]⟩
+  check ((rowJson Order o).compress ==
+      "{\"customer\":\"c\",\"id\":1,\"items\":[{\"name\":\"a\",\"qty\":2,\"supplier\":null},{\"name\":\"b\",\"qty\":3,\"supplier\":null}],\"total\":5}")
+    s!"row JSON nests the child list, got {(rowJson Order o).compress}"
+  -- in: the list, positions by order; an omitted record field takes its default
+  let nested ← expectOk (rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":[{\"name\":\"p\"},{\"name\":\"q\",\"qty\":5}]}")) "nested in"
+  check (sameItems nested.items [item "p" 1, item "q" 5] && nested.total == 6)
+    "child list decodes in order; the derived column is recomputed from it"
+  let none' ← expectOk (rowOfJson Order (← pj "{\"customer\":\"x\"}")) "omitted list"
+  check (none'.items.isEmpty && none'.total == 0) "an omitted child list is empty"
+  -- refusals, by name
+  match rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":[{\"name\":\"p\",\"bogus\":1}]}") with
+  | .error (.decode "order_items" "bogus" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: an unknown record field was not refused: {repr (r.toOption.map (·.total))}"
+  match rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":{\"name\":\"p\"}}") with
+  | .error (.decode "order" "items" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a non-array list was not refused: {repr (r.toOption.map (·.total))}"
+  match rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":[3]}") with
+  | .error (.decode "order_items" "*" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a non-object record was not refused: {repr (r.toOption.map (·.total))}"
+  match rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":[{\"qty\":2}]}") with
+  | .error (.decode "order_items" "name" "missing required field") => pure ()
+  | r => throw <| IO.userError s!"FAIL: a missing record field was not refused: {repr (r.toOption.map (·.total))}"
+  match rowOfJson Order (← pj "{\"customer\":\"x\",\"items\":[{\"name\":\"p\",\"qty\":\"two\"}]}") with
+  | .error (.decode "order_items" "qty" _) => pure ()
+  | r => throw <| IO.userError s!"FAIL: a mistyped record field was not refused: {repr (r.toOption.map (·.total))}"
+  -- merge: a list given replaces the whole list; omitted, the old one is kept
+  let replaced ← expectOk (rowMergeJson Order o.val (← pj "{\"items\":[{\"name\":\"z\",\"qty\":9}]}")) "merge with a list"
+  check (sameItems replaced.items [item "z" 9] && replaced.total == 9 && replaced.customer == "c")
+    "merge replaces the list and recomputes the derived column"
+  let kept ← expectOk (rowMergeJson Order o.val (← pj "{\"customer\":\"d\"}")) "merge without the list"
+  check (sameItems kept.items o.val.items && kept.customer == "d" && kept.total == 5) "merge without the list keeps it"
+
+/-! The tactic: `.any`/`.all` over the child-list field is LEP-0004's
+    quantifier over the generated child; a body it cannot translate makes
+    the whole quantifier opaque; anything but a quantifier over the list
+    stays residual. -/
+
+private def anyPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) => o.val.items.any (·.qty ≥ 3)) := by leandb_plan
+private def allPlan (n : Nat) : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    o.val.items.all (fun i => i.qty ≥ n)) := by leandb_plan
+private def dotAllPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    List.all o.val.items (fun i => i.qty ≥ 3)) := by leandb_plan
+private def outerPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    o.val.items.any (fun i => i.name == o.val.customer)) := by leandb_plan
+private def opaqueBodyPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    o.val.items.any (fun i => i.name.length == 3)) := by leandb_plan
+private def lengthPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) => o.val.items.length == 2) := by leandb_plan
+private def negAllPlan : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    o.val.customer == "c" && !(o.val.items.all (·.qty ≥ 3))) := by leandb_plan
+private def joinedPlan : PlanFor (ts := [Shipment, Order]) (fun (r : Stored Shipment × Stored Order) =>
+    r.1.val.order == r.2.ref && r.2.val.items.any (fun i => i.qty ≥ 3)) := by leandb_plan
+private def supplierPlan (a : Ref Author) : PlanFor (ts := [Order]) (fun (o : Stored Order) =>
+    o.val.items.any (fun i => i.supplier == some a)) := by leandb_plan
+
+/-- The same question as `allPlan 3`, written as data (LEP-0004). -/
+private def allP (n : Nat) : Pred [Order] :=
+  Pred.all (.here Order.Items.Field.parent) (pred% [Order.Items, Order] fun (i, _) => i.val.qty ≥ n)
+
+private def orders : Array (Stored Order) := #[
+  ⟨⟨1⟩, order "c" [item "ab" 2, item "abc" 4]⟩,
+  ⟨⟨2⟩, order "d" []⟩,
+  ⟨⟨3⟩, order "xyz" [item "xyz" 3]⟩]
+
+/-- The child table as the snapshot sees it: every list, flattened. -/
+private def childRows : Array (Stored Order.Items) := Id.run do
+  let mut out := #[]
+  for o in orders do
+    for (i, k) in o.val.items.zipIdx do
+      out := out.push (⟨⟨out.size.toInt64 + 1⟩, Order.Items.ofRecord o.ref k i⟩ : Stored Order.Items)
+  return out
+
+private def snap : Pred.Snapshot := Pred.Snapshot.empty.add Order.Items childRows
+
+/-- `checkCoherent` under the snapshot of the child table: the lambda reads
+    the attached list, the plan the snapshot — the same rows. -/
+private def checkCoherentSnap {ts : List Type} {w : Rows ts → Bool} (p : PlanFor w)
+    (rows : Array (Rows ts)) (label : String) : IO Unit := do
+  for r in rows do
+    check (p.plan.denote snap r == w r) s!"coherence: {label}"
+
+private def testPlans : IO Unit := do
+  checkPlan anyPlan "EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"qty\" >= ?)" #[.int 3] 0
+    ".any over the child list is EXISTS"
+  checkPlan (allPlan 3) "NOT EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"qty\" < ?)" #[.int 3] 0
+    ".all over the child list is NOT EXISTS of the negated body"
+  checkPlan dotAllPlan "NOT EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"qty\" < ?)" #[.int 3] 0
+    "List.all spelling is the same plan"
+  checkPlan outerPlan "EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"name\" IS t0.\"customer\")" #[] 0
+    "the body reaches the outer row"
+  checkPlan opaqueBodyPlan "1" #[] 1 "a body the tactic cannot translate makes the whole quantifier opaque"
+  checkPlan lengthPlan "1" #[] 1 "an aggregate over the list stays residual"
+  checkPlan negAllPlan "(t0.\"customer\" IS ? AND EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"qty\" < ?))" #[.text "c", .int 3] 0
+    "negation of a quantifier is exact"
+  checkPlan joinedPlan "(t0.\"order\" IS t1.\"id\" AND EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t1.\"id\" AND s0.\"qty\" >= ?))" #[.int 3] 0
+    "a quantifier on the second table of a join lifts its parent reference"
+  checkPlan (supplierPlan ⟨5⟩) "EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"supplier\" IS ?)" #[.int 5] 0
+    "a Ref column of the record pushes through `some`"
+  -- lambda and data spellings are one plan
+  check ((allPlan 3).plan.renderT == (allP 3).renderT && (allPlan 3).plan.residuals == (allP 3).residuals)
+    s!"lambda .all and Pred.all render identically: {(allPlan 3).plan.renderT.1} vs {(allP 3).renderT.1}"
+  -- the plan surface
+  check (anyPlan.plan.tables == [0] && !anyPlan.plan.hasJoin) "a quantifier on table 0 is not a join"
+  check ((anyPlan.plan.children.map fun c => @Entity.tableName c.1 c.2) == ["order_items"]) "children names the generated child"
+  -- coherence under the child snapshot
+  checkCoherentSnap anyPlan orders "anyPlan"
+  checkCoherentSnap (allPlan 3) orders "allPlan 3"
+  checkCoherentSnap (allPlan 5) orders "allPlan 5"
+  checkCoherentSnap outerPlan orders "outerPlan"
+  checkCoherentSnap opaqueBodyPlan orders "opaqueBodyPlan"
+  checkCoherentSnap lengthPlan orders "lengthPlan"
+  checkCoherentSnap negAllPlan orders "negAllPlan"
+  check ((orders.filter ((allP 3).denote snap)).map (·.id.toInt64) == #[2, 3]) "Pred.all denotes over the child snapshot"
+
+private def dbPath : System.FilePath := ".lake" / "leandb_test_child.sqlite"
+
+private def childSchema : List TableSpec :=
+  [Entity.spec Author] ++ Entity.specs Order ++ [Entity.spec Shipment]
+
+/-- Raw count of child rows for one parent. -/
+private def childCount (db : SQLite) (parent : Int64) : IO Int64 := do
+  let stmt ← db.prepare "SELECT count(*) FROM order_items WHERE parent = ?"
+  stmt.bindInt64 1 parent
+  discard <| stmt.step
+  stmt.columnInt64 0
+
+private def customers (rows : Array (Stored Order)) : Array String := rows.map (·.val.customer)
+
+private def testEndToEnd : IO Unit := do
+  if ← dbPath.pathExists then IO.FS.removeFile dbPath
+  let r ← withDb dbPath childSchema do
+    let ada ← insert Author ⟨"Ada", 36⟩
+    let o1 ← insert Order (order "c" [item "ab" 2, { item "abc" 4 with supplier := some ada.ref }])
+    let o2 ← insert Order (order "d" [])
+    let o3 ← insert Order (order "xyz" [item "xyz" 3])
+    -- every read path attaches, in position order
+    let some g ← get o1.id | throw (.sqlite "FAIL: get")
+    unless sameItems g.val.items o1.val.items && g.val.total == 6 do
+      throw (.sqlite s!"FAIL: get attaches: {repr g.val}")
+    let all ← fetchAll Order
+    unless all.size == 3 && sameItems all[0]!.val.items o1.val.items && all[1]!.val.items.isEmpty
+        && sameItems all[2]!.val.items o3.val.items do
+      throw (.sqlite s!"FAIL: fetchAll attaches: {repr all}")
+    let filtered ← select [Order] (fun o => o.val.customer == "c")
+    unless filtered.size == 1 && sameItems filtered[0]!.val.items o1.val.items do
+      throw (.sqlite s!"FAIL: fetchFiltered attaches: {repr filtered}")
+    let sh ← insert Shipment ⟨o1.ref, "post"⟩
+    let joined ← select [Shipment, Order] (fun (s, o) => s.val.order == o.ref)
+    unless joined.size == 1 && sameItems joined[0]!.2.val.items o1.val.items && joined[0]!.1.id == sh.id do
+      throw (.sqlite s!"FAIL: selectJoined attaches: {joined.size}")
+    -- the quantifier, three ways: lambda, data, reference — one answer
+    let byId : SortBy (Stored Order) := .key (·.id)
+    let viaLambda ← select [Order] (fun o => o.val.items.all (·.qty ≥ 3)) byId
+    let viaData ← selectP [Order] (allP 3) byId
+    let reference ← selectUnplanned [Order] (fun o => o.val.items.all (·.qty ≥ 3)) byId
+    unless customers viaLambda == #["d", "xyz"] && customers viaData == customers viaLambda
+        && customers reference == customers viaLambda do
+      throw (.sqlite s!"FAIL: .all three ways: {customers viaLambda} / {customers viaData} / {customers reference}")
+    let entries ← readLog 3
+    let details := entries.map fun e => (e.getObjValAs? String "detail").toOption.getD ""
+    let expected := "order | pushed: NOT EXISTS (SELECT 1 FROM \"order_items\" AS s0 WHERE s0.\"parent\" IS t0.\"id\" AND s0.\"qty\" < ?), residual conjuncts: 0"
+    unless (details.filter (· == expected)).size == 2 do
+      throw (.sqlite s!"FAIL: lambda and data log the same NOT EXISTS plan: {details}")
+    let anyRows ← select [Order] (fun o => o.val.items.any (·.qty ≥ 3)) byId
+    unless customers anyRows == #["c", "xyz"] do throw (.sqlite s!"FAIL: .any: {customers anyRows}")
+    -- an opaque body: SQL returns everyone, the lambda decides
+    let opaqueRows ← select [Order] (fun o => o.val.items.any (fun i => i.name.length == 3)) byId
+    let opaqueRef ← selectUnplanned [Order] (fun o => o.val.items.any (fun i => i.name.length == 3)) byId
+    unless customers opaqueRows == #["c", "xyz"] && customers opaqueRows == customers opaqueRef do
+      throw (.sqlite s!"FAIL: opaque body: {customers opaqueRows} vs {customers opaqueRef}")
+    let last ← readLog 2
+    unless (last.map fun e => (e.getObjValAs? String "detail").toOption.getD "").contains
+        "order | pushed: 1, residual conjuncts: 1" do
+      throw (.sqlite s!"FAIL: opaque quantifier logged as residual 1: {last}")
+    -- update replaces the list wholesale and recomputes the derived column
+    let o1' ← update o1 { o1.val with items := [item "z" 9] }
+    let some g' ← get o1.id | throw (.sqlite "FAIL: get after update")
+    unless sameItems g'.val.items [item "z" 9] && g'.val.total == 9 do
+      throw (.sqlite s!"FAIL: update replaced the list: {repr g'.val}")
+    -- CAS staleness on the parent still fires, and leaves the children alone
+    match ← (update o1 (order "stale" []) >>= fun _ => pure "updated") <|> pure "stale" with
+    | "stale" => pure ()
+    | r => throw (.sqlite s!"FAIL: stale update: {r}")
+    let some g'' ← get o1.id | throw (.sqlite "FAIL: get after stale update")
+    unless sameItems g''.val.items [item "z" 9] do throw (.sqlite "FAIL: a stale update touched the children")
+    -- a failing child write rolls the parent back: dangling supplier
+    match ← (insert Order (order "bad" [{ item "a" 1 with supplier := some ⟨999⟩ }]) >>= fun _ => pure "inserted")
+        <|> pure "refused" with
+    | "refused" => pure ()
+    | r => throw (.sqlite s!"FAIL: dangling ref inside a child row: {r}")
+    unless (← fetchAll Order).size == 3 do throw (.sqlite "FAIL: the parent row survived a failed child write")
+    -- RESTRICT from another table still refuses; then the cascade takes the children
+    match ← (delete o1.id >>= fun _ => pure "deleted") <|> pure "restricted" with
+    | "restricted" => pure ()
+    | r => throw (.sqlite s!"FAIL: a referenced parent was deleted: {r}")
+    delete sh.id
+    delete o1.id
+    delete o2.id
+    let _ := o1'
+    fetchAll Order
+  let rows ← expectOk r "child tables end to end"
+  check (customers rows == #["xyz"]) s!"the surviving order, got {customers rows}"
+  -- the file: the deleted parent's children are gone, the survivor's are there
+  let db ← SQLite.open dbPath
+  check ((← childCount db 1) == 0 && (← childCount db 3) == 1) "cascade removed the deleted parent's rows only"
+  -- the typed errors, by code
+  expectErr (← withDb dbPath childSchema (insert Order (order "bad" [{ item "a" 1 with supplier := some ⟨999⟩ }])))
+    "missing_ref" "dangling Ref inside a child row"
+  expectErr (← withDb dbPath childSchema (update ⟨⟨3⟩, order "stale" []⟩ (order "x" []))) "stale" "stale parent CAS"
+  -- a raw-SQL write to the derived column is caught by attach, by name
+  db.exec "UPDATE \"order\" SET total = 99 WHERE id = 3"
+  match ← withDb dbPath childSchema (fetchAll Order) with
+  | .error (.decode "order" "total" m) => check (m == "derived column disagrees with its source") s!"desync message, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: raw-SQL desync of a child-derived column: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a desynchronized child-derived column was read back"
+  db.exec "UPDATE \"order\" SET total = 3 WHERE id = 3"
+  -- the CLI: the child table is a table like any other; the parent shows the list
+  let cli ← expectOk (← withDb dbPath childSchema do
+      let child := Cli.CliTable.of Order.Items
+      let byName ← child.rowsWhere [("name", "xyz")] 100
+      let parent := Cli.CliTable.of Order
+      let inserted ← parent.insertJson (← DbM.ofExcept (match Lean.Json.parse "{\"customer\":\"j\",\"items\":[{\"name\":\"p\",\"qty\":2},{\"name\":\"q\"}]}" with
+        | .ok j => .ok j | .error e => .error (.sqlite e)))
+      return (byName.compress, inserted.compress)) "cli"
+  check ((cli.1.splitOn "\"count\":1").length == 2 && (cli.1.splitOn "\"parent\":3").length == 2)
+    s!"rows on the child table with --eq, got {cli.1}"
+  check ((cli.2.splitOn "\"items\":[{\"name\":\"p\",\"qty\":2,\"supplier\":null},{\"name\":\"q\",\"qty\":1,\"supplier\":null}]").length == 2
+      && (cli.2.splitOn "\"total\":3").length == 2)
+    s!"CLI insert with a nested list, got {cli.2}"
+
+private def chunkDbPath : System.FilePath := ".lake" / "leandb_test_child_chunk.sqlite"
+
+/-- More parents than one `IN (…)` chunk names: every list still comes back. -/
+private def testChunking : IO Unit := do
+  if ← chunkDbPath.pathExists then IO.FS.removeFile chunkDbPath
+  let r ← withDb chunkDbPath childSchema do
+    for i in [0:505] do
+      discard <| insert Order (order s!"c{i}" (if i % 7 == 0 then [] else [item s!"i{i}" (i % 5 + 1), item "x" 1]))
+    let all ← fetchAll Order
+    unless all.size == 505 do throw (.sqlite s!"FAIL: {all.size} orders")
+    for o in all do
+      let i := o.id.toInt64.toNatClampNeg - 1
+      let expected := if i % 7 == 0 then [] else [item s!"i{i}" (i % 5 + 1), item "x" 1]
+      unless sameItems o.val.items expected do throw (.sqlite s!"FAIL: order {i} came back as {repr o.val}")
+    let some big := all.find? (·.val.customer == "c503") | throw (.sqlite "FAIL: c503")
+    let filtered ← select [Order] (fun o => o.val.items.any (·.qty ≥ 5))
+    let reference ← selectUnplanned [Order] (fun o => o.val.items.any (·.qty ≥ 5))
+    return (big.val.items.length, filtered.size, reference.size)
+  let (n, m, m') ← expectOk r "chunked attach"
+  check (n == 2 && m == m' && m > 0) s!"c503 has its list ({n}); the quantifier agrees with the reference ({m} vs {m'})"
+
+private def migPath : System.FilePath := ".lake" / "leandb_test_child_mig.sqlite"
+
+private def testMigration : IO Unit := do
+  -- adding a child list is a new table; removing it drops one (destructive)
+  match planMigration [Entity.spec Order] (Entity.specs Order) with
+  | .ok plan =>
+      check (plan.steps.map (·.describe) == ["create table \"order_items\""] && !plan.isDestructive)
+        s!"adding a child list plans createTable, got {plan.steps.map (·.describe)}"
+  | .error e => throw <| IO.userError s!"FAIL: planMigration add: {e}"
+  match planMigration (Entity.specs Order) [Entity.spec Order] with
+  | .ok plan =>
+      check (plan.steps.map (·.describe) == ["DROP table \"order_items\""] && plan.destructiveAgainst (Entity.specs Order))
+        s!"removing a child list plans a destructive dropTable, got {plan.steps.map (·.describe)}"
+  | .error e => throw <| IO.userError s!"FAIL: planMigration remove: {e}"
+  -- cascade is a DDL change: switching it is a rebuild of the child table
+  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }⟩
+  match planMigration [Entity.spec Order, restricted] (Entity.specs Order) with
+  | .ok plan => check ((plan.steps.map (·.describe)).any (·.startsWith "rebuild table \"order_items\"")) "cascade change rebuilds the child"
+  | .error e => throw <| IO.userError s!"FAIL: planMigration cascade: {e}"
+  -- the cascade FK survives a rebuild of the parent
+  if ← migPath.pathExists then IO.FS.removeFile migPath
+  discard <| expectOk (← withDb migPath childSchema do
+      discard <| insert Order (order "c" [item "a" 1, item "b" 2])
+      discard <| insert Order (order "d" [item "e" 3])) "seed at v1"
+  let v2 : List TableSpec := childSchema.map fun t =>
+    if t.name == "order" then ⟨"order", t.columns.map fun c => if c.name == "customer" then { c with nullable := true } else c⟩ else t
+  let (_, report?) ← expectOk (← migrate migPath v2 (apply := true)) "rebuild the parent"
+  check (((report?.map (·.applied)).getD []).any (·.startsWith "rebuild table \"order\"")) "the parent was rebuilt"
+  let db ← SQLite.open migPath
+  check ((← childCount db 1) == 2 && (← childCount db 2) == 1) "child rows survived the parent rebuild"
+  db.exec "PRAGMA foreign_keys = ON"
+  db.exec "DELETE FROM \"order\" WHERE id = 1"
+  check ((← childCount db 1) == 0 && (← childCount db 2) == 1) "the cascade still fires after the rebuild"
+
+def run : IO Unit := do
+  testDerived
+  testJson
+  testPlans
+  testEndToEnd
+  testChunking
+  testMigration
+
+end ChildD
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -2131,5 +2599,6 @@ def main : IO UInt32 := do
   testOptionalParamPlans
   testOptionalParamEndToEnd
   InlineC.run
+  ChildD.run
   IO.println "all engine tests passed"
   return 0

@@ -249,6 +249,17 @@ Decisions made here so implementation does not have to.
   "every input has rank ≥ 3" and "any input is column-major" push as
   `NOT EXISTS`/`EXISTS`; `rank0`/`inDtype0` derived from the first child;
   `Prog.ofRows` unchanged.
+- **As implemented (2026-09-01), two departures from the above.** The
+  child entity is spelled `Kernel.Ins`, not `Kernel.ins`: the field's own
+  name is its projection function, and Lean refuses a second declaration
+  under it (`invalid declaration name 'ins', structure 'Kernel' has field
+  'ins'`); the table is still `kernel_ins`, and `Kernel.Ins.record`/
+  `ofRecord`/`Field.parent` live under that name. And `ChildLink` carries
+  two attach functions, `attach` (checks derived columns computed from
+  the list — `decode` cannot, the list is not there yet) and
+  `attachRecomputing` (the JSON boundary, where `decodeRecomputing` ran
+  with the list empty), mirroring `decode`/`decodeRecomputing`; plus the
+  field name, which row JSON needs.
 
 Order: C, then D. Each ends with the baseline replay and the release
 check.

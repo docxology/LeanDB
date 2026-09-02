@@ -155,7 +155,11 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
       ("rows", Json.arr (rows.map (rowJson α)).toArray)]
 
 /-- A base, as the CLI sees it: name, default instance path, specs (both
-    derived from the types), tables, and named queries. -/
+    derived from the types), tables, and named queries. An entity with
+    child lists (LEP-0003 D) contributes `Entity.specs α` — its table and
+    its child tables — and lists the children as tables of their own
+    (`.of Kernel.Ins`) so `rows kernel_ins --eq …` works like any other
+    table; `rows kernel` shows the lists nested. -/
 structure Base where
   name : String
   dbPath : System.FilePath

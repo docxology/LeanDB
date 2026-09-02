@@ -110,6 +110,7 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
     ++ (c.dflt.map fun v => ("default", v.toJson)).toList
     ++ (c.shape.map fun s => ("shape", Json.str s)).toList
     ++ (c.group.map fun g => ("group", Json.str g)).toList
+    ++ (if c.cascade then [("cascade", Json.bool true)] else [])
 
 def TableSpec.toJson (t : TableSpec) : Json :=
   Json.mkObj [("name", Json.str t.name),
@@ -138,7 +139,8 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
     (Col.fromJson partial_ v).toOption
   let shape := (j.getObjVal? "shape").toOption.bind (·.getStr?.toOption)
   let group := (j.getObjVal? "group").toOption.bind (·.getStr?.toOption)
-  return { partial_ with dflt, shape, group }
+  let cascade := ((j.getObjVal? "cascade").toOption.bind (·.getBool?.toOption)).getD false
+  return { partial_ with dflt, shape, group, cascade }
 
 def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
   let name ← j.getObjVal? "name" >>= (·.getStr?)
@@ -168,9 +170,17 @@ def ColumnSpec.subKey (c : ColumnSpec) : String :=
   | some g => (c.name.drop (g.length + 1)).toString
   | none => c.name
 
+/-- A child list as row JSON (LEP-0003 D): an array of record objects in
+    list order, position implicit. -/
+def childListJson [Entity α] (link : ChildLink α) (a : α) : Json :=
+  let cols := link.recordColumns
+  Json.arr <| (link.rows a).map fun row =>
+    Json.mkObj ((cols.zip row).toList.map fun (c, v) => (c.name, v.toJsonFor c))
+
 /-- A stored row as JSON: id plus one field per column, by column name.
     The columns of a flattened inline field (LEP-0003 C, `group`) nest as
-    one object under the field name: `"launch": {"block": …, …}`. -/
+    one object under the field name: `"launch": {"block": …, …}`; a child
+    list (LEP-0003 D) is an array of record objects: `"ins": [{…}, …]`. -/
 def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
   let fields := (Entity.columns α).zip (Entity.encode s.val)
   let (flat, groups) := fields.foldl (init := ((#[] : Array (String × Json)), (#[] : Array (String × Array (String × Json)))))
@@ -182,7 +192,8 @@ def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
           | some i => (flat, groups.modify i fun (g, kvs) => (g, kvs.push (c.subKey, v.toJsonFor c)))
           | none => (flat, groups.push (g, #[(c.subKey, v.toJsonFor c)]))
   Json.mkObj <| ("id", Lean.toJson s.id.toInt64.toInt) :: flat.toList
-    ++ groups.toList.map fun (g, kvs) => (g, Json.mkObj kvs.toList)
+    ++ groups.toList.map (fun (g, kvs) => (g, Json.mkObj kvs.toList))
+    ++ (Entity.children (α := α)).map fun link => (link.field, childListJson link s.val)
 
 /-- The columns of `α` with whether each is derived, in declaration order. -/
 private def columnsWithDerived (α : Type) [Entity α] : Array (ColumnSpec × Bool) :=
@@ -199,8 +210,22 @@ private def checkRowKeys (α : Type) [Entity α] (table : String) (j : Json) :
   let cols := Entity.columns α
   let known := cols.map (·.name)
   let groups := (cols.filterMap (·.group)).toList.eraseDups
+  let links := Entity.children (α := α)
   for (name, v) in obj.toList do
-    if groups.contains name then
+    if let some link := links.find? (·.field == name) then
+      -- a child list: an array of record objects, each over the record's columns
+      let items ← match v with
+        | .arr items => .ok items
+        | _ => .error (.decode table name s!"expected an array of {String.quote name} records")
+      let recordKeys := link.recordColumns.map (·.name)
+      for item in items do
+        let sub ← match item with
+          | .obj sub => .ok sub
+          | _ => .error (.decode link.table "*" s!"expected an object with the fields of a {String.quote name} record")
+        for (k, _) in sub.toList do
+          unless recordKeys.contains k do
+            throw (.decode link.table k s!"unknown field; fields of {name}: {recordKeys.toList}")
+    else if groups.contains name then
       let sub ← match v with
         | .obj sub => .ok sub
         | _ => .error (.decode table name
@@ -229,13 +254,40 @@ private def rowValue? (table : String) (j : Json) (c : ColumnSpec) : Except DbEr
       | some v, none | none, some v => return some v
       | none, none => return none
 
+/-- One record of a child list from its JSON object: the record's columns
+    with the same omission rules as a row (`rowOfJson`), errors naming the
+    child table and column. -/
+def childRecordOfJson [Entity α] (link : ChildLink α) (j : Json) : Except DbError (Array Col) :=
+  link.recordColumns.mapM fun c => do
+    match j.getObjVal? c.name with
+    | .ok v =>
+        match Col.fromJson c v with
+        | .ok col => .ok col
+        | .error m => .error (.decode link.table c.name m)
+    | .error _ =>
+        match c.dflt with
+        | some col => .ok col
+        | none =>
+            if c.nullable then .ok .null
+            else .error (.decode link.table c.name "missing required field")
+
+/-- A child list from its JSON array, positions by order. -/
+def childRowsOfJson [Entity α] (link : ChildLink α) (j : Json) :
+    Except DbError (Array (Nat × Array Col)) := do
+  let items ← match j with
+    | .arr items => .ok items
+    | _ => .error (.decode (Entity.tableName α) link.field s!"expected an array of {String.quote link.field} records")
+  items.zipIdx.mapM fun (item, i) => do return (i, ← childRecordOfJson link item)
+
 /-- Decode a full row from JSON field-by-field, then through the entity's
     codecs (and thus every smart constructor). An omitted field takes its
     declared default; without one it is `null` if the column is nullable
     and a typed error otherwise. An explicit JSON `null` is always `null`,
     default or not. A derived column is recomputed from its sources: it
     may be omitted, and a supplied value is ignored. A flattened inline
-    field may come nested (`"launch": {…}`) or flat (`"launch_block"`). -/
+    field may come nested (`"launch": {…}`) or flat (`"launch_block"`). A
+    child list (LEP-0003 D) is an array of record objects under the field
+    name, position implicit; omitted, it is empty. -/
 def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   let table := Entity.tableName α
   checkRowKeys α table j
@@ -252,13 +304,20 @@ def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
         | none =>
             if c.nullable then .ok .null
             else .error (.decode table c.name "missing required field")
-  Entity.decodeRecomputing cols
+  let a ← Entity.decodeRecomputing cols
+  -- child lists (LEP-0003 D): an omitted list is empty
+  (Entity.children (α := α)).foldlM (init := a) fun a link => do
+    let rows ← match j.getObjVal? link.field with
+      | .ok v => childRowsOfJson link v
+      | .error _ => pure #[]
+    link.attachRecomputing rows a
 
 /-- Overlay a partial JSON object onto an existing row at the column level,
     then re-decode — validation applies to the merged result. This is the
     CLI's `update <table> <id> <partial-json>`. Derived columns are
     recomputed from the merged sources, never kept from the old row. A
-    nested group object overlays only the sub-fields it names. -/
+    nested group object overlays only the sub-fields it names; a child
+    list (LEP-0003 D) given replaces the whole list, omitted it is kept. -/
 def rowMergeJson (α : Type) [Entity α] (base : α) (j : Json) : Except DbError α := do
   let table := Entity.tableName α
   checkRowKeys α table j
@@ -270,6 +329,12 @@ def rowMergeJson (α : Type) [Entity α] (base : α) (j : Json) : Except DbError
         | .ok col => .ok col
         | .error m => .error (.decode table c.name m)
     | none => .ok old
-  Entity.decodeRecomputing cols
+  let a ← Entity.decodeRecomputing cols
+  -- a child list given replaces the old one wholesale; omitted, it is kept
+  (Entity.children (α := α)).foldlM (init := a) fun a link => do
+    let rows ← match j.getObjVal? link.field with
+      | .ok v => childRowsOfJson link v
+      | .error _ => pure ((link.rows base).zipIdx.map fun (cols, i) => (i, cols))
+    link.attachRecomputing rows a
 
 end LeanDb

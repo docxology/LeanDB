@@ -9,13 +9,25 @@ ordinary Lean with `deriving LeanDb.DbJson` (LEP-0003 B1/B2): the same
 JSON encoding Lean's own derive produces, except that an omitted field
 with a default takes the default, plus a `JsonShape` the fingerprint and
 `migrate` can see. Payload-carrying sums and nested lists are fine
-because none of them is ever a bare column. The one column is `KernelSig`
-itself, stored as compressed JSON TEXT through `ColCodec.json` — opaque
-to SQL, which is precisely what this base is measuring (README).
+because none of them is ever a bare column.
 
-Invariants live in `KernelSig.make`, and the column codec validates
-through it, so the JSON boundary (CLI `insert`, the SQLite codec) refuses
-a malformed signature the same way the Lean constructor path does. -/
+Since LEP-0003 D the signature is split in two. `KernelSig` — the
+variables, scalar arguments and constraints — is one JSON TEXT column
+(`ColCodec.json`), opaque to SQL. The inputs and outputs are **child
+rows**: `Kernel.ins`/`Kernel.outs` are `List KernelInput`, an `Inline`
+record carrying the facts SQL asks about (`dtype`, `rank`, `layoutKind`)
+beside the whole `TensorTy` as a JSON column (`full`), so "every input
+has rank ≥ 3" is a `NOT EXISTS` over `kernel_ins` and `instantiate` still
+has the full type.
+
+Invariants that live inside one value live in its `make`; the column
+codec of `KernelSig` validates through `KernelSig.validate`, so a
+constraint over an undeclared variable is refused at the JSON boundary.
+The cross-checks between a signature and its tensors (every shape variable
+declared, outputs determined by inputs, at least one of each) span the
+parent row and its child rows; they are `Kernel.make`'s
+(`KernelSig.checkTensors`) — there is no engine hook for a whole-value
+validator across tables yet. -/
 
 namespace Kernels
 
@@ -62,6 +74,19 @@ inductive Layout where
   | tiled (tile : List Nat) (inner : Layout)
   deriving Repr, DecidableEq, LeanDb.DbJson
 
+/-- The closed world of layout *kinds*: `Layout` with its payloads
+    forgotten, so a child row can carry it as an enum column
+    (`KernelInput.layoutKind`) and "any input is column-major" pushes. -/
+inductive LayoutKind where
+  | rowMajor | colMajor | strided | tiled
+  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
+
+def Layout.kind : Layout → LayoutKind
+  | .rowMajor => .rowMajor
+  | .colMajor => .colMajor
+  | .strided _ => .strided
+  | .tiled .. => .tiled
+
 def Layout.vars : Layout → List DimVar
   | .rowMajor | .colMajor => []
   | .strided ds => ds.flatMap Dim.vars
@@ -105,6 +130,26 @@ def TensorTy.describe (t : TensorTy) : String :=
   let base := if t.layout == .rowMajor then base else s!"{base}:{t.layout.describe}"
   if t.mem == .global then base else s!"{base}@{LeanDb.ClosedEnum.encodeName t.mem}"
 
+/-- A tensor type as one JSON column: what a child row carries whole, so
+    the typed layer (`instantiate`, `unify`) reads the full type back. -/
+instance : ColCodec TensorTy := ColCodec.json TensorTy
+
+/-- One input or output of a kernel, as a child row (LEP-0003 D): the
+    facts SQL asks about as columns — element type, rank, layout kind —
+    and the whole `TensorTy` beside them. Built only through
+    `ofTensorTy`, so the three columns agree with `full` by construction
+    (an `Inline` record cannot carry a `derived` column; the check-on-read
+    that a parent's derived column gets is not available inside one). -/
+structure KernelInput where
+  dtype      : DType
+  rank       : Nat
+  layoutKind : LayoutKind
+  full       : TensorTy
+  deriving Repr, DecidableEq, LeanDb.Inline
+
+def KernelInput.ofTensorTy (t : TensorTy) : KernelInput :=
+  { dtype := t.dtype, rank := t.rank, layoutKind := t.layout.kind, full := t }
+
 /-- Name of a scalar kernel argument (`alpha`, `eps`, `causal`): lowercase
     identifier. -/
 structure ScalarName where
@@ -145,85 +190,77 @@ def DimConstraint.holds (env : DimVar → Option Nat) : DimConstraint → Except
   | .le a b => do return (← a.eval env) ≤ (← b.eval env)
   | .eq a b => do return (← a.eval env) == (← b.eval env)
 
-/-- The signature. A `KernelSig` that exists is well-formed: every
-    variable in `ins`/`outs`/`constraints` is bound in `vars`, every
-    variable in an output appears in some input (outputs are determined),
-    and there is at least one input and one output (the derived columns
-    `inDtype0`/`outDtype0`/`rank0` are read from them). -/
+/-- The signature minus its tensors: the shape variables, the scalar
+    arguments and the constraints. A `KernelSig` that exists declares each
+    variable once and constrains only declared ones; the tensors it
+    quantifies over are the kernel's child rows (`Kernel.ins`/`outs`),
+    checked against it by `checkTensors` in `Kernel.make`. -/
 structure KernelSig where
   vars        : List DimVar
-  ins         : List TensorTy
-  outs        : List TensorTy
   scalars     : List (ScalarName × DType)
   constraints : List DimConstraint
   deriving Repr, DecidableEq, LeanDb.DbJson
 
-def KernelSig.make (vars : List DimVar) (ins outs : List TensorTy)
-    (scalars : List (ScalarName × DType) := []) (constraints : List DimConstraint := []) :
-    Except String KernelSig := do
+def KernelSig.make (vars : List DimVar) (scalars : List (ScalarName × DType) := [])
+    (constraints : List DimConstraint := []) : Except String KernelSig := do
   if vars.eraseDups.length != vars.length then throw "duplicate shape variable"
-  if ins.isEmpty then throw "a kernel needs at least one input"
-  if outs.isEmpty then throw "a kernel needs at least one output"
-  let inVars := ins.flatMap TensorTy.vars
-  let used := inVars ++ outs.flatMap TensorTy.vars ++ constraints.flatMap DimConstraint.vars
-  for v in used do
+  for v in constraints.flatMap DimConstraint.vars do
     unless vars.contains v do throw s!"shape variable {v.name} is used but not declared in vars"
-  for v in outs.flatMap TensorTy.vars do
-    unless inVars.contains v do throw s!"output shape variable {v.name} appears in no input"
-  return { vars, ins, outs, scalars, constraints }
+  return { vars, scalars, constraints }
 
 /-- `make` over an already-built value: what the column codec validates
-    through, so JSON that names an undeclared variable is refused at the
-    boundary, whether it arrives from the CLI or from a row written by an
-    older build. -/
+    through, so JSON whose constraints name an undeclared variable is
+    refused at the boundary, whether it arrives from the CLI or from a row
+    written by an older build. -/
 def KernelSig.validate (s : KernelSig) : Except String KernelSig :=
-  KernelSig.make s.vars s.ins s.outs s.scalars s.constraints
+  KernelSig.make s.vars s.scalars s.constraints
 
 /-- The one nested column: compressed JSON TEXT with a declared shape.
     SQL sees a string; the fingerprint and `migrate` see the shape. -/
 instance : ColCodec KernelSig := ColCodec.json KernelSig KernelSig.validate
 
-/-! The facts the derived search columns carry (`Kernel.inDtype0`,
-`Kernel.outDtype0`, `Kernel.rank0`). Total functions: `make` guarantees an
-input and an output exist, so the fallback arms are unreachable for a
-signature that exists — they are there because a structure default must
-be total, not because a kernel can have no inputs. -/
+/-- The cross-check between a signature and its tensors: at least one
+    input and one output, every shape variable declared, every output
+    variable bound by some input (outputs are determined). Spans the
+    kernel row and its child rows, so it is `Kernel.make`'s, not a codec's. -/
+def KernelSig.checkTensors (s : KernelSig) (ins outs : List TensorTy) : Except String Unit := do
+  if ins.isEmpty then throw "a kernel needs at least one input"
+  if outs.isEmpty then throw "a kernel needs at least one output"
+  let inVars := ins.flatMap TensorTy.vars
+  for v in inVars ++ outs.flatMap TensorTy.vars do
+    unless s.vars.contains v do throw s!"shape variable {v.name} is used but not declared in vars"
+  for v in outs.flatMap TensorTy.vars do
+    unless inVars.contains v do throw s!"output shape variable {v.name} appears in no input"
 
-def KernelSig.inDtype0 (s : KernelSig) : DType :=
-  match s.ins with | t :: _ => t.dtype | [] => .f32
-
-def KernelSig.outDtype0 (s : KernelSig) : DType :=
-  match s.outs with | t :: _ => t.dtype | [] => .f32
-
-def KernelSig.rank0 (s : KernelSig) : Nat :=
-  match s.ins with | t :: _ => t.rank | [] => 0
-
-def KernelSig.describe (s : KernelSig) : String :=
-  let ins := String.intercalate ", " (s.ins.map TensorTy.describe)
-  let outs := String.intercalate ", " (s.outs.map TensorTy.describe)
+def KernelSig.describe (s : KernelSig) (ins outs : List TensorTy) : String :=
+  let ins := String.intercalate ", " (ins.map TensorTy.describe)
+  let outs := String.intercalate ", " (outs.map TensorTy.describe)
   let vars := String.intercalate " " (s.vars.map (·.name))
   let cs := if s.constraints.isEmpty then "" else
     s!" where {String.intercalate ", " (s.constraints.map DimConstraint.describe)}"
   s!"∀ {vars}, ({ins}) → ({outs}){cs}"
 
-/-- Instantiate at a binding: the monomorphic in/out types, or a named
-    reason (unbound variable, violated constraint). -/
-def KernelSig.instantiate (s : KernelSig) (b : DimBinding) :
+/-- Instantiate the tensors `ins`/`outs` of signature `s` at a binding:
+    the monomorphic in/out types, or a named reason (unbound variable,
+    violated constraint). -/
+def KernelSig.instantiate (s : KernelSig) (ins outs : List TensorTy) (b : DimBinding) :
     Except String (List TensorTy × List TensorTy) := do
   let env := b.lookup
   for v in s.vars do
     if (env v).isNone then throw s!"binding {b} leaves {v.name} unbound"
   for c in s.constraints do
     unless ← c.holds env do throw s!"constraint {c.describe} fails at {b}"
-  let ins ← s.ins.mapM (·.instantiate env)
-  let outs ← s.outs.mapM (·.instantiate env)
+  let ins ← ins.mapM (·.instantiate env)
+  let outs ← outs.mapM (·.instantiate env)
   return (ins, outs)
 
-/-- Boolean form of "instantiating `s` at `b` gives exactly `ins`/`outs`";
-    `Prog.kernel` carries a proof that it is `true`, obtained by `if h :`
-    on fetched rows and by `rfl` on closed terms. -/
-def KernelSig.instantiates (s : KernelSig) (b : DimBinding) (ins outs : List TensorTy) : Bool :=
-  match s.instantiate b with
+/-- Boolean form of "instantiating `sigIns`/`sigOuts` under `s` at `b`
+    gives exactly `ins`/`outs`"; `Prog.kernel` carries a proof that it is
+    `true`, obtained by `if h :` on fetched rows and by `rfl` on closed
+    terms. -/
+def KernelSig.instantiates (s : KernelSig) (sigIns sigOuts : List TensorTy) (b : DimBinding)
+    (ins outs : List TensorTy) : Bool :=
+  match s.instantiate sigIns sigOuts b with
   | .ok (i, o) => i == ins && o == outs
   | .error _ => false
 
@@ -290,11 +327,11 @@ def unifyAll (s : Subst) : List TensorTy → List TensorTy → Option Subst
   | _, _ => none
 
 /-- Bind a signature's variables by unifying a prefix of its inputs
-    (`pattern`, symbolic) against upstream outputs (`concrete`, literal);
+    (`sigIns`, symbolic) against upstream outputs (`concrete`, literal);
     variables the shape does not determine come from `fallback`. -/
-def bindByShape (sig : KernelSig) (concrete : List TensorTy) (fallback : DimBinding) :
-    Except String DimBinding := do
-  let pattern := sig.ins.take concrete.length
+def bindByShape (sig : KernelSig) (sigIns : List TensorTy) (concrete : List TensorTy)
+    (fallback : DimBinding) : Except String DimBinding := do
+  let pattern := sigIns.take concrete.length
   let some s := unifyAll [] pattern concrete
     | throw s!"inputs ({String.intercalate ", " (pattern.map TensorTy.describe)}) do not unify with upstream ({String.intercalate ", " (concrete.map TensorTy.describe)})"
   let assign ← sig.vars.mapM fun v =>

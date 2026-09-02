@@ -22,7 +22,7 @@ inductive Prog : List TensorTy → List TensorTy → Type where
       instantiates to exactly these edge types (by `if h :` on fetched
       rows, by `rfl` on closed terms). -/
   | kernel (k : Stored Kernel) (b : DimBinding) (ins outs : List TensorTy)
-      (h : k.val.sig.instantiates b ins outs = true) : Prog ins outs
+      (h : k.val.instantiates b ins outs = true) : Prog ins outs
   /-- Pass buffers through untouched — how a program input reaches a
       later node beside an upstream output (`par p (id extra)`). -/
   | id (xs : List TensorTy) : Prog xs xs
@@ -103,8 +103,8 @@ def Prog.emit (sku : GpuMarket.Gpu) {a b : List TensorTy} (p : Prog a b) : Strin
 
 /-- A one-node program. -/
 def Prog.start (k : Stored Kernel) (b : DimBinding) : Except String SomeProg := do
-  let (ins, outs) ← k.val.sig.instantiate b
-  if h : k.val.sig.instantiates b ins outs = true then
+  let (ins, outs) ← k.val.instantiate b
+  if h : k.val.instantiates b ins outs = true then
     return ⟨ins, outs, .kernel k b ins outs h⟩
   else throw "unreachable: instantiate succeeded but instantiates is false"
 
@@ -113,8 +113,8 @@ def Prog.start (k : Stored Kernel) (b : DimBinding) : Except String SomeProg := 
     check `ins = mid ++ extra` is where a dtype/shape mismatch is refused. -/
 def Prog.extend (acc : SomeProg) (k : Stored Kernel) (b : DimBinding) : Except String SomeProg := do
   let ⟨a, mid, p⟩ := acc
-  let (ins, outs) ← k.val.sig.instantiate b
-  if h : k.val.sig.instantiates b ins outs = true then
+  let (ins, outs) ← k.val.instantiate b
+  if h : k.val.instantiates b ins outs = true then
     let extra := ins.drop mid.length
     if h2 : ins = mid ++ extra then
       let q : Prog (mid ++ extra) outs := h2 ▸ Prog.kernel k b ins outs h
@@ -153,7 +153,7 @@ def Prog.ofRows (prog : Stored Program) (nodes : Array (Stored ProgramNode))
           unless incoming.any fun e =>
               e.val.toInput == j && e.val.fromNode == prev.id && e.val.fromOutput == j do
             throw s!"node {node.val.position} input {j} is not fed by node {prev.val.position} output {j}; only chains are re-typed today"
-        let b ← bindByShape k.val.sig mid prog.val.binding
+        let b ← bindByShape k.val.sig k.val.tensorIns mid prog.val.binding
         acc := some (← Prog.extend sp k b, node)
   match acc with
   | some (sp, _) => return sp

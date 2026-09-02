@@ -1,4 +1,5 @@
 import SQLite
+import Std.Data.HashMap
 import LeanDb.Select
 import LeanDb.PlanElab
 import LeanDb.Json
@@ -152,20 +153,116 @@ private def columnList (α : Type) [Entity α] : String :=
 private def placeholders (n : Nat) : String :=
   String.intercalate ", " (List.replicate n "?")
 
-/-- `INSERT` a value; returns it with its assigned identity. -/
+/-! ## Child tables (LEP-0003 D)
+
+A parent's child lists live in their own tables and are *part of the
+parent's value*: every read reattaches them, every write owns them.
+Reads cost one engine-internal statement per child table per fetch —
+`WHERE parent IN (…)` over the fetched parents, chunked — never one per
+row. Writes run inside a transaction. -/
+
+/-- Run `act` inside `BEGIN … COMMIT`; any failure rolls back and re-raises
+    the typed error. Used by the verbs that write more than one row. -/
+private def transaction (act : DbM α) : DbM α := fun conn => ExceptT.mk do
+  let exec (sql : String) : IO (Except DbError Unit) :=
+    try conn.raw.exec sql; pure (.ok ()) catch e => pure (.error (.sqlite (toString e)))
+  match ← exec "BEGIN" with
+  | .error e => return .error e
+  | .ok () =>
+    let r ← try (act conn).run catch e => pure (.error (.sqlite (toString e)))
+    match r with
+    | .ok a =>
+        match ← exec "COMMIT" with
+        | .ok () => return .ok a
+        | .error e => discard <| exec "ROLLBACK"; return .error e
+    | .error e => discard <| exec "ROLLBACK"; return .error e
+
+/-- How many parent ids one child fetch names: SQLite's default parameter
+    limit is far above this, and the statement text stays small. -/
+private def childChunk : Nat := 500
+
+/-- Attach every child list of `α` to `rows`: per child table, one
+    `SELECT parent, position, <record columns> … WHERE parent IN (…) ORDER
+    BY parent, position` per chunk of parent ids, grouped by parent, then
+    `ChildLink.attach` (which also checks derived columns computed from
+    the list). Order and length of `rows` are preserved; an entity without
+    children costs nothing. -/
+private def attachChildren (α : Type) [Entity α] (rows : Array (Stored α)) :
+    DbM (Array (Stored α)) := do
+  let links := Entity.children (α := α)
+  if links.isEmpty || rows.isEmpty then return rows
+  -- distinct parent ids (a joined result repeats a parent per product row)
+  let ids := (rows.map (·.id.toInt64)).qsort (· < ·)
+  let ids := ids.foldl (init := #[]) fun acc i =>
+    if acc.back? == some i then acc else acc.push i
+  let mut rows := rows
+  for link in links do
+    let cols := link.spec.columns
+    let parentCol := cols.getD 0 default |>.name
+    let positionCol := cols.getD 1 default |>.name
+    let names := String.intercalate ", " (cols.toList.map (quoteId ·.name))
+    let n := link.recordColumns.size
+    let label (i : Nat) : String × String := (link.table, ((cols[i + 2]?).map (·.name)).getD "?")
+    let mut groups : Std.HashMap Int64 (Array (Nat × Array Col)) := {}
+    for start in [0:ids.size:childChunk] do
+      let chunk := ids.extract start (start + childChunk)
+      let sql := s!"SELECT {names} FROM {quoteId link.table} WHERE {quoteId parentCol} IN ({placeholders chunk.size}) ORDER BY {quoteId parentCol}, {quoteId positionCol}"
+      let raw ← sqlite fun db => do
+        let stmt ← db.prepare sql
+        for h : i in [0:chunk.size] do stmt.bindInt64 (Int32.ofNat (i + 1)) chunk[i]
+        let mut out : Array (Int64 × Nat × Except DbError (Array Col)) := #[]
+        repeat
+          if ← stmt.step then
+            let parent ← stmt.columnInt64 0
+            let position ← stmt.columnInt64 1
+            out := out.push (parent, position.toNatClampNeg, ← readRow stmt 2 n label)
+          else break
+        return out
+      for (parent, position, r) in raw do
+        let cols ← liftExcept r
+        groups := groups.insert parent ((groups.getD parent #[]).push (position, cols))
+    rows ← rows.mapM fun r => do
+      let v ← liftExcept (link.attach (groups.getD r.id.toInt64 #[]) r.val)
+      return ⟨r.id, v⟩
+  return rows
+
+/-- Write the child rows of one list for parent `id`: positions `0…`, the
+    record's columns after `parent` and `position`. -/
+private def insertChildren [Entity α] (link : ChildLink α) (id : Int64) (a : α) : DbM Unit := do
+  let rows := link.rows a
+  if rows.isEmpty then return
+  let names := String.intercalate ", " (link.spec.columns.toList.map (quoteId ·.name))
+  let sql := s!"INSERT INTO {quoteId link.table} ({names}) VALUES ({placeholders link.spec.columns.size})"
+  sqliteWith (constraintError link.table (.missingRef link.table)) fun db => do
+    let stmt ← db.prepare sql
+    for h : i in [0:rows.size] do
+      stmt.reset
+      stmt.clearBindings
+      stmt.bindInt64 1 id
+      stmt.bindInt64 2 (Int64.ofNat i)
+      bindCols stmt 3 rows[i]
+      stmt.exec
+
+/-- `INSERT` a value; returns it with its assigned identity. A parent with
+    child lists writes its own row and then every child row, in one
+    transaction. -/
 def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
+  let links := Entity.children (α := α)
   let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
   let sql := if spec.columns.isEmpty then
     s!"INSERT INTO {quoteId spec.name} DEFAULT VALUES"
   else
     s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
-  sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
-    let stmt ← db.prepare sql
-    unless spec.columns.isEmpty do bindCols stmt 1 (Entity.encode a)
-    stmt.exec
-  let id ← sqlite (·.lastInsertRowId)
-  return ⟨⟨id⟩, a⟩
+  let act : DbM (Stored α) := do
+    sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
+      let stmt ← db.prepare sql
+      unless spec.columns.isEmpty do bindCols stmt 1 (Entity.encode a)
+      stmt.exec
+    let id ← sqlite (·.lastInsertRowId)
+    for link in links do insertChildren link id a
+    return ⟨⟨id⟩, a⟩
+  if links.isEmpty then act else transaction act
 
 /-- Fetch one row by typed identity. -/
 def get [Entity α] (id : Id α) : DbM (Option (Stored α)) := do
@@ -176,7 +273,9 @@ def get [Entity α] (id : Id α) : DbM (Option (Stored α)) := do
     if ← stmt.step then some <$> readStored α stmt else return none
   match row with
   | none => return none
-  | some r => some <$> liftExcept r
+  | some r => do
+      let rows ← attachChildren α #[← liftExcept r]
+      return rows[0]?
 
 /-- Every row of `α`'s table, in id order. -/
 def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
@@ -187,40 +286,57 @@ def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
     return out
-  rows.mapM liftExcept
+  attachChildren α (← rows.mapM liftExcept)
 
 /-- Compare-and-swap update: `SET` to `new` only where the row still equals
     `old`, id included. A lost race is a typed `.stale`, never a silent
-    clobber. `IS` (not `=`) so `NULL` columns pin correctly. -/
+    clobber. `IS` (not `=`) so `NULL` columns pin correctly. The CAS is on
+    the parent's own columns; once it holds, every child list is replaced
+    wholesale (`DELETE … WHERE parent = ?`, then re-inserted), in the same
+    transaction. -/
 def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog "update" (Entity.tableName α) (fun _ => 1) do
   let spec := Entity.spec α
-  if spec.columns.isEmpty then
-    let changed ← sqlite fun db => do
-      let stmt ← db.prepare s!"UPDATE {quoteId spec.name} SET id = id WHERE id = ?"
-      stmt.bindInt64 1 old.id.toInt64
+  let links := Entity.children (α := α)
+  let cas : DbM Unit := do
+    if spec.columns.isEmpty then
+      let changed ← sqlite fun db => do
+        let stmt ← db.prepare s!"UPDATE {quoteId spec.name} SET id = id WHERE id = ?"
+        stmt.bindInt64 1 old.id.toInt64
+        stmt.exec
+        db.changes
+      if changed == 0 then throw (.notFound spec.name old.id.toInt64)
+      return
+    let sets := String.intercalate ", " (spec.columns.toList.map (s!"{quoteId ·.name} = ?"))
+    let pins := String.intercalate " AND " (spec.columns.toList.map (s!"{quoteId ·.name} IS ?"))
+    let sql := s!"UPDATE {quoteId spec.name} SET {sets} WHERE id = ? AND {pins}"
+    let n := spec.columns.size
+    let changed ← sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
+      let stmt ← db.prepare sql
+      bindCols stmt 1 (Entity.encode new)
+      stmt.bindInt64 (Int32.ofNat (n + 1)) old.id.toInt64
+      bindCols stmt (n + 2) (Entity.encode old.val)
       stmt.exec
       db.changes
-    if changed == 0 then throw (.notFound spec.name old.id.toInt64)
+    if changed == 0 then
+      match ← get old.id with
+      | some _ => throw (.stale spec.name old.id.toInt64)
+      | none => throw (.notFound spec.name old.id.toInt64)
+  let act : DbM (Stored α) := do
+    cas
+    for link in links do
+      let parentCol := (link.spec.columns.getD 0 default).name
+      sqlite fun db => do
+        let stmt ← db.prepare s!"DELETE FROM {quoteId link.table} WHERE {quoteId parentCol} = ?"
+        stmt.bindInt64 1 old.id.toInt64
+        stmt.exec
+      insertChildren link old.id.toInt64 new
     return ⟨old.id, new⟩
-  let sets := String.intercalate ", " (spec.columns.toList.map (s!"{quoteId ·.name} = ?"))
-  let pins := String.intercalate " AND " (spec.columns.toList.map (s!"{quoteId ·.name} IS ?"))
-  let sql := s!"UPDATE {quoteId spec.name} SET {sets} WHERE id = ? AND {pins}"
-  let n := spec.columns.size
-  let changed ← sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
-    let stmt ← db.prepare sql
-    bindCols stmt 1 (Entity.encode new)
-    stmt.bindInt64 (Int32.ofNat (n + 1)) old.id.toInt64
-    bindCols stmt (n + 2) (Entity.encode old.val)
-    stmt.exec
-    db.changes
-  if changed == 0 then
-    match ← get old.id with
-    | some _ => throw (.stale spec.name old.id.toInt64)
-    | none => throw (.notFound spec.name old.id.toInt64)
-  return ⟨old.id, new⟩
+  if links.isEmpty then act else transaction act
 
 /-- Delete by typed identity. Rows referenced elsewhere refuse with
-    `.restricted` (FK RESTRICT) — destruction is loud. -/
+    `.restricted` (FK RESTRICT) — destruction is loud. A parent's own child
+    rows go with it (the child FK cascades: they are part of its value),
+    while any other table's `Ref` to it still restricts. -/
 def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.tableName α) (fun _ => 1) do
   let table := Entity.tableName α
   let changed ← sqliteWith (constraintError table (.restricted table id.toInt64)) fun db => do
@@ -248,9 +364,11 @@ def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts) :
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
     return out
-  rows.mapM liftExcept
+  attachChildren α (← rows.mapM liftExcept)
 
-/-- The live database as a row `Source`, ignoring plans. -/
+/-- The live database as a row `Source`, ignoring plans. Rows come with
+    their child lists attached, so `selectSpec` over it — the reference
+    semantics — sees whole values. -/
 def dbSource : Source DbM := ⟨fun _ α _ => fetchAll α⟩
 
 /-- The live database narrowed by a pushed plan's per-table conjuncts. -/
@@ -288,6 +406,7 @@ def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
   let rows ← raw.mapM fun r => do
     let cols ← liftExcept r
     liftExcept (RowsOf.decodeFrom (ts := ts) cols 0)
+  let rows ← RowsOf.mapTables (ts := ts) (fun α _ rows => attachChildren α rows) rows
   return finishRows ts rows where' sortBy
 
 /-- Run a pushed plan and a decider: the opaque-free `pushed` ships to
