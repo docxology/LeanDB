@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S8 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S9 done 2026-09-02 |
 
 ---
 
@@ -220,6 +220,11 @@ logged plans byte-identical:
   in `serve` mode, `/bases/<name>/…` over the shared `Http` resolver)
   and `<base> serve --mcp` (`LeanDb.Mcp`: JSON-RPC over stdio, tools
   derived from tables and `query%` params); smokes in the release check.
+- **S9 — done 2026-09-02.** Deployable: bearer-token auth on the HTTP
+  surface (`--auth-token`/`$LEANDB_TOKEN`, open `/healthz`), a root
+  `Dockerfile` for any example base, and a Dockerfile in every
+  `leandb new` scaffold. Not done: TLS termination (a reverse proxy's
+  job), multi-writer scaling (one SQLite writer per base by design).
 - **S8 — done 2026-09-02.** `leandb new` (`LeanDb.Scaffold`): a
   standalone base requiring the engine by path or by git+rev, laid out
   like the examples, tests included; scaffold round trip in the release

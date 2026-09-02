@@ -24,6 +24,7 @@ def statusOf (j : Json) : Status :=
   if (j.getObjValAs? Bool "ok").toOption == some true then .ok
   else match (j.getObjValAs? String "code").toOption with
     | some "usage" | some "decode" => .badRequest
+    | some "unauthorized" => .unauthorized
     | some "not_found" => .notFound
     | some "stale" | some "restricted" | some "duplicate" | some "missing_ref"
     | some "schema_mismatch" | some "unknown_lineage" | some "migrate" => .conflict
@@ -95,11 +96,41 @@ private def respond (status : Status) (j : Json) : ContextAsync (Response Body.A
     resolves everything to itself; a host resolves `/bases/<name>/…`. -/
 abbrev Resolver := List String → IO (Except (Nat × String) (List String × String × (List String → IO Json)))
 
+/-- Access policy for a served base: open, or a bearer token every
+    request must carry (`Authorization: Bearer <token>`). `/healthz` is
+    always open, so an orchestrator can probe without the secret. -/
+inductive Auth where
+  | open
+  | bearer (token : String)
+
+/-- `--auth-token <t>` beats `$LEANDB_TOKEN`; neither means open. -/
+def Auth.resolve (flag : Option String) : IO Auth := do
+  match flag with
+  | some t => return .bearer t
+  | none =>
+      match ← IO.getEnv "LEANDB_TOKEN" with
+      | some t => if t.isEmpty then return .open else return .bearer t
+      | none => return .open
+
+private def authorized (auth : Auth) (req : Request Body.Stream) : Bool :=
+  match auth with
+  | .open => true
+  | .bearer token =>
+      match req.line.headers.get? (Header.Name.ofString! "authorization") with
+      | some v => toString v == s!"Bearer {token}"
+      | none => false
+
 /-- One request through the resolver. -/
-def handleRequest (resolve : Resolver) (req : Request Body.Stream) :
+def handleRequest (auth : Auth) (resolve : Resolver) (req : Request Body.Stream) :
     ContextAsync (Response Body.Any) := do
   let method := (toString req.line.method).toUpper
   let segs := (req.line.uri.path.toDecodedSegments.toList).filter (!·.isEmpty)
+  -- liveness, before the secret: nothing about the base is revealed
+  if segs == ["healthz"] then
+    return ← respond .ok (Json.mkObj [("ok", Json.bool true)])
+  unless authorized auth req do
+    let r ← respond .unauthorized (errJson "unauthorized" "bearer token required (Authorization: Bearer <token>)")
+    return { r with line := { r.line with headers := r.line.headers.insert (Header.Name.ofString! "www-authenticate") (Header.Value.ofString! "Bearer") } }
   let query := req.line.uri.query.toList.filterMap fun (k, v) => do
     let k ← k.decode
     some (k, (v.bind (·.decode)).getD "")
@@ -129,30 +160,37 @@ private def parseHost (host : String) : Except String Net.IPv4Addr :=
   | _ => .error s!"expected a dotted IPv4 address, got {host}"
 
 /-- Serve a resolver on `host:port` until shutdown. -/
-def serveResolver (host : String) (port : UInt16) (resolve : Resolver) (banner : Json) : IO UInt32 := do
+def serveResolver (host : String) (port : UInt16) (auth : Auth) (resolve : Resolver) (banner : Json) : IO UInt32 := do
   let ip ← match parseHost host with
     | .ok ip => pure ip
     | .error m =>
         IO.eprintln (errJson "usage" m).compress
         return 3
   let addr : Net.SocketAddress := .v4 { addr := ip, port }
-  let handler := Std.Http.Server.Handler.ofFn (handleRequest resolve)
+  let handler := Std.Http.Server.Handler.ofFn (handleRequest auth resolve)
+  let banner := match auth with
+    | .open => banner.mergeObj (Json.mkObj [("auth", Json.str "open")])
+    | .bearer _ => banner.mergeObj (Json.mkObj [("auth", Json.str "bearer")])
   IO.eprintln banner.compress
+  -- No `Date` header: the server would compute it through `Std.Time`,
+  -- which needs zoneinfo, and a minimal container has none — every
+  -- response then dies before its first byte. An API needs no Date.
+  let config : Std.Http.Config := { generateDate := false }
   Async.block do
-    let server ← Std.Http.Server.serve addr handler
+    let server ← Std.Http.Server.serve addr handler config
     server.waitShutdown
   return 0
 
 /-- Serve one dispatcher (a single base). -/
-def serveWith (host : String) (port : UInt16) (fingerprint : String)
+def serveWith (host : String) (port : UInt16) (auth : Auth) (fingerprint : String)
     (dispatch : List String → IO Json) (banner : Json) : IO UInt32 :=
-  serveResolver host port (fun segs => return .ok (segs, fingerprint, dispatch)) banner
+  serveResolver host port auth (fun segs => return .ok (segs, fingerprint, dispatch)) banner
 
 /-- Serve many bases under `/bases/<name>/…`; `GET /bases` lists them.
     `bases name` gives a base's fingerprint and dispatcher. -/
-def serveHosted (host : String) (port : UInt16) (list : Json)
+def serveHosted (host : String) (port : UInt16) (auth : Auth) (list : Json)
     (bases : String → Option (String × (List String → IO Json))) (banner : Json) : IO UInt32 :=
-  serveResolver host port (fun segs => do
+  serveResolver host port auth (fun segs => do
     match segs with
     | [] | ["bases"] => return .ok ([], "", fun _ => pure list)
     | "bases" :: name :: rest =>
@@ -161,8 +199,8 @@ def serveHosted (host : String) (port : UInt16) (list : Json)
         | none => return .error (404, s!"no base {name}")
     | _ => return .error (404, "routes live under /bases/<name>/…")) banner
 
-/-- `<base> serve --http <port> [--bind <host>]`. -/
-def serve (b : Base) (inst : Instance) (host : String) (port : UInt16) : IO UInt32 := do
+/-- `<base> serve --http <port> [--bind <host>] [--auth-token <t>]`. -/
+def serve (b : Base) (inst : Instance) (host : String) (port : UInt16) (auth : Auth) : IO UInt32 := do
   match ← Cli.Session.open b inst with
   | .error e =>
       IO.eprintln e.toJson.compress
@@ -172,11 +210,12 @@ def serve (b : Base) (inst : Instance) (host : String) (port : UInt16) : IO UInt
       let fp := fingerprint b.specs
       let dispatch := fun (argv : List String) =>
         (lock.atomically (fun ref => do b.handle inst (← ref.get) argv) : IO Json)
-      serveWith host port fp dispatch <| Json.mkObj [("ok", Json.bool true),
+      serveWith host port auth fp dispatch <| Json.mkObj [("ok", Json.bool true),
         ("serving", Json.str s!"http://{host}:{port}"), ("base", Json.str b.name),
         ("instance", Json.str inst.path.toString), ("fingerprint", Json.str fp)]
 
 initialize
-  Cli.httpServer.set (some serve)
+  Cli.httpServer.set (some fun b inst host port token? => do
+    serve b inst host port (← Auth.resolve token?))
 
 end LeanDb.Http

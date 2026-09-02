@@ -60,15 +60,21 @@ done
   cd examples/tickets
   http_db=$(mktemp /tmp/leandb-http.XXXXXX)
   rm -f "$http_db"
-  .lake/build/bin/tickets --db "$http_db" serve --http 7433 >/dev/null 2>&1 &
+  .lake/build/bin/tickets --db "$http_db" serve --http 7433 --auth-token release-check >/dev/null 2>&1 &
   http_pid=$!
   sleep 2
   ok=1
+  # the token gate: healthz open, everything else 401 without the bearer
+  curl -sf http://127.0.0.1:7433/healthz | grep -q '"ok":true' || ok=0
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7433/version)
+  [[ "$code" == "401" ]] || ok=0
+  curl() { command curl -H 'Authorization: Bearer release-check' "$@"; }
   curl -sf -X POST http://127.0.0.1:7433/seed | grep -q '"seeded":true' || ok=0
   curl -sf http://127.0.0.1:7433/query/slaBreached/1700000000 | grep -q '"ok":true' || ok=0
   curl -sf -X POST http://127.0.0.1:7433/rpc -d '["rows","ticket","--limit","1"]' | grep -q '"count":1' || ok=0
   code=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-LeanDb-Fingerprint: stale' http://127.0.0.1:7433/version)
   [[ "$code" == "409" ]] || ok=0
+  unset -f curl
   kill "$http_pid" 2>/dev/null || true
   wait "$http_pid" 2>/dev/null || true
   rm -f "$http_db"

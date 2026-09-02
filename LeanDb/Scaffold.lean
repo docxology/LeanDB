@@ -246,11 +246,43 @@ wire `chain := some {t.module}.Migrations.chain` into the base, and
 uncomment `leandb_check_head` in `{t.module}Tests.lean`.
 "
 
+private def dockerfile (t : Target) : String := s!"# {t.name} as a container: build the executable, ship only it.
+#   docker build -t {t.name} .
+#   docker run -p 7411:7411 -v {t.name}-data:/data -e LEANDB_TOKEN=s3cret {t.name}
+# The server binds 0.0.0.0 inside the container: set LEANDB_TOKEN before
+# publishing the port. The instance lives in the /data volume.
+
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+      curl git ca-certificates build-essential \\
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \\
+    | sh -s -- -y --default-toolchain none
+ENV PATH=/root/.elan/bin:$PATH
+WORKDIR /src
+COPY . .
+RUN lake build {t.name}
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgmp10 curl tzdata \\
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/.lake/build/bin/{t.name} /usr/local/bin/base
+VOLUME /data
+ENV LEANDB_DB=/data/base.sqlite
+EXPOSE 7411
+HEALTHCHECK --interval=30s --timeout=3s CMD curl -sf http://127.0.0.1:7411/healthz || exit 1
+ENTRYPOINT [\"/usr/local/bin/base\"]
+CMD [\"serve\", \"--http\", \"7411\", \"--bind\", \"0.0.0.0\"]
+"
+
 /-- Every file of the scaffold: relative path → contents. -/
 def files (t : Target) : List (System.FilePath × String) :=
   [("lean-toolchain", t.toolchain ++ "\n"),
    ("lakefile.toml", lakefile t),
    (".gitignore", ".lake/\ndata/\n*.sqlite\n"),
+   (".dockerignore", ".lake/\ndata/\n*.sqlite\n.git/\n"),
+   ("Dockerfile", dockerfile t),
    ("README.md", readme t),
    (s!"{t.module}.lean", rootFile t),
    (s!"{t.module}/Scalars.lean", scalars t),

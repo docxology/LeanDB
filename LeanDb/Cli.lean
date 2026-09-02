@@ -104,7 +104,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "backup  (full copy under <instance dir>/backups)",
       Json.str "restore <file>",
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
-      Json.str "serve --http <port> [--bind <host>]  (HTTP/1.1; every route is sugar over the CLI)",
+      Json.str "serve --http <port> [--bind <host>] [--auth-token <t>]  (HTTP/1.1; every route is sugar over the CLI; $LEANDB_TOKEN also sets the token)",
       Json.str "serve --mcp  (Model Context Protocol over stdio; tools derived from tables and queries)",
       Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
@@ -646,7 +646,7 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
 
 /-- The HTTP server, registered by `LeanDb.Http` at initialization so the
     CLI module (which it imports) can reach it. -/
-initialize httpServer : IO.Ref (Option (Base → Instance → String → UInt16 → IO UInt32)) ← IO.mkRef none
+initialize httpServer : IO.Ref (Option (Base → Instance → String → UInt16 → Option String → IO UInt32)) ← IO.mkRef none
 
 /-- The MCP server, registered by `LeanDb.Mcp` the same way. -/
 initialize mcpServer : IO.Ref (Option (Base → Instance → IO UInt32)) ← IO.mkRef none
@@ -665,16 +665,19 @@ def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
   | "serve" :: "--http" :: rest =>
       match ← httpServer.get with
       | some http =>
-          let rec parse : List String → Except String (Option String × Option String)
-            | [] => .ok (none, none)
-            | "--bind" :: h :: r => do let (p, _) ← parse r; return (p, some h)
-            | p :: r => do let (_, h) ← parse r; return (some p, h)
+          let rec parse : List String → Except String (Option String × Option String × Option String)
+            | [] => .ok (none, none, none)
+            | "--bind" :: h :: r => do let (p, _, t) ← parse r; return (p, some h, t)
+            | "--auth-token" :: t :: r => do let (p, h, _) ← parse r; return (p, h, some t)
+            | f :: r =>
+                if f.startsWith "--" then .error s!"unrecognized serve flag {f}"
+                else do let (_, h, t) ← parse r; return (some f, h, t)
           match parse rest with
           | .error m => IO.eprintln (usageErr m).compress; return 3
-          | .ok (port?, host?) =>
+          | .ok (port?, host?, token?) =>
               match port?.bind (·.toNat?) with
-              | some port => http b inst (host?.getD "127.0.0.1") port.toUInt16
-              | none => IO.eprintln (usageErr "serve --http <port> [--bind <host>]").compress; return 3
+              | some port => http b inst (host?.getD "127.0.0.1") port.toUInt16 token?
+              | none => IO.eprintln (usageErr "serve --http <port> [--bind <host>] [--auth-token <token>]").compress; return 3
       | none =>
           IO.eprintln (usageErr "HTTP serving is not linked into this base").compress
           return 3

@@ -1,0 +1,6 @@
+.lake/
+**/.lake/
+**/data/
+*.sqlite
+.git/
+.claude/

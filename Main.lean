@@ -19,7 +19,7 @@ def usageJson : Json :=
     ("tool", Json.str "leandb"),
     ("usage", Json.arr #[
       Json.str "import-sqlite <file.db> --name <base-name> --out <dir> [--require-path <path-to-leandb>] [--db-path <path>]",
-      Json.str "host --port <port> [--bind <host>] <name>=<exe>[,<arg>,…]…  (serve many bases under /bases/<name>/…)",
+      Json.str "host --port <port> [--bind <host>] [--auth-token <t>] <name>=<exe>[,<arg>,…]…  (serve many bases under /bases/<name>/…)",
       Json.str "new <name> [--out <dir>] (--leandb-path <path> | --leandb-git <url> [--rev <tag>])  (scaffold a standalone base package)",
       Json.str "--help"]),
     ("defaults", Json.mkObj [

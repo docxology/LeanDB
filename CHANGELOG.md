@@ -184,6 +184,18 @@ of this repository: it builds anywhere and other projects `require` it
 in turn. Refuses to overwrite existing files. The release check
 scaffolds one against the checkout, builds it and runs its tests.
 
+Deployable: `serve --http` and `leandb host` take `--auth-token <t>` (or
+`$LEANDB_TOKEN`); with a token set every request must carry
+`Authorization: Bearer <t>` or gets 401 with `WWW-Authenticate: Bearer`,
+except `GET /healthz`, which is always open for orchestrators. A root
+`Dockerfile` (`--build-arg BASE=<example>`) builds any example base into
+an image that serves on 7411 with the instance in a `/data` volume;
+`leandb new` emits the same Dockerfile for a standalone base. Found on
+the way: `Std.Http.Server` generates a `Date` header through `Std.Time`,
+which needs zoneinfo; in a minimal container every response died before
+its first byte. The server now runs with `generateDate := false` (an
+API needs no Date) and the images ship `tzdata` anyway.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

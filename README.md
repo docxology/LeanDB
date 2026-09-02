@@ -444,6 +444,15 @@ serves them under `/bases/tickets/…` and `/bases/eats/…` (each base is
 its own binary, so the host supervises processes and speaks their
 JSON-lines protocol).
 
+Deploying: `--auth-token <t>` (or `LEANDB_TOKEN`) on `serve --http` and
+`host` requires `Authorization: Bearer <t>` on every request except
+`GET /healthz`; without a token the server is open and binds
+`127.0.0.1`. The root `Dockerfile` builds any example base into an
+image — `docker build --build-arg BASE=tickets -t leandb-tickets .`,
+then `docker run -p 7411:7411 -v tickets-data:/data -e LEANDB_TOKEN=s3cret leandb-tickets`
+— and `leandb new` emits the same for a standalone base. TLS is a
+reverse proxy's job; the server speaks plain HTTP/1.1.
+
 `Client.connect` spawns `tickets serve` and refuses a base whose schema
 fingerprint is not the one the client was compiled against. Arguments
 render through `CliRender`, results decode through `QueryIn`; a base adds
