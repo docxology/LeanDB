@@ -35,6 +35,12 @@ JSON columns carry a type shape that the fingerprint, `schema_json` and
 the migration diff see (additive-with-defaults changes restamp, others
 are refused by name); `:= derived expr` columns are recomputed on write
 and checked on read. kernels' signature and search columns use them.
+
+LEP-0005 stage 1 (eats): configurable espresso offers — a finite
+configuration type with a validity predicate, typed option patterns, a
+price rule with `decide`d lints, a tabulated `offer_price` table, order
+lines quoted against it; seven configuration queries and a second test
+executable.
 Design docs: LEP-0002, the kernels/restaurants stress study, `ROADMAP.md`.
 
 ## 0.2.0 - 2026-08-25

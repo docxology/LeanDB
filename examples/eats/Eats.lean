@@ -3,3 +3,7 @@ import Eats.Enums
 import Eats.Entities
 import Eats.Queries
 import Eats.Seed
+import Eats.Config
+import Eats.Offers
+import Eats.OfferQueries
+import Eats.OfferSeed

@@ -19,6 +19,10 @@ for base in tickets crm shop gpus gpumarket pricewatch eats kernels; do
     cd "examples/$base"
     lake build "$base" "${base}_tests"
     ".lake/build/bin/${base}_tests"
+    if [[ "$base" == "eats" ]]; then
+      lake build eats_offers_tests
+      .lake/build/bin/eats_offers_tests
+    fi
     schema_json=$(".lake/build/bin/$base" schema)
     if [[ "$schema_json" != *'"ok":true'* ]]; then
       echo "release check failed: $base schema smoke test failed" >&2

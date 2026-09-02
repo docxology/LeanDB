@@ -15,3 +15,7 @@ root = "Main"
 [[lean_exe]]
 name = "eats_tests"
 root = "EatsTests"
+
+[[lean_exe]]
+name = "eats_offers_tests"
+root = "EatsOffersTests"

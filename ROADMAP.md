@@ -116,14 +116,27 @@ Both written 2026-09-01 from R1/R2 evidence; implementation order below.
   shape-less base's fingerprint unchanged. Open: A `EnumSet` (+
   `Pred.bit`), C inline flatten, D child tables.
 
-## R4b — LEP-0005, configurable entities (after LEP-0003 C)
+## R4b — LEP-0005, configurable entities
 
 Modifiers and variants as a stored function over a finite configuration
-type: rule (truth, JSON with shape), tabulation (derived child rows),
-bounds (derived columns). Stage 1 is built by hand in eats after LEP-0004
-lands there, to measure the hand-maintenance cost; engine pieces
-(`deriving Config`, `Pattern`/`PriceRule`, derived child rows) follow
-LEP-0003 C and D.
+type: rule (truth), tabulation (child rows), bounds (columns).
+
+**Stage 1 landed 2026-09-01, by hand in eats:** `EspressoConfig` (180
+configurations, 125 valid), typed `EspressoOption`/`Pattern`, `PriceRule`
+with `overridesDisjoint`/`nonNegative` proved by `decide +kernel` for
+every seed rule and refused by the codec otherwise, `EspressoOffer` with
+hand-maintained bounds, tabulated `OfferPrice`, `OrderLine`; queries
+`priceOf`, `cheapestConfigured` (residual 0), `cheapestMatching`
+(runtime pattern: residual 1), `offersWith`, `configurationsFor`,
+`quote`, `placeOrder`; `eats_offers_tests`; evidence in
+`examples/eats/README.md`. Findings: an `Option α` filter parameter is
+fully residual (tactic extension: split a captured `Option α` for closed
+`α`); hand-maintained bounds and tabulation desynchronize under `update`
+exactly as kernels' search columns did before LEP-0003 B3.
+
+Engine stages (`deriving Config`, `Pattern`/`PriceRule` as library types,
+derived child rows, the rule-coverage migration check) follow LEP-0003 C
+and D.
 
 ## R5 — The universe
 

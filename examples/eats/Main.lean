@@ -58,12 +58,14 @@ def main (args : List String) : IO UInt32 := do
   Cli.run {
     name := "eats"
     dbPath := "data" / "eats.sqlite"
-    specs := schema
+    specs := schema ++ offersSchema
     tables := [.of CanonicalDish, .of Restaurant, .of Ingredient, .of Hours, .of Dish,
-      .of DishIngredient, .of Modification, .of PriceObs]
+      .of DishIngredient, .of Modification, .of PriceObs,
+      .of EspressoOffer, .of OfferPrice, .of OrderLine]
     queries := [
       ("seed", fun _ => do
         seed
+        seedOffers
         return Json.mkObj [("ok", Json.bool true), ("seeded", Json.bool true)]),
       query% avgPrice,
       query% openFor,
@@ -72,5 +74,13 @@ def main (args : List String) : IO UInt32 := do
       query% dietsFor,
       query% priceWith,
       query% nearby,
-      query% history]
+      query% history,
+      -- LEP-0005 stage 1: configurable offers
+      query% priceOf,
+      query% cheapestConfigured,
+      query% cheapestMatching,
+      query% offersWith,
+      query% configurationsFor,
+      query% quote,
+      query% placeOrder]
   } args
