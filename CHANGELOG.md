@@ -137,6 +137,19 @@ number of logged runs that did), and `unregistered_runs` (logged selects
 outside any registered query). This is the third report of the thesis:
 a vocabulary edit says which queries it reaches, before `apply`.
 
+HTTP: `<base> serve --http <port> [--bind <host>]` serves the base over
+HTTP/1.1 on the toolchain's `Std.Http.Server`. Every route is sugar over
+the CLI's argv — `GET /schema|version|log`, `GET /tables/:t?eq=k=v&limit=n`,
+`GET|PATCH|DELETE /tables/:t/:id`, `POST /tables/:t`,
+`GET /query/:q/:args…` or `POST /query/:q {"args":[…]}`, `POST /seed`,
+`GET /migrate`, `POST /migrate/apply?allow_destructive=1&backup=0`,
+`POST /migrate/rollback`, `GET /migrate/history`, `POST /backup`,
+`POST /restore {"file":…}`, and `POST /rpc` with a JSON argv array —
+and reaches the same `Base.handle`; the status code derives from the
+response `code`. Requests run one at a time behind a mutex (one SQLite
+handle). A request carrying `X-LeanDb-Fingerprint` for another schema
+is refused with `schema_mismatch` (409).
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S4 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S5 done 2026-09-02 |
 
 ---
 
@@ -204,11 +204,15 @@ logged plans byte-identical:
   *re-execution* replay is not built — the impact scan reads footprints,
   which is what a schema change can be checked against. Engine test
   `testFootprints`.
-- **S5** — `<base> serve --http <port>` on `Std.Http.Server`, fingerprint
-  handshake; **S6** — `leandb host` multi-base supervisor and
-  `serve --mcp`; **S7** — `Base.withInstance`, `examples/dashboard`
-  importing two bases, `client%` typed remote stubs; **S8** —
-  `leandb new` scaffolder with a git require, tag v0.3.0.
+- **S5 — done 2026-09-02.** `<base> serve --http <port> [--bind host]`
+  on `Std.Http.Server` (`LeanDb.Http`): typed routes and `POST /rpc`
+  over one `Base.handle`, statuses from response codes, a mutex around
+  the session, the `X-LeanDb-Fingerprint` handshake; curl smoke in the
+  release check.
+- **S6** — `leandb host` multi-base supervisor and `serve --mcp`;
+  **S7** — `Base.withInstance`, `examples/dashboard` importing two
+  bases, `client%` typed remote stubs; **S8** — `leandb new` scaffolder
+  with a git require, tag v0.3.0.
 
 ## Deferred, by name
 

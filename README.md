@@ -388,6 +388,7 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `migrate rollback` · `migrate history` · `backup` · `restore <file>` | return to the pre-migration copy; the journal; copies on demand |
 | `log [n]` | the query log: verb, reified SQL plan (text and as data with its footprint), the query it ran under, outcome, row count |
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
+| `serve --http <port> [--bind <host>]` | the same surface over HTTP/1.1: `GET /tables/ticket?eq=status=done`, `GET /query/slaBreached/1700000000`, `POST /rpc` with an argv array, `POST /migrate/apply`, … — statuses from the response `code`, `X-LeanDb-Fingerprint` refused when stale |
 
 Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:
 `decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `schema`, `enum_drift`,
@@ -450,6 +451,7 @@ LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query lo
 LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal, backups
 LeanDb/Migration.lean chains: Step (typed transforms), Migration, Chain, adoption, apply
 LeanDb/Freeze.lean   migrate freeze: V<n>.lean (snapshot, raw types, holes) and the roll-up
+LeanDb/Http.lean     serve --http: routes as sugar over Base.handle (Std.Http.Server)
 LeanDb/Json.lean     schema/row/error JSON, merge decode
 LeanDb/Base.lean     Base (tables → derived schema, queries, seed), Instance, QueryEntry
 LeanDb/Cli.lean      the CLI driver (CliArg, QueryOut, verbs, serve)

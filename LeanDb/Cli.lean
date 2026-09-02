@@ -104,6 +104,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "backup  (full copy under <instance dir>/backups)",
       Json.str "restore <file>",
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
+      Json.str "serve --http <port> [--bind <host>]  (HTTP/1.1; every route is sugar over the CLI)",
       Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
     ("queries", Json.arr (b.queries.map fun q =>
@@ -642,11 +643,31 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
         out.flush
       return 0
 
+/-- The HTTP server, registered by `LeanDb.Http` at initialization so the
+    CLI module (which it imports) can reach it. -/
+initialize httpServer : IO.Ref (Option (Base → Instance → String → UInt16 → IO UInt32)) ← IO.mkRef none
+
 /-- Run one command against a resolved instance. `help`, `schema` and
     `version` touch no file; everything else opens a session. -/
 def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
   match args with
   | ["serve"] => serve b inst
+  | "serve" :: "--http" :: rest =>
+      match ← httpServer.get with
+      | some http =>
+          let rec parse : List String → Except String (Option String × Option String)
+            | [] => .ok (none, none)
+            | "--bind" :: h :: r => do let (p, _) ← parse r; return (p, some h)
+            | p :: r => do let (_, h) ← parse r; return (some p, h)
+          match parse rest with
+          | .error m => IO.eprintln (usageErr m).compress; return 3
+          | .ok (port?, host?) =>
+              match port?.bind (·.toNat?) with
+              | some port => http b inst (host?.getD "127.0.0.1") port.toUInt16
+              | none => IO.eprintln (usageErr "serve --http <port> [--bind <host>]").compress; return 3
+      | none =>
+          IO.eprintln (usageErr "HTTP serving is not linked into this base").compress
+          return 3
   | [] | ["help"] | ["--help"] =>
       IO.println (usageJson b inst).compress
       return 0
