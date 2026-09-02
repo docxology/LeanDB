@@ -1,5 +1,6 @@
 import LeanDb.Base
 import LeanDb.Migrate
+import LeanDb.Freeze
 
 namespace LeanDb.Cli
 
@@ -99,7 +100,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "query <name> [args...]"] ++
       (if b.seed.isSome then #[Json.str "seed"] else #[]) ++ #[
       Json.str "log [limit]",
-      Json.str "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit]",
+      Json.str "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit] | freeze [--module M]",
       Json.str "backup  (full copy under <instance dir>/backups)",
       Json.str "restore <file>",
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
@@ -206,7 +207,8 @@ structure Session where
   gate : IO.Ref (Option DbError)
 
 private def gateOf (b : Base) (conn : Conn) : IO (Option DbError) := do
-  match ← conn.verify b.specs with
+  if let some c := b.chain then discard <| c.adopt conn
+  match ← conn.verify b.specs b.headVersion with
   | .ok () => return none
   | .error e => return some e
 
@@ -303,7 +305,183 @@ private def historyJson (sess : Session) (limit : Nat) : IO Json := do
   return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.size), ("entries", Json.arr rows)]
 
 private def migrateUsage : String :=
-  "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit]"
+  "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit] \
+| freeze [--module M] [--imports A,B]"
+
+/-! ### Chain mode: the frozen history drives status and apply -/
+
+private def rowCount (conn : Conn) (table : String) : IO Nat := do
+  try
+    let stmt ← conn.raw.prepare s!"SELECT COUNT(*) FROM {quoteIdent table}"
+    if ← stmt.step then return (← stmt.columnInt64 0).toNatClampNeg else return 0
+  catch _ => return 0
+
+private def stepTable : MigStep → Option String
+  | .createTable spec => some spec.name
+  | .addColumn t _ | .dropColumn t _ | .dropTable t | .restampShape t _ => some t
+  | .rebuildTable spec _ => some spec.name
+
+/-- One pending migration as `status` reports it: its steps with row
+    counts, whether each needs a judgment and whether one is declared. -/
+private def pendingJson (conn : Conn) (prev : List TableSpec) (m : Migration) (version : Nat) :
+    IO (Except String (Json × Bool)) := do
+  let required := (Freeze.refusals prev m.snapshot).map (·.1)
+  let declared := m.steps.filterMap (·.table?)
+  match m.plan prev with
+  | .error msg => return .error s!"V{version}: {msg}"
+  | .ok plan =>
+      let destructive := plan.destructiveAgainst prev
+      let mut steps : Array Json := #[]
+      for st in plan.steps do
+        let table := stepTable st
+        let rows ← match table with
+          | some t => if prev.any (·.name == t) then rowCount conn t else pure 0
+          | none => pure 0
+        let transform := match table with
+          | some t =>
+              if declared.contains t then "provided"
+              else if required.contains t then "required" else "none"
+          | none => "none"
+        steps := steps.push <| Json.mkObj [
+          ("describe", Json.str st.describe),
+          ("table", (table.map Json.str).getD Json.null),
+          ("rows", Lean.toJson rows),
+          ("destructive", Json.bool (st.destructive ||
+            (match st with
+              | .rebuildTable spec cols => (prev.find? (·.name == spec.name)).any fun o => cols.length < o.columns.size
+              | _ => false))),
+          ("transform", Json.str transform)]
+      for st in m.steps do
+        if let .custom d _ := st then
+          steps := steps.push <| Json.mkObj [("describe", Json.str d), ("table", Json.null),
+            ("rows", Lean.toJson 0), ("destructive", Json.bool false), ("transform", Json.str "custom")]
+      let missing := required.filter (!declared.contains ·)
+      return .ok (Json.mkObj [
+        ("version", Lean.toJson version),
+        ("from", Json.str m.fromFingerprint),
+        ("to", Json.str m.toFingerprint),
+        ("note", Json.str m.note),
+        ("destructive", Json.bool destructive),
+        ("transforms_missing", Json.arr (missing.map Json.str).toArray),
+        ("steps", Json.arr steps)], destructive)
+
+/-- `migrate status` / `apply` when the base carries a chain. -/
+private def chainMigrate (b : Base) (inst : Instance) (sess : Session) (c : Chain)
+    (apply allowDestructive backup : Bool) : IO Json := do
+  let conn ← sess.conn.get
+  -- the code must be frozen before the instance can follow it
+  if let .error m := c.check b.specs then
+    return (DbError.migrate m).toJson
+  let (fp?, ver?) ← instanceInfoOn conn
+  let some fp := fp? | do
+    -- a fresh instance: verify created it at the head
+    return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
+      ("applied", Json.arr #[]), ("notes", Json.arr #[Json.str "fresh instance, created at the head"]),
+      ("fingerprint", Json.str (fingerprint b.specs)),
+      ("instance_version", Lean.toJson c.headVersion), ("head_version", Lean.toJson c.headVersion)]
+  let some k := c.versionOf? fp | return (DbError.unknownLineage fp c.fingerprints).toJson
+  let mut notes : Array String := #[]
+  if ver? != some k then
+    notes := notes.push s!"instance schema_version is {ver?}; by fingerprint it is at V{k}"
+  let pending := c.migrations.drop k
+  if pending.isEmpty then
+    return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
+      ("applied", Json.arr #[]),
+      ("notes", Json.arr (#[Json.str "schema already up to date"] ++ notes.map Json.str)),
+      ("fingerprint", Json.str (fingerprint b.specs)),
+      ("instance_version", Lean.toJson k), ("head_version", Lean.toJson c.headVersion)]
+  if !apply then
+    let mut items : Array Json := #[]
+    let mut describes : Array Json := #[]
+    let mut destructive := false
+    let mut prev := (c.at? k).getD []
+    let mut v := k
+    for m in pending do
+      v := v + 1
+      match ← pendingJson conn prev m v with
+      | .error msg => return (DbError.migrate msg).toJson
+      | .ok (j, d) =>
+          items := items.push j
+          destructive := destructive || d
+          if let .ok arr := j.getObjValAs? (Array Json) "steps" then
+            for st in arr do
+              if let .ok d := st.getObjValAs? String "describe" then
+                describes := describes.push (Json.str s!"V{v}: {d}")
+      prev := m.snapshot
+    return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
+      ("instance_version", Lean.toJson k), ("head_version", Lean.toJson c.headVersion),
+      ("steps", Json.arr describes), ("destructive", Json.bool destructive),
+      ("notes", Json.arr (notes.map Json.str)), ("pending", Json.arr items)]
+  -- apply, one migration per transaction, each after its own backup
+  let mut applied : Array Json := #[]
+  let mut prev := (c.at? k).getD []
+  let mut v := k
+  for m in pending do
+    let dest ← do
+      if backup then pure (some (inst.backupPath b (some v) (← unixNow conn))) else pure none
+    match ← m.applyOn conn prev (v + 1) allowDestructive dest with
+    | .error e =>
+        sess.gate.set (← gateOf b conn)
+        return Json.mkObj [("ok", Json.bool false), ("code", Json.str e.code),
+          ("message", Json.str e.message), ("mode", Json.str "chain"),
+          ("applied", Json.arr applied), ("instance_version", Lean.toJson v)]
+    | .ok r =>
+        v := v + 1
+        prev := m.snapshot
+        applied := applied.push <| Json.mkObj [("version", Lean.toJson v),
+          ("applied", Json.arr (r.applied.map Json.str).toArray),
+          ("notes", Json.arr (r.notes.map Json.str).toArray),
+          ("backup", (r.backup.map Json.str).getD Json.null)]
+  sess.gate.set (← gateOf b conn)
+  return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
+    ("applied", Json.arr applied), ("notes", Json.arr (notes.map Json.str)),
+    ("fingerprint", Json.str (fingerprint b.specs)),
+    ("instance_version", Lean.toJson v), ("head_version", Lean.toJson c.headVersion)]
+
+/-- `migrate freeze`: write the next version's file and the roll-up. -/
+private def freezeJson (b : Base) (flags : List String) : IO Json := do
+  let rec parse : List String → Except String (Option String × List String)
+    | [] => .ok (none, [])
+    | "--module" :: m :: rest => do let (_, i) ← parse rest; return (some m, i)
+    | "--imports" :: is :: rest => do let (m, _) ← parse rest; return (m, is.splitOn ",")
+    | f :: _ => .error s!"unrecognized freeze flag {String.quote f}"
+  match parse flags with
+  | .error m => return usageErr m
+  | .ok (module?, imports) =>
+      let module := module?.getD b.module
+      if module.isEmpty then
+        return usageErr "freeze needs the base's Lean module: set `module` on the base or pass --module <Module>"
+      let t := Freeze.Target.ofModule module (if imports.isEmpty then b.freezeImports else imports)
+      let cur := b.specs
+      let (n, prev) ← match b.chain with
+        | some c =>
+            if fingerprint c.head == fingerprint cur then
+              return (DbError.migrate s!"nothing to freeze: the code's schema is the chain's head V{c.headVersion}").toJson
+            pure (c.headVersion + 1, some c.head)
+        | none =>
+            let v0 := t.dir / "V0.lean"
+            if ← v0.pathExists then
+              return (DbError.migrate s!"{v0} exists but the base carries no chain: set `chain := some {module}.Migrations.chain` on the base").toJson
+            pure (0, none)
+      let typeNames := b.tables.map fun tbl => (tbl.name, tbl.typeName)
+      let (src, holes) := Freeze.versionFile t b.name n cur prev typeNames
+      let file := t.dir / s!"V{n}.lean"
+      let rollup : System.FilePath := t.dir.toString ++ ".lean"
+      try
+        IO.FS.createDirAll t.dir
+        IO.FS.writeFile file src
+        IO.FS.writeFile rollup (Freeze.rollup t b.name n)
+      catch e =>
+        return (DbError.migrate s!"freeze could not write: {e}").toJson
+      let next := if n == 0 then
+          s!"add `import {module}.Migrations` to {module}.lean (before Base), `chain := some {module}.Migrations.chain` to the base, and `leandb_check_head {module}.Migrations.chain {module}.base.specs` to the tests; then `lake build`"
+        else if holes > 0 then
+          s!"fill the {holes} hole(s) in {file}, then `lake build` and `migrate apply`"
+        else "lake build, then `migrate apply`"
+      return Json.mkObj [("ok", Json.bool true), ("version", Lean.toJson n),
+        ("fingerprint", Json.str (fingerprint cur)),
+        ("files", Json.arr #[Json.str file.toString, Json.str rollup.toString]),
+        ("holes", Lean.toJson holes), ("next", Json.str next)]
 
 private def migrateJson (b : Base) (inst : Instance) (sess : Session) (rest : List String) : IO Json := do
   match rest with
@@ -313,6 +491,7 @@ private def migrateJson (b : Base) (inst : Instance) (sess : Session) (rest : Li
       match n.toNat? with
       | some limit => historyJson sess limit
       | none => return usageErr s!"expected a limit, got {String.quote n}"
+  | "freeze" :: flags => freezeJson b flags
   | ["status"] => runMigrate false false true
   | "apply" :: flags =>
       let known := ["--allow-destructive", "--no-backup"]
@@ -322,6 +501,8 @@ private def migrateJson (b : Base) (inst : Instance) (sess : Session) (rest : Li
   | _ => return usageErr migrateUsage
 where
   runMigrate (apply allowDestructive backup : Bool) : IO Json := do
+    if let some c := b.chain then
+      return ← chainMigrate b inst sess c apply allowDestructive backup
     let conn ← sess.conn.get
     let backupPath ← do
       if apply && backup then
@@ -371,7 +552,7 @@ def exitCodeOf (j : Json) : UInt32 :=
   if (j.getObjValAs? Bool "ok").toOption == some true then 0
   else match (j.getObjValAs? String "code").toOption with
     | some "usage" => 3
-    | some "schema_mismatch" => 4
+    | some "schema_mismatch" | some "unknown_lineage" => 4
     | _ => 2
 
 /-- Served mode: JSON-lines over stdio against one persistent connection.

@@ -67,6 +67,9 @@ class Entity (α : Type) where
   /-- Every symbol, in declaration order. -/
   fields : Array Field
   tableName : String
+  /-- The Lean name of the entity type (`Tickets.Ticket`), for generated
+      source that must refer to it (`migrate freeze`). -/
+  typeName : String := ""
   /-- Field values in declaration order, id excluded. -/
   encode : α → Array Col
   /-- Inverse of `encode` over honest data; typed failure otherwise. A

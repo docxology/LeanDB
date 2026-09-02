@@ -271,8 +271,11 @@ structure MigPlan where
   deriving Repr
 
 /-- Diff two schemas into a plan. Errors are refusals with reasons —
-    never a silent guess. -/
-def planMigration (old new : List TableSpec) : Except String MigPlan := do
+    never a silent guess. A table in `covered` has a declared typed
+    transform (`LeanDb.Step`) that rewrites its rows: it is rebuilt
+    without the refusals that exist because no value could be invented. -/
+def planMigration (old new : List TableSpec) (covered : List String := []) :
+    Except String MigPlan := do
   let mut steps : List MigStep := []
   let mut notes : List String := []
   -- new and changed tables
@@ -281,6 +284,11 @@ def planMigration (old new : List TableSpec) : Except String MigPlan := do
     | none => steps := steps ++ [.createTable spec]
     | some oldSpec =>
         if oldSpec == spec then continue
+        if covered.contains spec.name then
+          notes := notes ++ [s!"\"{spec.name}\" is rewritten by a typed transform"]
+          steps := steps ++ [.rebuildTable spec (spec.columns.toList.filterMap fun c =>
+            if (oldSpec.columns.find? (·.name == c.name)).isSome then some c.name else none)]
+          continue
         let added := spec.columns.toList.filter fun c =>
           (oldSpec.columns.find? (·.name == c.name)).isNone
         let dropped := oldSpec.columns.toList.filter fun c =>
@@ -442,6 +450,10 @@ def migrateOn (conn : Conn) (specs : List TableSpec) (opts : MigrateOpts) :
         let fromVer := ((← readMeta db "schema_version").bind (·.toNat?)).getD 0
         let toVer := fromVer + 1
         db.exec "PRAGMA foreign_keys = OFF"
+        -- a rebuild renames the scratch table over the old one; an adopted file may
+        -- carry views over it (uncarried by the importer), which the modern rename
+        -- check rejects — the legacy behaviour is the one the swap needs
+        db.exec "PRAGMA legacy_alter_table = ON"
         db.exec "BEGIN"
         try
           for step in plan.steps do
@@ -470,8 +482,10 @@ VALUES (?, ?, 1, ?, ?, ?)"
           db.exec "COMMIT"
         catch e =>
           db.exec "ROLLBACK"
+          db.exec "PRAGMA legacy_alter_table = OFF"
           db.exec "PRAGMA foreign_keys = ON"
           return .error (.migrate (toString e))
+        db.exec "PRAGMA legacy_alter_table = OFF"
         db.exec "PRAGMA foreign_keys = ON"
         let report : MigrateReport := {
           applied := plan.steps.map (·.describe)

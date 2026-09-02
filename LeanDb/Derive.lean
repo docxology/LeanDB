@@ -716,6 +716,7 @@ partial def deriveEntityCore (declName : Name) (tableName? : Option String := no
         fieldSpec := $(b.specFn)
         fields := #[$(b.syms),*]
         tableName := $(quote tblName)
+        typeName := $(quote (toString declName))
         encode := $(b.encode)
         decode := fun row =>
           if row.size == $n then $bodyCheck

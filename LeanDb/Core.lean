@@ -56,6 +56,9 @@ inductive DbError where
   | enumDrift (table column value : String)
   /-- A migration was refused or failed; the message says why. -/
   | migrate (message : String)
+  /-- The instance's schema is at a fingerprint the base's migration chain
+      never produced: it was not created by this base's history. -/
+  | unknownLineage (instanceFp : String) (known : List String)
   /-- Raw SQLite error that no typed constructor claims. -/
   | sqlite (message : String)
   deriving Repr
@@ -71,6 +74,7 @@ def DbError.code : DbError → String
   | .schemaInvalid .. => "schema"
   | .enumDrift .. => "enum_drift"
   | .migrate .. => "migrate"
+  | .unknownLineage .. => "unknown_lineage"
   | .sqlite .. => "sqlite"
 
 def DbError.message : DbError → String
@@ -86,6 +90,9 @@ def DbError.message : DbError → String
   | .enumDrift table column value =>
       s!"{table}.{column}: stored value {String.quote value} is not in the closed world"
   | .migrate msg => msg
+  | .unknownLineage fp known =>
+      s!"the instance is at schema {fp}, which is not in this base's migration chain {known}: \
+it was not created by this base's history (restore a known version, or migrate by hand)"
   | .sqlite msg => msg
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
@@ -94,7 +101,7 @@ instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
     drift is 4, every other typed error is 2. Matching on the constructor,
     not the code string — strings are diagnostics, never identity. -/
 def DbError.exitCode : DbError → UInt32
-  | .schemaMismatch .. => 4
+  | .schemaMismatch .. | .unknownLineage .. => 4
   | _ => 2
 
 /-- Typed row identity: `Id User` and `Id Ticket` are distinct types. -/

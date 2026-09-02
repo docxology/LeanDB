@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S2 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S3 done 2026-09-02 |
 
 ---
 
@@ -185,10 +185,15 @@ logged plans byte-identical:
   `backup`/`note` (upgraded in place); `migrate rollback`, `backup`,
   `restore <file>`, `migrate history`; all work under `serve` (the
   session swaps the file and re-verifies). Engine test `testSession`.
-- **S3** — `migrate freeze` writes `<Base>/Migrations/V<n>.lean` (schema
-  snapshot as data + generated raw structures), typed chain
-  (`Migration`, `Step.transformT`), build-time `leandb_check_head`,
-  lineage check at open.
+- **S3 — done 2026-09-02.** `migrate freeze` writes
+  `<Module>/Migrations/V<n>.lean` (snapshot as data, raw structures,
+  `M<n>` with typed `sorry` holes) and the `chain` roll-up; chain-mode
+  `migrate status` (per-step rows/destructive/transform) and `apply`
+  (one transaction per version, backups, `transformT` rewrites rows
+  keeping ids); `unknown_lineage`; `leandb_check_head` in the tests;
+  adoption stamps an unstamped file at the version it matches.
+  `examples/legacy` carries V0→V1 (`qty` → closed `size`); engine test
+  `testChain`, base test `legacy_tests`.
 - **S4** — static query footprints from the plan tactic; `migrate status`
   reports rows, destructive, transform required/provided, and which
   queries a change touches; log stores the plan as data; `--replay`

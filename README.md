@@ -274,6 +274,66 @@ The rules, all loud:
   rollback` restores it (writes made after the migration are not in
   it, and the response says so). `--no-backup` opts out.
 
+## Versioned, typed migrations
+
+The rules above are the *unfrozen* mode: the instance remembers its
+schema and every change is diffed mechanically. Freezing gives the base a
+history, and lets a change that needs judgment be written as a typed
+function instead of refused:
+
+```bash
+$ legacy migrate freeze              # once: Legacy/Migrations/V0.lean, the origin
+```
+
+Add `import Legacy.Migrations`, `chain := some Legacy.Migrations.chain`
+to the base, and `leandb_check_head Legacy.Migrations.chain Legacy.base.specs`
+to the tests. Now edit an entity — say the imported `qty : Int64` becomes
+a closed world:
+
+```lean
+inductive OrderSize where | small | bulk   deriving …, LeanDb.ClosedEnum
+structure Orders where
+  customer_id : Ref Customers
+  item : OrdersItem
+  size : OrderSize        -- was `qty : Int64`
+```
+
+`lake build` is red — the tests say the code's schema is not the chain's
+head — but `lake build legacy && legacy migrate freeze` writes `V1.lean`:
+the new snapshot, the raw row types of V0 (`V0.Orders` with `qty :
+Int64`), and the migration with one hole, commented with the refusal:
+
+```lean
+def M1 : LeanDb.Migration := {
+  fromFingerprint := "7882435756683641985"
+  toFingerprint := "17105251411370212804"
+  snapshot := V1.schema
+  steps := [
+    -- table "orders": new column "size" is NOT NULL with no default — …
+    LeanDb.Step.transformT V0.Orders Legacy.Orders fun (old : V0.Orders) =>
+      sorry]
+}
+```
+
+Fill it — `size := if old.qty > 10 then .bulk else .small` — and the
+build is green. The instance follows:
+
+```console
+$ legacy migrate status
+{"ok":true,"mode":"chain","instance_version":0,"head_version":1,"destructive":true,
+ "pending":[{"version":1,"steps":[{"describe":"rebuild table \"orders\" (copying 2 columns)",
+   "table":"orders","rows":3,"destructive":true,"transform":"provided"}],…}],…}
+$ legacy migrate apply --allow-destructive
+{"ok":true,"mode":"chain","applied":[{"version":1,"applied":["transform rows of \"orders\" (… → …): 3 rows"],
+ "backup":"data/backups/legacy-v0-….sqlite"}],"instance_version":1,…}
+```
+
+One transaction per version, a full backup before each, ids kept, the
+first row the transform rejects aborts the whole migration by id. An
+instance whose fingerprint is in no snapshot is `unknown_lineage` (exit
+4); an adopted file with no stamp is stamped at the version whose
+columns it has. `examples/legacy` is this example, tests included.
+
 ## Importing an existing SQLite database
 
 Point the importer at any SQLite file; it generates a complete typed base:
@@ -379,7 +439,9 @@ LeanDb/Derive.lean   deriving LeanDb.Entity / LeanDb.ClosedEnum (incl. field def
 LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (the reference semantics)
 LeanDb/Pred.lean     typed plan IR (Pred)  LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
 LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query log
-LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal
+LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal, backups
+LeanDb/Migration.lean chains: Step (typed transforms), Migration, Chain, adoption, apply
+LeanDb/Freeze.lean   migrate freeze: V<n>.lean (snapshot, raw types, holes) and the roll-up
 LeanDb/Json.lean     schema/row/error JSON, merge decode
 LeanDb/Base.lean     Base (tables → derived schema, queries, seed), Instance, QueryEntry
 LeanDb/Cli.lean      the CLI driver (CliArg, QueryOut, verbs, serve)

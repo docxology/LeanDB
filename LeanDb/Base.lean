@@ -1,5 +1,6 @@
 import LeanDb.Db
 import LeanDb.Json
+import LeanDb.Migration
 
 namespace LeanDb
 
@@ -40,6 +41,8 @@ structure QueryEntry where
     verbs, type-erased into closures over the `Entity` instance. -/
 structure CliTable where
   name : String
+  /-- The entity's Lean name, for generated source (`migrate freeze`). -/
+  typeName : String
   specs : List TableSpec
   insertJson : Json → DbM Json
   getJson : Int64 → DbM Json
@@ -54,6 +57,7 @@ private def okRow (j : Json) : Json := Json.mkObj [("ok", Json.bool true), ("row
 
 def CliTable.of (α : Type) [Entity α] : CliTable where
   name := Entity.tableName α
+  typeName := Entity.typeName α
   specs := Entity.specs α
   insertJson j := do
     let a ← DbM.ofExcept (rowOfJson α j)
@@ -130,6 +134,16 @@ structure Base where
   /-- Instance path used when neither `--db` nor `LEANDB_DB` is given;
       `none` means `data/<name>.sqlite`. -/
   defaultDb : Option System.FilePath := none
+  /-- The frozen schema history (`migrate freeze`). `none` = unfrozen:
+      migrations are diffed from the instance's stored schema and applied
+      mechanically, refusing anything that needs judgment. -/
+  chain : Option Chain := none
+  /-- The base's Lean module (`Tickets`), where `migrate freeze` writes
+      `<module>/Migrations/V<n>.lean`; empty = pass `--module`. -/
+  module : String := ""
+  /-- Modules a generated migration imports to see the head entity
+      types; empty = `[<module>.Entities]`. -/
+  freezeImports : List String := []
 
 /-- Dedup by table name (first occurrence wins) and order so that every
     foreign-key target precedes its referrer. The sort is stable: among
@@ -206,11 +220,22 @@ def Instance.resolve (b : Base) (args : List String) :
         | none, none => b.defaultInstance
       return .ok (Instance.ofPath path, rest)
 
+/-- The version a fresh instance of this base starts at: the chain's head,
+    or 1 when unfrozen (the counter mode). -/
+def Base.headVersion (b : Base) : Nat :=
+  (b.chain.map (·.headVersion)).getD 1
+
 /-- Open the instance for this base and run an action — the whole
     lifecycle for another program that imports the base. -/
 def Base.withInstance (b : Base) (i : Instance) (act : DbM α) : IO (Except DbError α) := do
   if let some parent := i.path.parent then
     IO.FS.createDirAll parent
-  withDb i.path b.specs act
+  match ← openDbRaw i.path with
+  | .error e => return .error e
+  | .ok conn =>
+      if let some c := b.chain then discard <| c.adopt conn
+      match ← conn.verify b.specs b.headVersion with
+      | .error e => return .error e
+      | .ok () => act.run conn
 
 end LeanDb

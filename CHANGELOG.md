@@ -100,6 +100,31 @@ restores any file; `backup` takes one on demand; `migrate history`
 lists the journal. A restore swaps the file under a persistent session
 and re-verifies, so `serve` supports all of these.
 
+Versioned, typed migrations. `migrate freeze` writes
+`<Module>/Migrations/V<n>.lean`: the schema snapshot as data
+(`V<n>.schema`), one raw structure per table (the row as stored, so the
+old version lives on as a type), and for `n ≥ 1` the migration `M<n>`
+whose mechanical steps are diffed at apply time and whose judgments —
+every table the diff refuses — are `Step.transformT V<n-1>.T T fun old
+=> sorry` holes, each commented with the refusal; the roll-up
+`Migrations.lean` defines `chain`. A base with `chain := some …` is in
+chain mode: an instance names its version by fingerprint
+(`unknown_lineage`, exit 4, when it matches none), `migrate status`
+lists each pending version's steps with row counts, destructiveness and
+`transform: provided|required|none`, `migrate apply` runs one migration
+per transaction after its backup, transforms rewrite rows through the
+frozen old entity and the head entity keeping ids (the first `.error`
+aborts, naming the row), and the version is the chain index.
+`leandb_check_head chain specs` (in the base's tests) fails the build
+until the code's schema is the chain's head. An unstamped adopted file
+is stamped at the version whose columns it has, not mislabeled as the
+head. Rebuilds set `legacy_alter_table` so an adopted file's views do
+not block the rename. `examples/legacy` is the worked example: the
+imported `orders.qty` became a closed `size` at V1, the transform
+encodes the rule the uncarried `big_orders` view held, and
+`legacy_tests` adopts the raw fixture, migrates it, rolls it back and
+re-applies.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

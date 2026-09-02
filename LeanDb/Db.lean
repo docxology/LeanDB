@@ -64,20 +64,20 @@ private def constraintError (table : String) (fkError : DbError) (e : IO.Error) 
       else .sqlite s!"constraint: {details}"
   | e => .sqlite (toString e)
 
-private def bindCol (stmt : SQLite.Stmt) (idx : Int32) : Col → IO Unit
+def bindCol (stmt : SQLite.Stmt) (idx : Int32) : Col → IO Unit
   | .int v => stmt.bindInt64 idx v
   | .text v => stmt.bindText idx v
   | .real v => stmt.bindFloat idx v
   | .null => stmt.bindNull idx
 
 /-- Bind row values starting at parameter `first` (bind params are 1-based). -/
-private def bindCols (stmt : SQLite.Stmt) (first : Nat) (cols : Array Col) : IO Unit := do
+def bindCols (stmt : SQLite.Stmt) (first : Nat) (cols : Array Col) : IO Unit := do
   for h : i in [0:cols.size] do
     bindCol stmt (Int32.ofNat (first + i)) cols[i]
 
 /-- A column we cannot represent (`none`) is a decode failure like any
     other; the caller names the table and field it came from. -/
-private def readCol (stmt : SQLite.Stmt) (i : Int32) : IO (Option Col) := do
+def readCol (stmt : SQLite.Stmt) (i : Int32) : IO (Option Col) := do
   match ← stmt.columnType i with
   | .integer => return some (.int (← stmt.columnInt64 i))
   | .float => return some (.real (← stmt.columnDouble i))
@@ -88,7 +88,7 @@ private def readCol (stmt : SQLite.Stmt) (i : Int32) : IO (Option Col) := do
 /-- Read `n` result columns starting at `first`. `label i` names the
     `(table, field)` column `i` was selected from — consulted only when a
     value cannot be represented, so a row decode allocates nothing for it. -/
-private def readRow (stmt : SQLite.Stmt) (first n : Nat) (label : Nat → String × String) :
+def readRow (stmt : SQLite.Stmt) (first n : Nat) (label : Nat → String × String) :
     IO (Except DbError (Array Col)) := do
   let mut cols : Array Col := Array.mkEmpty n
   for i in [0:n] do
@@ -581,7 +581,8 @@ def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
 /-- Check the open instance against the code's schema: refuse fingerprint
     drift, apply DDL idempotently, scan stored closed-world values for
     drift, and record the schema. Drift is an error, not a surprise. -/
-def Conn.verify (conn : Conn) (specs : List TableSpec) : IO (Except DbError Unit) := do
+def Conn.verify (conn : Conn) (specs : List TableSpec) (initialVersion : Nat := 1) :
+    IO (Except DbError Unit) := do
   if let .error e := validateSchema specs then return .error e
   try
     let db := conn.raw
@@ -615,7 +616,7 @@ def Conn.verify (conn : Conn) (specs : List TableSpec) : IO (Except DbError Unit
     writeMeta db "schema_fingerprint" fp
     writeMeta db "schema_json" (specsToJson specs).compress
     if (← readMeta db "schema_version").isNone then
-      writeMeta db "schema_version" "1"
+      writeMeta db "schema_version" (toString initialVersion)
     return .ok ()
   catch e =>
     return .error (.sqlite (toString e))

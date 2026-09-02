@@ -7,6 +7,9 @@ import LeanDb.PlanElab
 import LeanDb.Db
 import LeanDb.Json
 import LeanDb.Migrate
+import LeanDb.Render
+import LeanDb.Migration
+import LeanDb.Freeze
 import LeanDb.Base
 import LeanDb.Cli
 import LeanDb.CliQuery

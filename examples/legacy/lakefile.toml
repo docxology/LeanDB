@@ -1,6 +1,6 @@
 name = "legacy"
 version = "0.1.0"
-defaultTargets = ["legacy"]
+defaultTargets = ["legacy", "legacy_tests"]
 
 [[require]]
 name = "leandb"
@@ -12,3 +12,7 @@ name = "Legacy"
 [[lean_exe]]
 name = "legacy"
 root = "Main"
+
+[[lean_exe]]
+name = "legacy_tests"
+root = "LegacyTests"

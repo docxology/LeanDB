@@ -34,6 +34,7 @@ done
 (
   cd examples/legacy
   lake build
+  .lake/build/bin/legacy_tests
   schema_json=$(.lake/build/bin/legacy schema)
   if [[ "$schema_json" != *'"ok":true'* ]]; then
     echo "release check failed: legacy schema smoke test failed" >&2

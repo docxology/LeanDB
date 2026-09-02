@@ -652,6 +652,7 @@ private def baseFile (p : Plan) (dbPath : String) : String :=
     "",
     "def base : LeanDb.Base := {",
     s!"  name := {String.quote p.baseName}",
+    s!"  module := {String.quote p.moduleName}",
     s!"  tables := [{String.intercalate ", " tables}]",
     s!"  defaultDb := some (System.FilePath.mk {String.quote dbPath})",
     "}",

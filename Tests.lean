@@ -2670,10 +2670,94 @@ private def testSession : IO Unit := do
   check ((rs.getObjValAs? Bool "in_sync").toOption == some true) "restore of a current backup stays in sync"
   check ((← b.handle inst sess ["rows", "author"] |>.map code) == "") "verbs admitted after restore"
 
+/-! ## Chains: a typed transform carries rows the mechanical diff refuses -/
+
+/-- `author` as stored at V0 (what `migrate freeze` would generate). -/
+structure V0Author where
+  name : String
+  age : Int64
+  deriving Repr, LeanDb.Entity
+
+/-- V1: `age` becomes a closed `Cohort`, NOT NULL without a default — the
+    diff refuses it; the transform decides. -/
+inductive Cohort where
+  | young | senior
+  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
+
+structure AuthorV1 where
+  name : String
+  cohort : Cohort
+  deriving Repr, LeanDb.Entity
+
+private def chainDbPath : System.FilePath := ".lake" / "leandb_test_chain.sqlite"
+
+private def testChain : IO Unit := do
+  if ← chainDbPath.pathExists then IO.FS.removeFile chainDbPath
+  let v0 : List TableSpec := [Entity.spec Author]
+  -- the V1 snapshot keeps the table name `author` with the new columns
+  let v1 : List TableSpec := [{ Entity.spec AuthorV1 with name := "author" }]
+  let toV1 : V0Author → Except String AuthorV1 := fun old =>
+    if old.age < 0 then .error s!"negative age {old.age}"
+    else .ok { name := old.name, cohort := if old.age ≥ 50 then .senior else .young }
+  let migration : Migration := {
+    fromFingerprint := fingerprint v0
+    toFingerprint := fingerprint v1
+    snapshot := v1
+    steps := [Step.transformT V0Author AuthorV1 toV1 (table := "author")] }
+  let chain : Chain := { origin := v0, migrations := [migration] }
+  -- the chain checks against the head schema, and refuses a stale one
+  if let .error m := chain.check v1 then throw <| IO.userError s!"FAIL: chain head is v1: {m}"
+  match chain.check v0 with
+  | .ok () => throw <| IO.userError "FAIL: chain.check must refuse a stale head"
+  | .error m => check (m.startsWith "the code's schema") s!"stale head named: {m}"
+  -- refusals name the table; covering it lets the plan through
+  check ((Freeze.refusals v0 v1).map (·.1) == ["author"]) "refusal names author"
+  check ((planMigration v0 v1).toOption.isNone) "uncovered plan refuses"
+  check ((planMigration v0 v1 ["author"]).toOption.isSome) "covered plan rebuilds"
+  -- an instance at V0 with rows
+  discard <| expectOk (← withDb chainDbPath v0 do
+    discard <| insert Author ⟨"Ada", 36⟩
+    discard <| insert Author ⟨"Grace", 85⟩) "seed at v0"
+  let conn ← expectOk (← openDbRaw chainDbPath) "open raw"
+  check ((chain.versionOf? (fingerprint v0)) == some 0) "instance fingerprint is V0"
+  -- apply: the transform rewrites both rows, keeping ids
+  let r ← expectOk (← migration.applyOn conn v0 1 (allowDestructive := true) none) "apply V0→V1"
+  check (r.applied.any (·.startsWith "transform rows of \"author\"") && r.applied.any (fun a => (a.splitOn ": 2 rows").length == 2))
+    s!"transform applied to 2 rows: {r.applied}"
+  check (r.fromVersion == some 0 && r.toVersion == some 1) "versions journaled"
+  let (fp, ver) ← instanceInfoOn conn
+  check (fp == some (fingerprint v1) && ver == some 1) "instance now at V1"
+  let db ← SQLite.open chainDbPath
+  let st ← db.prepare "SELECT id, name, cohort FROM author ORDER BY id"
+  let mut rows : Array (Int64 × String × String) := #[]
+  repeat
+    if ← st.step then rows := rows.push (← st.columnInt64 0, ← st.columnText 1, ← st.columnText 2)
+    else break
+  check (rows == #[(1, "Ada", "young"), (2, "Grace", "senior")]) s!"rows transformed with ids kept: {rows}"
+  -- a rejecting transform aborts the whole migration: nothing changes
+  if ← chainDbPath.pathExists then IO.FS.removeFile chainDbPath
+  discard <| expectOk (← withDb chainDbPath v0 do
+    discard <| insert Author ⟨"Ada", 36⟩
+    discard <| insert Author ⟨"Bad", 0⟩) "seed again"
+  (← SQLite.open chainDbPath).exec "UPDATE author SET age = -1 WHERE name = 'Bad'"
+  let conn ← expectOk (← openDbRaw chainDbPath) "open raw again"
+  match ← migration.applyOn conn v0 1 (allowDestructive := true) none with
+  | .ok _ => throw <| IO.userError "FAIL: a rejecting transform must abort"
+  | .error e =>
+      check ((e.message.splitOn "row 2 of \"author\": negative age -1").length == 2) s!"names the row: {e.message}"
+  let (fp, _) ← instanceInfoOn conn
+  check (fp == some (fingerprint v0)) "still at V0 after the abort"
+  check ((← rowCountOf chainDbPath) == 2) "rows untouched after the abort"
+where
+  rowCountOf (p : System.FilePath) : IO Nat := do
+    let st ← (← SQLite.open p).prepare "SELECT COUNT(*) FROM author"
+    if ← st.step then return (← st.columnInt64 0).toNatClampNeg else return 0
+
 def main : IO UInt32 := do
   testCodecs
   testBaseSpecs
   testSession
+  testChain
   testDerivedSpec
   testSortBy
   testPlans

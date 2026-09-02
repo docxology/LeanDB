@@ -13,11 +13,19 @@ structure Customers where
   balance : Float
   deriving Repr, LeanDb.Entity
 
-/-- Imported from table `orders` (`id` is LeanDB's, not a field). -/
+/-- V1 (hand-tightened after the import): the closed world the uncarried
+    `big_orders` view (`qty > 10`) encoded as a filter. -/
+inductive OrderSize where
+  | small | bulk
+  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
+
+/-- Imported from table `orders` (`id` is LeanDB's, not a field). At V1
+    `qty : Int64` became `size : OrderSize` — see `Legacy/Migrations/V1.lean`
+    for the typed transform that carried the rows. -/
 structure Orders where
   customer_id : LeanDb.Ref Customers
   item : OrdersItem
-  qty : Int64
+  size : OrderSize
   deriving Repr, LeanDb.Entity
 
 /-- FK-dependency order: referenced tables first. -/
