@@ -6,7 +6,7 @@ That gives you:
 
 - validated, typed data,
 - queries checked against the tables they read, and
-- schema-derived migrations (with typed data transformations coming soon).
+- schema-derived migrations, with typed transformations for changes a mechanical diff can't make.
 
 ## Typed Data
 
@@ -74,7 +74,7 @@ LeanDB reifies the part of the predicate it can express in SQL and always
 checks the original Lean predicate on the returned rows, preserving Lean's
 reference semantics.
 
-## Schema migrations (typed transformations coming soon)
+## Schema migrations
 
 A migration starts as a type-safe schema edit. For example, adding an optional
 field is enough to produce a non-destructive migration plan:
@@ -96,9 +96,10 @@ $ tickets migrate apply
 {"applied":["add column \"ticket\".\"assignee\""],"ok":true,…}
 ```
 
-LeanDB already derives and transactionally applies schema changes. A future
-typed-transformation API will cover changes that need application-specific
-row conversion rather than a mechanical SQLite migration.
+This is the *unfrozen* mode: every change is diffed mechanically, and anything
+needing application-specific row conversion is refused with a reason rather
+than guessed. `migrate freeze` (below, “Versioned, typed migrations”) gives a
+base a history and lets exactly those changes be written as typed functions.
 
 Backed by SQLite ([leansqlite](https://github.com/leanprover/leansqlite),
 bundled — nothing to install). Machine-first: every command emits one JSON
@@ -388,15 +389,17 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `query <name> [args…]` | your `query%`-registered queries; args parse by type (`help` lists each query's parameters) |
 | `seed` | the base's seed, when it declares one |
 | `migrate status` / `migrate apply [--allow-destructive] [--no-backup]` | see above; `apply` takes a full backup first |
+| `migrate freeze` | snapshot the schema as data, giving the base a typed migration history (see "Versioned, typed migrations") |
 | `migrate rollback` · `migrate history` · `backup` · `restore <file>` | return to the pre-migration copy; the journal; copies on demand |
 | `log [n]` | the query log: verb, reified SQL plan (text and as data with its footprint), the query it ran under, outcome, row count |
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
 | `serve --mcp` | Model Context Protocol over stdio: one tool per table verb and per registered query (parameters from the signature) |
-| `serve --http <port> [--bind <host>]` | the same surface over HTTP/1.1: `GET /tables/ticket?eq=status=done`, `GET /query/slaBreached/1700000000`, `POST /rpc` with an argv array, `POST /migrate/apply`, … — statuses from the response `code`, `X-LeanDb-Fingerprint` refused when stale |
+| `serve --http <port> [--bind <host>] [--auth-token <t>]` | the same surface over HTTP/1.1: `GET /tables/ticket?eq=status=done`, `GET /query/slaBreached/1700000000`, `POST /rpc` with an argv array, `POST /migrate/apply`, … — statuses from the response `code`, `X-LeanDb-Fingerprint` refused when stale, `GET /healthz` always open, everything else 401 without the bearer when a token is set (`$LEANDB_TOKEN` also sets it) |
 
 Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:
 `decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `schema`, `enum_drift`,
-`migrate`, `sqlite`) · `3` usage · `4` schema/version mismatch.
+`migrate`, `sqlite`) · `3` usage · `4` schema/version mismatch (`schema_mismatch`) or an
+instance whose fingerprint is in no migration snapshot (`unknown_lineage`).
 
 ## Queries are Lean
 
@@ -491,6 +494,7 @@ LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (the reference semantic
 LeanDb/Pred.lean     typed plan IR (Pred)  LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
 LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query log
 LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal, backups
+LeanDb/Render.lean   Lean-source rendering shared by the importer and migrate freeze
 LeanDb/Migration.lean chains: Step (typed transforms), Migration, Chain, adoption, apply
 LeanDb/Freeze.lean   migrate freeze: V<n>.lean (snapshot, raw types, holes) and the roll-up
 LeanDb/Http.lean     serve --http: routes as sugar over Base.handle (Std.Http.Server)
@@ -518,6 +522,12 @@ Design docs: [`plan.md`](plan.md) (interface spec),
 [`LEP-0005`](proposals/LEP-0005-configurable-entities.md)
 (configurable entities: modifiers and variants as stored functions over finite types — rule, tabulation, bounds),
 [`claude-discussion.md`](claude-discussion.md) (original design
-discussion). Deferred, by name: MCP/HTTP serve, log replay,
-`--output-lean`, migration source-file synthesis, `--infer-enums` on
-import, column-arithmetic pushdown.
+discussion), [`leancurl` plan](proposals/leancurl-http-client-plan.md)
+(a libcurl-backed HTTP client, so a typed `client%` stub can reach a
+served base directly — a separate project, plan only). Deferred, by
+name: plan re-execution replay (the log stores the plan as data and
+`migrate status` reads its footprint, but nothing re-runs it against a
+candidate schema), the `Query : Type → Type` universe and LEP-0001 row
+symbols, `--output-lean`, `--infer-enums` on import, column-arithmetic
+pushdown, aggregates as a verb, pushed `SortBy`/`LIMIT`, cross-instance
+queries (`ATTACH`).

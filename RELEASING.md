@@ -8,9 +8,18 @@ Before tagging a release:
 2. Run `./scripts/release_check.sh` from the repository root.
 3. Review `git diff --check` and `git status --short`. The release commit should contain only intended source, documentation, and lockfile changes.
 4. Confirm that the repository's MIT `LICENSE` file is present and carries the intended copyright holder and year.
-5. Commit the release, then create an annotated tag matching the Lake version, for example `v0.2.0`.
+5. Commit the release, then create an annotated tag matching the Lake version, for example `v0.3.0`.
 
-The release check builds the engine and importer, runs the engine suite, builds and runs every example suite, builds the generated legacy example, and exercises fresh SQLite import generation plus overwrite refusal.
+The release check builds the engine and importer, runs the engine suite,
+builds and runs every example suite (including `legacy`'s frozen V0→V1
+migration drill), builds and runs `examples/dashboard` (importing two
+bases in-process and over the stdio wire), scaffolds a base with
+`leandb new` against the checkout and runs its tests (twice, to check
+the overwrite refusal), smokes `serve --http` (typed routes, `/rpc`,
+the bearer-token gate, a stale `X-LeanDb-Fingerprint`), `serve --mcp`
+(`tools/list`, `tools/call`), and `leandb host` (two bases under one
+port), and exercises fresh SQLite import generation plus overwrite
+refusal.
 
 Bases pulled out of this repository require the engine by git tag
 (`leandb new … --leandb-git <url> --rev v0.3.0`); a tag therefore fixes

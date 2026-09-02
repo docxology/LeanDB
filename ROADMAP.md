@@ -1,6 +1,6 @@
 # LeanDB roadmap
 
-**2026-09-01.** From v0.2.0. Companion to `plan-v2.md` (what was built and
+**2026-09-02.** From v0.3.0. Companion to `plan-v2.md` (what was built and
 why) and `proposals/` (what is designed). This file is the order of work
 and the acceptance test for each step; it is updated as steps land.
 
@@ -220,11 +220,6 @@ logged plans byte-identical:
   in `serve` mode, `/bases/<name>/…` over the shared `Http` resolver)
   and `<base> serve --mcp` (`LeanDb.Mcp`: JSON-RPC over stdio, tools
   derived from tables and `query%` params); smokes in the release check.
-- **S9 — done 2026-09-02.** Deployable: bearer-token auth on the HTTP
-  surface (`--auth-token`/`$LEANDB_TOKEN`, open `/healthz`), a root
-  `Dockerfile` for any example base, and a Dockerfile in every
-  `leandb new` scaffold. Not done: TLS termination (a reverse proxy's
-  job), multi-writer scaling (one SQLite writer per base by design).
 - **S8 — done 2026-09-02.** `leandb new` (`LeanDb.Scaffold`): a
   standalone base requiring the engine by path or by git+rev, laid out
   like the examples, tests included; scaffold round trip in the release
@@ -232,9 +227,27 @@ logged plans byte-identical:
   by path. Not done: sharing one leansqlite build across examples via
   `packagesDir` (path dependencies build in place; concurrent `lake`
   runs would race) — each example keeps its own `.lake`.
+- **S9 — done 2026-09-02.** Deployable: bearer-token auth on the HTTP
+  surface (`--auth-token`/`$LEANDB_TOKEN`, open `/healthz`), a root
+  `Dockerfile` for any example base, and a Dockerfile in every
+  `leandb new` scaffold. Not done: TLS termination (a reverse proxy's
+  job), multi-writer scaling (one SQLite writer per base by design).
 
 ## Deferred, by name
 
 Aggregates as a verb; pushed `SortBy`/`LIMIT`; cross-instance queries
 (`ATTACH`); proof fields in `deriving Entity`; `Float` ordering (correctly
-refused — NaN); MCP/HTTP serve; migration source synthesis.
+refused — NaN); `Query : Type → Type` universe and LEP-0001 row symbols
+(R5, above); plan re-execution replay (S4 gives `migrate status` a
+footprint-based impact report instead — a schema change is checked
+against what a query *reads*, not by re-running its plan); an HTTP
+client transport for `LeanDb.Client` (`Std` has no HTTP client; planned
+separately as [`leancurl`](proposals/leancurl-http-client-plan.md), a
+libcurl binding, plus a small `leandb-curl` adapter — its own project);
+TLS termination for `serve --http`/`leandb host` (a reverse proxy's
+job); sharing one leansqlite build across examples via `packagesDir`
+(S8); `--output-lean`; `--infer-enums` on import; column-arithmetic
+pushdown.
+
+Landed since the previous version of this list: MCP/HTTP serve (S5, S6);
+migration source synthesis (S3, `migrate freeze`).
