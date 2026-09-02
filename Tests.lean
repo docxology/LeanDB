@@ -2605,6 +2605,8 @@ private def sessDbPath : System.FilePath := ".lake" / "leandb_test_session.sqlit
 
 private def testSession : IO Unit := do
   if ← sessDbPath.pathExists then IO.FS.removeFile sessDbPath
+  let backups : System.FilePath := ".lake" / "backups"
+  if ← backups.pathExists then IO.FS.removeDirAll backups
   -- an instance shaped by an older code: `author` had an extra nullable column
   let older : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer,
     col "nick" .text (nullable := true)]⟩
@@ -2632,6 +2634,41 @@ private def testSession : IO Unit := do
   check ((v.getObjValAs? Bool "in_sync").toOption == some true
     && (v.getObjValAs? Nat "schema_version").toOption == some 2) "in sync at version 2"
   check (Cli.exitCodeOf (← b.handle inst sess ["frobnicate"]) == 3) "usage exit code"
+  -- the apply took a full backup first; the journal names it
+  let backup := (applied.getObjValAs? String "backup").toOption.getD ""
+  check (backup.startsWith (System.FilePath.mk ".lake" / "backups" / "s-v1-").toString) s!"backup named by base/version: {backup}"
+  check (← (System.FilePath.mk backup).pathExists) "backup file exists"
+  check ((applied.getObjValAs? Nat "from_version").toOption == some 1
+    && (applied.getObjValAs? Nat "to_version").toOption == some 2) "report carries the versions"
+  let hist ← b.handle inst sess ["migrate", "history"]
+  check ((hist.getObjValAs? Nat "count").toOption == some 1) "one journal row"
+  -- rollback restores the pre-migration file: old shape, old version, gated again
+  let rb ← b.handle inst sess ["migrate", "rollback"]
+  check ((rb.getObjValAs? Bool "ok").toOption == some true
+    && (rb.getObjValAs? Nat "schema_version").toOption == some 1
+    && (rb.getObjValAs? Bool "in_sync").toOption == some false) s!"rollback restores v1: {rb}"
+  check (code (← b.handle inst sess ["rows", "author"]) == "schema_mismatch") "gated again after rollback"
+  let hist ← b.handle inst sess ["migrate", "history"]
+  check ((hist.getObjValAs? Nat "count").toOption == some 1) "restored file journals the rollback"
+  -- the `nick` column is back, with its data
+  let dbr ← SQLite.open sessDbPath
+  let st ← dbr.prepare "SELECT nick FROM author WHERE name = 'Ada'"
+  discard <| st.step
+  check ((← st.columnText 0) == "A") "rolled-back data intact"
+  -- nothing else to roll back now; apply again without a backup
+  check (code (← b.handle inst sess ["migrate", "rollback"]) == "migrate") "rollback refused without a backup"
+  let again ← b.handle inst sess ["migrate", "apply", "--allow-destructive", "--no-backup"]
+  check ((again.getObjValAs? Bool "ok").toOption == some true
+    && (again.getObjValAs? String "backup").toOption.isNone) "--no-backup applies without one"
+  check ((← b.handle inst sess ["rows", "author"] |>.map code) == "") "admitted after re-apply"
+  -- explicit backup and restore
+  let bk ← b.handle inst sess ["backup"]
+  let bkPath := (bk.getObjValAs? String "backup").toOption.getD ""
+  check (← (System.FilePath.mk bkPath).pathExists) "backup verb writes a file"
+  check (code (← b.handle inst sess ["restore", ".lake/does-not-exist.sqlite"]) == "migrate") "restore refuses a missing file"
+  let rs ← b.handle inst sess ["restore", bkPath]
+  check ((rs.getObjValAs? Bool "in_sync").toOption == some true) "restore of a current backup stays in sync"
+  check ((← b.handle inst sess ["rows", "author"] |>.map code) == "") "verbs admitted after restore"
 
 def main : IO UInt32 := do
   testCodecs

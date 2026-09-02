@@ -99,7 +99,9 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "query <name> [args...]"] ++
       (if b.seed.isSome then #[Json.str "seed"] else #[]) ++ #[
       Json.str "log [limit]",
-      Json.str "migrate status | apply [--allow-destructive]",
+      Json.str "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit]",
+      Json.str "backup  (full copy under <instance dir>/backups)",
+      Json.str "restore <file>",
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
       Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
@@ -194,12 +196,19 @@ private def versionJson (b : Base) (info : Option (Option String × Option Nat))
 
 /-- An open instance as a server sees it: the connection, and a gate that
     is `none` when the base's verbs are admitted and `some e` while
-    `Conn.verify` refuses them (fingerprint drift, enum drift). `version`
-    and `migrate` work either way; a successful `migrate apply` re-verifies
-    and opens the gate. -/
+    `Conn.verify` refuses them (fingerprint drift, enum drift). `version`,
+    `migrate`, `backup` and `restore` work either way; a successful
+    `migrate apply` (or a restore) re-verifies and sets the gate. The
+    connection sits in a ref because a restore replaces the file and
+    reopens. -/
 structure Session where
-  conn : Conn
+  conn : IO.Ref Conn
   gate : IO.Ref (Option DbError)
+
+private def gateOf (b : Base) (conn : Conn) : IO (Option DbError) := do
+  match ← conn.verify b.specs with
+  | .ok () => return none
+  | .error e => return some e
 
 def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := do
   if let some parent := inst.path.parent then
@@ -207,32 +216,132 @@ def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := d
   match ← openDbRaw inst.path with
   | .error e => return .error e
   | .ok conn =>
-      let gate ← IO.mkRef (match ← conn.verify b.specs with | .ok () => none | .error e => some e)
-      return .ok { conn, gate }
+      let gate ← IO.mkRef (← gateOf b conn)
+      return .ok { conn := ← IO.mkRef conn, gate }
 
-private def migrateJson (b : Base) (sess : Session) (rest : List String) : IO Json := do
-  let mode := match rest with
-    | ["status"] => some (false, false)
-    | ["apply"] => some (true, false)
-    | ["apply", "--allow-destructive"] => some (true, true)
-    | _ => none
-  match mode with
-  | none => return usageErr "migrate status | apply [--allow-destructive]"
-  | some (apply, allowDestructive) =>
-      match ← migrateOn sess.conn b.specs apply allowDestructive with
+/-- Where the next backup of this instance goes: named by the base, the
+    version the instance is at, and the clock. -/
+def _root_.LeanDb.Instance.backupPath (i : Instance) (b : Base) (ver : Option Nat) (now : Nat) :
+    System.FilePath :=
+  let v := match ver with | some v => s!"v{v}" | none => "v0"
+  i.backups / s!"{b.name}-{v}-{now}.sqlite"
+
+private def backupJson (b : Base) (inst : Instance) (sess : Session) : IO Json := do
+  let conn ← sess.conn.get
+  let (_, ver) ← instanceInfoOn conn
+  let dest := inst.backupPath b ver (← unixNow conn)
+  try
+    backupTo conn dest
+    return Json.mkObj [("ok", Json.bool true), ("backup", Json.str dest.toString),
+      ("schema_version", (ver.map fun v => Lean.toJson v).getD Json.null)]
+  catch e =>
+    return (DbError.sqlite s!"backup failed: {e}").toJson
+
+/-- Replace the instance file with `src` and reopen: the old handle is
+    released first (its finalizer closes it), the copy lands under a
+    temporary name and is renamed into place so no reader ever sees a
+    half-written file, and stale `-wal`/`-shm` siblings go with the old
+    file. Assumes this process is the only writer. -/
+private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
+    IO (Except DbError Unit) := do
+  unless ← src.pathExists do
+    return .error (.migrate s!"restore source does not exist: {src}")
+  try
+    sess.conn.set ⟨← SQLite.open ":memory:"⟩
+    let tmp : System.FilePath := inst.path.toString ++ ".restore"
+    IO.FS.writeBinFile tmp (← IO.FS.readBinFile src)
+    for suffix in ["-wal", "-shm", "-journal"] do
+      let side : System.FilePath := inst.path.toString ++ suffix
+      if ← side.pathExists then IO.FS.removeFile side
+    IO.FS.rename tmp inst.path
+  catch e =>
+    return .error (.sqlite s!"restore failed: {e}")
+  match ← openDbRaw inst.path with
+  | .error e => return .error e
+  | .ok conn =>
+      sess.conn.set conn
+      sess.gate.set (← gateOf b conn)
+      return .ok ()
+
+private def restoreJson (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
+    IO Json := do
+  let before ← (← sess.conn.get) |> instanceInfoOn
+  match ← replaceFile b inst sess src with
+  | .error e => return e.toJson
+  | .ok () =>
+      let conn ← sess.conn.get
+      let (fp, ver) ← instanceInfoOn conn
+      journalEvent conn [s!"restore from {src}"] true before.2 ver (some src.toString) "restore"
+      return Json.mkObj [("ok", Json.bool true), ("restored", Json.str src.toString),
+        ("fingerprint", (fp.map Json.str).getD Json.null),
+        ("schema_version", (ver.map fun v => Lean.toJson v).getD Json.null),
+        ("in_sync", Json.bool ((← sess.gate.get).isNone))]
+
+private def rollbackJson (b : Base) (inst : Instance) (sess : Session) : IO Json := do
+  let conn ← sess.conn.get
+  match ← lastRestorable conn with
+  | none => return (DbError.migrate "nothing to roll back: no applied migration has a backup").toJson
+  | some (idx, fromVer, backup) =>
+      let (_, before) ← instanceInfoOn conn
+      match ← replaceFile b inst sess backup with
       | .error e => return e.toJson
-      | .ok (plan?, report?) =>
-          if apply then
-            -- the instance now matches the code (or says why not)
-            sess.gate.set (match ← sess.conn.verify b.specs with | .ok () => none | .error e => some e)
-          match report? with
-          | some r => return r.toJson
-          | none =>
-              let plan := plan?.getD {}
-              return Json.mkObj [("ok", Json.bool true),
-                ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
-                ("destructive", Json.bool plan.isDestructive),
-                ("notes", Json.arr (plan.notes.map Json.str).toArray)]
+      | .ok () =>
+          let conn ← sess.conn.get
+          let (fp, ver) ← instanceInfoOn conn
+          journalEvent conn [s!"rollback of migration {idx} from {backup}"] true before ver
+            (some backup) "rollback: writes made after the migration are not in the backup"
+          return Json.mkObj [("ok", Json.bool true), ("rolled_back", Lean.toJson idx),
+            ("restored", Json.str backup),
+            ("fingerprint", (fp.map Json.str).getD Json.null),
+            ("schema_version", (ver.map fun v => Lean.toJson v).getD Json.null),
+            ("expected_version", (fromVer.map fun v => Lean.toJson v).getD Json.null),
+            ("in_sync", Json.bool ((← sess.gate.get).isNone)),
+            ("note", Json.str "writes made after the migration are not in the backup")]
+
+private def historyJson (sess : Session) (limit : Nat) : IO Json := do
+  let rows ← readJournal (← sess.conn.get) limit
+  return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.size), ("entries", Json.arr rows)]
+
+private def migrateUsage : String :=
+  "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit]"
+
+private def migrateJson (b : Base) (inst : Instance) (sess : Session) (rest : List String) : IO Json := do
+  match rest with
+  | ["rollback"] => rollbackJson b inst sess
+  | ["history"] => historyJson sess 50
+  | ["history", n] =>
+      match n.toNat? with
+      | some limit => historyJson sess limit
+      | none => return usageErr s!"expected a limit, got {String.quote n}"
+  | ["status"] => runMigrate false false true
+  | "apply" :: flags =>
+      let known := ["--allow-destructive", "--no-backup"]
+      match flags.find? (!known.contains ·) with
+      | some f => return usageErr s!"unrecognized migrate flag {String.quote f}; {migrateUsage}"
+      | none => runMigrate true (flags.contains "--allow-destructive") (!flags.contains "--no-backup")
+  | _ => return usageErr migrateUsage
+where
+  runMigrate (apply allowDestructive backup : Bool) : IO Json := do
+    let conn ← sess.conn.get
+    let backupPath ← do
+      if apply && backup then
+        let (_, ver) ← instanceInfoOn conn
+        pure (some (inst.backupPath b ver (← unixNow conn)))
+      else pure none
+    match ← migrateOn conn b.specs { apply, allowDestructive, backup := backupPath } with
+    | .error e => return e.toJson
+    | .ok (plan?, report?) =>
+        if apply then
+          -- the instance now matches the code (or says why not)
+          sess.gate.set (← gateOf b conn)
+        match report? with
+        | some r => return r.toJson
+        | none =>
+            let plan := plan?.getD {}
+            return Json.mkObj [("ok", Json.bool true),
+              ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
+              ("destructive", Json.bool plan.isDestructive),
+              ("notes", Json.arr (plan.notes.map Json.str).toArray)]
 
 /-- The one place argv meets an open instance: every transport (one-shot
     CLI, JSON-lines `serve`, and the servers built on it) sends argv here
@@ -241,8 +350,10 @@ private def migrateJson (b : Base) (sess : Session) (rest : List String) : IO Js
 def _root_.LeanDb.Base.handle (b : Base) (inst : Instance) (sess : Session) : List String → IO Json
   | [] | ["help"] | ["--help"] => return usageJson b inst
   | ["schema"] => return schemaJson b.name b.specs
-  | ["version"] => return versionJson b (some (← instanceInfoOn sess.conn))
-  | "migrate" :: rest => migrateJson b sess rest
+  | ["version"] => return versionJson b (some (← instanceInfoOn (← sess.conn.get)))
+  | "migrate" :: rest => migrateJson b inst sess rest
+  | ["backup"] => backupJson b inst sess
+  | ["restore", src] => restoreJson b inst sess src
   | args => do
       match command b args with
       | .error m => return usageErr m
@@ -250,7 +361,7 @@ def _root_.LeanDb.Base.handle (b : Base) (inst : Instance) (sess : Session) : Li
           match ← sess.gate.get with
           | some e => return e.toJson
           | none =>
-              match ← act.run sess.conn with
+              match ← act.run (← sess.conn.get) with
               | .ok j => return j
               | .error e => return e.toJson
 

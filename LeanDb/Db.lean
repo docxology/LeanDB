@@ -496,6 +496,71 @@ def writeMeta (db : SQLite) (key value : String) : IO Unit := do
   stmt.bindText 2 value
   stmt.exec
 
+/-- Add the columns of an engine bookkeeping table that an older engine
+    did not create (idempotent; `PRAGMA table_info` decides). Only the
+    engine's own tables are ever touched this way. -/
+def ensureColumns (db : SQLite) (table : String) (cols : List (String × String)) : IO Unit := do
+  let stmt ← db.prepare s!"PRAGMA table_info({quoteId table})"
+  let mut present : List String := []
+  repeat
+    if ← stmt.step then
+      present := (← stmt.columnText 1) :: present
+    else break
+  for (name, decl) in cols do
+    unless present.contains name do
+      db.exec s!"ALTER TABLE {quoteId table} ADD COLUMN {quoteId name} {decl}"
+
+/-- Columns the journal gained after 0.2.0: the versions a migration moved
+    between, the backup taken before it, and a free-form note. -/
+def journalColumns : List (String × String) :=
+  [("from_version", "INTEGER"), ("to_version", "INTEGER"), ("backup", "TEXT"), ("note", "TEXT")]
+
+/-- SQLite's clock, so backups and journal rows agree on the epoch. -/
+def unixNow (conn : Conn) : IO Nat := do
+  let stmt ← conn.raw.prepare "SELECT unixepoch()"
+  if ← stmt.step then return (← stmt.columnInt64 0).toNatClampNeg else return 0
+
+/-- A full, consistent copy of the instance at `dest` (`VACUUM INTO`),
+    after a WAL checkpoint so nothing is left in a `-wal` file. `dest`
+    must not exist. -/
+def backupTo (conn : Conn) (dest : System.FilePath) : IO Unit := do
+  if let some parent := dest.parent then
+    IO.FS.createDirAll parent
+  if ← dest.pathExists then
+    throw <| IO.userError s!"backup target already exists: {dest}"
+  conn.raw.exec "PRAGMA wal_checkpoint(TRUNCATE)"
+  let quoted := "'" ++ (dest.toString.replace "'" "''") ++ "'"
+  conn.raw.exec s!"VACUUM INTO {quoted}"
+
+/-- The migration journal, newest first. -/
+def readJournal (conn : Conn) (limit : Nat) : IO (Array Lean.Json) := do
+  let stmt ← conn.raw.prepare
+    "SELECT idx, steps, fingerprint, applied_at, ok, from_version, to_version, backup, note \
+FROM _leandb_migrations ORDER BY idx DESC LIMIT ?"
+  stmt.bindInt64 1 (Int64.ofNat limit)
+  let mut out := #[]
+  let optText := fun (i : Int32) => do
+    if (← stmt.columnType i) == .null then pure Lean.Json.null
+    else Lean.Json.str <$> stmt.columnText i
+  let optInt := fun (i : Int32) => do
+    if (← stmt.columnType i) == .null then pure Lean.Json.null
+    else pure (Lean.toJson (← stmt.columnInt64 i).toInt)
+  repeat
+    if ← stmt.step then
+      let steps := (Lean.Json.parse (← stmt.columnText 1)).toOption.getD Lean.Json.null
+      out := out.push <| Lean.Json.mkObj [
+        ("idx", Lean.toJson (← stmt.columnInt64 0).toInt),
+        ("steps", steps),
+        ("fingerprint", Lean.Json.str (← stmt.columnText 2)),
+        ("applied_at", Lean.toJson (← stmt.columnInt64 3).toInt),
+        ("ok", Lean.Json.bool ((← stmt.columnInt64 4) == 1)),
+        ("from_version", ← optInt 5),
+        ("to_version", ← optInt 6),
+        ("backup", ← optText 7),
+        ("note", ← optText 8)]
+    else break
+  return out
+
 /-- Open the file (creating it if absent) and make sure the engine's own
     bookkeeping tables exist — nothing about the base's schema is checked
     or applied. A server holds a connection opened this way so it can
@@ -508,6 +573,7 @@ def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
     db.exec metaDdl
     db.exec logDdl
     db.exec migrationsDdl
+    ensureColumns db "_leandb_migrations" journalColumns
     return .ok ⟨db⟩
   catch e =>
     return .error (.sqlite (toString e))

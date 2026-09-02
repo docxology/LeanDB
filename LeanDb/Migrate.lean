@@ -355,14 +355,33 @@ structure MigrateReport where
   applied : List String
   notes : List String
   fingerprint : String
+  /-- The versions moved between, when a migration was applied. -/
+  fromVersion : Option Nat := none
+  toVersion : Option Nat := none
+  /-- The backup taken before applying, when one was. -/
+  backup : Option String := none
   deriving Repr
 
 open Lean (Json) in
 def MigrateReport.toJson (r : MigrateReport) : Json :=
-  Json.mkObj [("ok", Json.bool true),
+  Json.mkObj <| [("ok", Json.bool true),
     ("applied", Json.arr (r.applied.map Json.str).toArray),
     ("notes", Json.arr (r.notes.map Json.str).toArray),
-    ("fingerprint", Json.str r.fingerprint)]
+    ("fingerprint", Json.str r.fingerprint)] ++
+    (match r.fromVersion, r.toVersion with
+      | some f, some t => [("from_version", Lean.toJson f), ("to_version", Lean.toJson t)]
+      | _, _ => []) ++
+    (match r.backup with
+      | some b => [("backup", Json.str b)]
+      | none => [])
+
+/-- How to migrate: report only, or apply; whether drops are allowed;
+    and where to put the full backup taken before applying (`none` =
+    no backup). -/
+structure MigrateOpts where
+  apply : Bool := false
+  allowDestructive : Bool := false
+  backup : Option System.FilePath := none
 
 private def readStoredSchema (db : SQLite) : IO (Except String (Option (List TableSpec))) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = 'schema_json'"
@@ -389,15 +408,17 @@ private def writeStoredSchema (db : SQLite) (specs : List TableSpec) : IO Unit :
     schema to the code's schema, on an open connection (`openDbRaw` is
     enough — the connection need not verify). `apply := false` only
     reports. -/
-def migrateOn (conn : Conn) (specs : List TableSpec)
-    (apply : Bool) (allowDestructive : Bool := false) :
+def migrateOn (conn : Conn) (specs : List TableSpec) (opts : MigrateOpts) :
     IO (Except DbError (Option MigPlan × Option MigrateReport)) := do
+  let apply := opts.apply
+  let allowDestructive := opts.allowDestructive
   if let .error e := validateSchema specs then return .error e
   try
     let db := conn.raw
     db.exec "PRAGMA foreign_keys = ON"
     db.exec "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     db.exec migrationsDdl
+    ensureColumns db "_leandb_migrations" journalColumns
     let old? ← match ← readStoredSchema db with
       | .ok old? => pure old?
       | .error msg => return .error (.migrate msg)
@@ -408,12 +429,18 @@ def migrateOn (conn : Conn) (specs : List TableSpec)
         let plan := { plan with isDestructive := plan.destructiveAgainst old }
         if plan.steps.isEmpty then
           if apply then writeStoredSchema db specs
-          return .ok (some plan, some ⟨[], ["schema already up to date"], fingerprint specs⟩)
+          return .ok (some plan, some { applied := [], notes := ["schema already up to date"], fingerprint := fingerprint specs })
         if !apply then
           return .ok (some plan, none)
         if plan.isDestructive && !allowDestructive then
           return .error (.migrate
             "plan is destructive (drops tables or columns); pass --allow-destructive")
+        -- the full backup precedes the transaction: VACUUM INTO cannot run
+        -- inside one, and the file it writes is what `migrate rollback` restores
+        if let some dest := opts.backup then
+          backupTo conn dest
+        let fromVer := ((← readMeta db "schema_version").bind (·.toNat?)).getD 0
+        let toVer := fromVer + 1
         db.exec "PRAGMA foreign_keys = OFF"
         db.exec "BEGIN"
         try
@@ -427,13 +454,18 @@ def migrateOn (conn : Conn) (specs : List TableSpec)
             throw <| IO.userError s!"foreign_key_check failed on table {t}"
           writeStoredSchema db specs
           -- version bump + journal, atomic with the migration itself
-          let ver := (((← readMeta db "schema_version").bind (·.toNat?)).getD 0) + 1
-          writeMeta db "schema_version" (toString ver)
+          writeMeta db "schema_version" (toString toVer)
           let j ← db.prepare
-            "INSERT INTO _leandb_migrations (steps, fingerprint, ok) VALUES (?, ?, 1)"
+            "INSERT INTO _leandb_migrations (steps, fingerprint, ok, from_version, to_version, backup) \
+VALUES (?, ?, 1, ?, ?, ?)"
           j.bindText 1 (Lean.Json.arr
             (plan.steps.map (Lean.Json.str ·.describe)).toArray).compress
           j.bindText 2 (fingerprint specs)
+          j.bindInt64 3 (Int64.ofNat fromVer)
+          j.bindInt64 4 (Int64.ofNat toVer)
+          match opts.backup with
+          | some dest => j.bindText 5 dest.toString
+          | none => j.bindNull 5
           j.exec
           db.exec "COMMIT"
         catch e =>
@@ -441,7 +473,14 @@ def migrateOn (conn : Conn) (specs : List TableSpec)
           db.exec "PRAGMA foreign_keys = ON"
           return .error (.migrate (toString e))
         db.exec "PRAGMA foreign_keys = ON"
-        return .ok (some plan, some ⟨plan.steps.map (·.describe), plan.notes, fingerprint specs⟩)
+        let report : MigrateReport := {
+          applied := plan.steps.map (·.describe)
+          notes := plan.notes
+          fingerprint := fingerprint specs
+          fromVersion := some fromVer
+          toVersion := some toVer
+          backup := opts.backup.map (·.toString) }
+        return .ok (some plan, some report)
   catch e =>
     return .error (.sqlite (toString e))
 
@@ -451,7 +490,39 @@ def migrate (path : System.FilePath) (specs : List TableSpec)
     IO (Except DbError (Option MigPlan × Option MigrateReport)) := do
   match ← openDbRaw path with
   | .error e => return .error e
-  | .ok conn => migrateOn conn specs apply allowDestructive
+  | .ok conn => migrateOn conn specs { apply, allowDestructive }
+
+/-- The last applied migration that has a backup to return to:
+    `(journal idx, from_version, backup path)`. Migration rows carry no
+    `note`; rollback/restore events do (`journalEvent`), and are not
+    themselves restorable. -/
+def lastRestorable (conn : Conn) : IO (Option (Nat × Option Nat × String)) := do
+  let stmt ← conn.raw.prepare
+    "SELECT idx, from_version, backup FROM _leandb_migrations \
+WHERE ok = 1 AND backup IS NOT NULL AND note IS NULL ORDER BY idx DESC LIMIT 1"
+  if ← stmt.step then
+    let from? ← do
+      if (← stmt.columnType 1) == .null then pure none
+      else pure (some (← stmt.columnInt64 1).toNatClampNeg)
+    return some ((← stmt.columnInt64 0).toNatClampNeg, from?, ← stmt.columnText 2)
+  else return none
+
+/-- Journal an event that is not a schema migration (a rollback, a
+    restore): the steps name it, `ok` records the outcome. -/
+def journalEvent (conn : Conn) (steps : List String) (ok : Bool)
+    (fromVer toVer : Option Nat) (backup : Option String) (note : String) : IO Unit := do
+  let fp := (← readMeta conn.raw "schema_fingerprint").getD ""
+  let j ← conn.raw.prepare
+    "INSERT INTO _leandb_migrations (steps, fingerprint, ok, from_version, to_version, backup, note) \
+VALUES (?, ?, ?, ?, ?, ?, ?)"
+  j.bindText 1 (Lean.Json.arr (steps.map Lean.Json.str).toArray).compress
+  j.bindText 2 fp
+  j.bindInt64 3 (if ok then 1 else 0)
+  match fromVer with | some v => j.bindInt64 4 (Int64.ofNat v) | none => j.bindNull 4
+  match toVer with | some v => j.bindInt64 5 (Int64.ofNat v) | none => j.bindNull 5
+  match backup with | some b => j.bindText 6 b | none => j.bindNull 6
+  j.bindText 7 note
+  j.exec
 
 /-- What an open instance says about itself, readable even when drifted:
     (fingerprint, schema_version). -/

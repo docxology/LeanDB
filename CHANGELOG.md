@@ -88,6 +88,18 @@ every other verb returns `schema_mismatch` until `["migrate","apply"]`
 succeeds in the same session. Exit codes derive from the response's
 `code`.
 
+Backups and rolldown: `migrate apply` takes a full copy of the instance
+first (`VACUUM INTO`, after a WAL checkpoint) under
+`<instance dir>/backups/<base>-v<k>-<time>.sqlite` unless `--no-backup`;
+the journal (`_leandb_migrations`, upgraded in place with
+`from_version`, `to_version`, `backup`, `note`) names it, and the apply
+report carries `from_version`/`to_version`/`backup`. `migrate rollback`
+restores the last applied migration's backup (writes made after the
+migration are not in it, and the response says so); `restore <file>`
+restores any file; `backup` takes one on demand; `migrate history`
+lists the journal. A restore swaps the file under a persistent session
+and re-verifies, so `serve` supports all of these.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

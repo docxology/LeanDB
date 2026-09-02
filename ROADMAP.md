@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S1 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S2 done 2026-09-02 |
 
 ---
 
@@ -180,9 +180,11 @@ logged plans byte-identical:
   a live connection, `Session` gate: `serve` holds a drifted instance,
   answers `version`/`migrate`, admits the verbs after `migrate apply`
   (engine test `testSession`). `backup` arrives with S2.
-- **S2** — backups (`VACUUM INTO`) before every apply, journal
-  `from_version`/`to_version`/`backup`, `migrate rollback`, `backup` /
-  `restore` / `migrate history`.
+- **S2 — done 2026-09-02.** Full backup (`VACUUM INTO`) before every
+  apply unless `--no-backup`; journal gains `from_version`/`to_version`/
+  `backup`/`note` (upgraded in place); `migrate rollback`, `backup`,
+  `restore <file>`, `migrate history`; all work under `serve` (the
+  session swaps the file and re-verifies). Engine test `testSession`.
 - **S3** — `migrate freeze` writes `<Base>/Migrations/V<n>.lean` (schema
   snapshot as data + generated raw structures), typed chain
   (`Migration`, `Step.transformT`), build-time `leandb_check_head`,

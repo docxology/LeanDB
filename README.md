@@ -269,6 +269,10 @@ The rules, all loud:
 - Everything runs in one transaction with a foreign-key check before
   commit; each apply is journaled in `_leandb_migrations` and bumps
   `schema_version`.
+- **Every apply is preceded by a full backup** (`VACUUM INTO`) under
+  `data/backups/`, named in the journal and the report; `migrate
+  rollback` restores it (writes made after the migration are not in
+  it, and the response says so). `--no-backup` opts out.
 
 ## Importing an existing SQLite database
 
@@ -312,7 +316,8 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `rows <table> [--eq col=value]… [--limit n]` | conjunctive equality filters — the CLI's whole filter language, by design |
 | `query <name> [args…]` | your `query%`-registered queries; args parse by type (`help` lists each query's parameters) |
 | `seed` | the base's seed, when it declares one |
-| `migrate status` / `migrate apply [--allow-destructive]` | see above |
+| `migrate status` / `migrate apply [--allow-destructive] [--no-backup]` | see above; `apply` takes a full backup first |
+| `migrate rollback` · `migrate history` · `backup` · `restore <file>` | return to the pre-migration copy; the journal; copies on demand |
 | `log [n]` | the query log: verb, reified SQL plan, outcome, row count |
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
 
