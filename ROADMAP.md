@@ -110,6 +110,15 @@ Both written 2026-09-01 from R1/R2 evidence; implementation order below.
   C inline flatten; D child tables (after LEP-0004). kernels is the
   acceptance base for A–C.
 
+## R4b — LEP-0005, configurable entities (after LEP-0003 C)
+
+Modifiers and variants as a stored function over a finite configuration
+type: rule (truth, JSON with shape), tabulation (derived child rows),
+bounds (derived columns). Stage 1 is built by hand in eats after LEP-0004
+lands there, to measure the hand-maintenance cost; engine pieces
+(`deriving Config`, `Pattern`/`PriceRule`, derived child rows) follow
+LEP-0003 C and D.
+
 ## R5 — The universe
 
 - Log stores the plan as data (needs R3); replay before `migrate apply`.

@@ -387,6 +387,8 @@ Design docs: [`plan.md`](plan.md) (interface spec),
 (nested values: `EnumSet`, JSON columns with a declared shape, derived columns, inline flatten, child tables),
 [`LEP-0004`](proposals/LEP-0004-child-table-quantifiers.md)
 (`exists`/`forall` over a related table as one pushed `select`),
+[`LEP-0005`](proposals/LEP-0005-configurable-entities.md)
+(configurable entities: modifiers and variants as stored functions over finite types — rule, tabulation, bounds),
 [`claude-discussion.md`](claude-discussion.md) (original design
 discussion). Deferred, by name: MCP/HTTP serve, log replay,
 `--output-lean`, migration source-file synthesis, `--infer-enums` on
