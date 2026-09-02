@@ -55,6 +55,9 @@ example : ruleNegative.nonNegative = false := by decide +kernel
 -- and the space is what the docstrings say
 example : EspressoConfig.all.size = 180 := by decide +kernel
 example : EspressoConfig.allValid.size = 125 := by decide +kernel
+-- `baseKinds : EnumSet IngredientKind` — 22 variants, under the 62 a column admits
+example : (ClosedEnum.variants IngredientKind).size = 22 := by decide
+example : (ClosedEnum.variants IngredientKind).size ≤ EnumSet.maxVariants := by decide
 
 /-! ## Vocabulary, in Lean -/
 
@@ -94,7 +97,7 @@ private def vocabulary : IO Unit := do
   | .ok _ => throw <| IO.userError "FAIL: negative rule accepted by the codec"
   -- the same refusal through the CLI's JSON path: `insert espresso_offer <json>`
   let bad := Lean.Json.mkObj [("restaurant", 1), ("canonical", 1), ("rule", Lean.Json.str (Lean.toJson ruleAmbiguous).compress),
-    ("baseKinds", ""), ("minPrice", 500), ("maxPrice", 600), ("veganPossible", true)]
+    ("baseKinds", Lean.Json.arr #[]), ("minPrice", 500), ("maxPrice", 600), ("veganPossible", true)]
   match rowOfJson EspressoOffer bad with
   | .error (.decode "espresso_offer" "rule" m) => IO.println s!"rowOfJson: espresso_offer.rule: {m}"
   | .error e => throw <| IO.userError s!"FAIL: wrong error for ambiguous rule via JSON: {e}"
@@ -148,6 +151,17 @@ private def runQueries : DbM Unit := do
   checkD (oatSF.size == 4) s!"four SF offers with oat, got {oatSF.size}"
   checkD ((← offersWith .oat .oakland).isEmpty) "Highwire has no oat"
   checkD ((← offersWith .almond .oakland).map (·.2.val.name.raw) == #["Highwire Coffee"]) "Highwire has almond"
+  -- baseKinds as an EnumSet: the cappuccino carries sugar, the lattes nothing
+  let bbCapp ← offerAt "Blue Bottle Hayes Valley" "cappuccino"
+  checkD (bbCapp.val.baseKinds.toList == [.sugar]) "cappuccino base: [sugar]"
+  checkD (bbCapp.val.baseKinds.contains .sugar && !(bbCapp.val.baseKinds.contains .dairy)) "contains"
+  checkD (((rowJson EspressoOffer bbCapp).compress.splitOn "\"baseKinds\":[\"sugar\"]").length == 2)
+    "row JSON shows the names"
+  -- offersFreeOf: membership pushed as a bit test (plan asserted in `freeOfPlan`)
+  let sugarFree ← offersFreeOf .sugar .sanFrancisco
+  checkD (sugarFree.size == 3 && sugarFree.all fun (o, _) => o.ref != bbCapp.ref) "three SF offers without sugar"
+  checkD ((← offersFreeOf .dairy .sanFrancisco).size == 4) "no SF base holds dairy"
+  checkD ((← offersFreeOf .sugar .oakland).size == 1) "Highwire's latte is sugar-free"
   -- 4. configurationsFor: a dairy-free base is vegan with oat, never with whole
   let bbLatte ← offerAt "Blue Bottle Hayes Valley" "latte"
   let vegan ← configurationsFor bbLatte.ref .vegan
@@ -195,6 +209,16 @@ private def optionalPlans : DbM Unit := do
     checkD (detail == expected)
       s!"cheapestOptional {repr temp?} {repr milk?}: expected {expected}, logged {detail}"
 
+/-- Membership in the `EnumSet` column, pushed: `offersFreeOf`'s logged
+    plan is the join, `available`, the city and one bit test against
+    `= 0` (the negated `Pred.bit`), residual 0. -/
+private def freeOfPlan : DbM Unit := do
+  discard <| offersFreeOf .sugar .sanFrancisco
+  let entries ← readLog 1
+  let detail := (entries[0]?.bind fun e => (e.getObjValAs? String "detail").toOption).getD ""
+  let expected := "espresso_offer×restaurant | pushed: (((t0.\"restaurant\" IS t1.\"id\" AND t0.\"available\" IS ?) AND t1.\"city\" IS ?) AND ((t0.\"baseKinds\" & ?) = 0)), residual conjuncts: 0"
+  checkD (detail == expected) s!"offersFreeOf: expected {expected}, logged {detail}"
+
 /-- The hand-maintenance cost, demonstrated: `update` of the rule alone
     is accepted, and the stored summaries and tabulation are now wrong. A
     Lean check (`summariesAgree`) is the only thing that notices. -/
@@ -225,6 +249,7 @@ def main : IO UInt32 := do
   expectOk (validateSchema fullSchema) "schema"
   expectOk (← withDb dbPath fullSchema runQueries) "seed + queries"
   expectOk (← withDb dbPath fullSchema optionalPlans) "optional plans"
+  expectOk (← withDb dbPath fullSchema freeOfPlan) "offersFreeOf plan"
   -- results identical to the unplanned reference semantics
   let (planned, reference) ← expectOk (← withDb dbPath fullSchema do
       let planned ← cheapestConfigured .iced .large .oat .double false .sanFrancisco

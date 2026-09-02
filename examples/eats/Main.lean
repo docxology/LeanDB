@@ -80,6 +80,7 @@ def main (args : List String) : IO UInt32 := do
       query% cheapestConfigured,
       query% cheapestMatching,
       query% offersWith,
+      query% offersFreeOf,
       query% configurationsFor,
       query% quote,
       query% placeOrder]

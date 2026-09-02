@@ -23,30 +23,6 @@ namespace Eats
 
 open LeanDb
 
-/-- The base ingredients of an offer as a canonical TEXT set — sorted
-    constructor names, comma-separated — the same stand-in kernels uses
-    for its `fuses` set until `EnumSet` (LEP-0003 A). Equality pushes;
-    membership does not. -/
-structure KindSet where
-  kinds : List IngredientKind
-  deriving Repr, DecidableEq
-
-def KindSet.make (ks : List IngredientKind) : KindSet :=
-  ⟨(ks.eraseDups.toArray.qsort fun a b => compare a b == .lt).toList⟩
-
-def KindSet.render (s : KindSet) : String :=
-  String.intercalate "," (s.kinds.map ClosedEnum.encodeName)
-
-def KindSet.parse (t : String) : Except String KindSet := do
-  if t.isEmpty then return ⟨[]⟩
-  let ks ← (t.splitOn ",").mapM fun name =>
-    match ClosedEnum.decodeName (α := IngredientKind) name with
-    | some k => pure k
-    | none => throw s!"{String.quote name} is not an ingredient kind"
-  return KindSet.make ks
-
-instance : ColCodec KindSet := ColCodec.via KindSet.render KindSet.parse
-
 /-- A café's pricing of one espresso family (its `canonical` dish). The
     rule is the truth; the three summaries are *hand-maintained* copies of
     facts about it. The only place the invariant
@@ -59,7 +35,14 @@ structure EspressoOffer where
   restaurant    : Ref Restaurant
   canonical     : Ref CanonicalDish
   rule          : PriceRule
-  baseKinds     : KindSet
+  /-- The base ingredients as an `EnumSet` (LEP-0003 A): one INTEGER
+      bitmask, bit *k* for `IngredientKind`'s *k*-th constructor —
+      `IngredientKind` has 22 variants, well under the 62 an `EnumSet`
+      column admits (`EnumSet.maxVariants`). Membership pushes as a bit
+      test (`offersFreeOf`); the DDL CHECK bounds the mask; row JSON
+      shows the names. Replaces the canonical-TEXT `KindSet` stage 1
+      first shipped, kernels' pre-`EnumSet` `fuses` idiom. -/
+  baseKinds     : EnumSet IngredientKind
   minPrice      : Money
   maxPrice      : Money
   veganPossible : Bool
@@ -67,8 +50,9 @@ structure EspressoOffer where
   deriving Repr, LeanDb.Entity
 
 /-- Does the cup, with this configuration, suit the diet? -/
-def EspressoOffer.suits (baseKinds : KindSet) (c : EspressoConfig) (d : Diet) : Bool :=
-  (baseKinds.kinds ++ c.ingredients).all fun k => d.allows k
+def EspressoOffer.suits (baseKinds : EnumSet IngredientKind) (c : EspressoConfig) (d : Diet) :
+    Bool :=
+  (baseKinds.toList ++ c.ingredients).all fun k => d.allows k
 
 /-- The one constructor that establishes the bounds. `veganPossible` is
     "some valid configuration is allowed by `Diet.vegan`" — a latte on a
@@ -76,7 +60,7 @@ def EspressoOffer.suits (baseKinds : KindSet) (c : EspressoConfig) (d : Diet) : 
 def EspressoOffer.make (restaurant : Ref Restaurant) (canonical : Ref CanonicalDish)
     (rule : PriceRule) (baseIngredients : List IngredientKind) (available : Bool := true) :
     EspressoOffer :=
-  let baseKinds := KindSet.make baseIngredients
+  let baseKinds := EnumSet.ofList baseIngredients
   { restaurant, canonical, rule, baseKinds
     minPrice := rule.minPrice
     maxPrice := rule.maxPrice

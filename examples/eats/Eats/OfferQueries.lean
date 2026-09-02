@@ -103,6 +103,21 @@ def offersWith (milk : Milk) (city : City) :
     unless out.any (·.1.ref == o.ref) do out := out.push (o, r)
   return out
 
+/-- "Espresso offers in a city with no `k` in the base" — nut-free
+    cappuccinos, dairy-free bases. `baseKinds` is an `EnumSet`
+    (LEP-0003 A), so `!(o.val.baseKinds.contains k)` pushes as a bit test
+    on the INTEGER mask, `((t0."baseKinds" & ?) = 0)`, the bound value the
+    kind's bit — one `Pred.bit` leaf whose negation flips a flag. With the
+    join, `available` and the city, residual 0 (asserted in
+    `EatsOffersTests.lean`). The canonical-TEXT set this column replaced
+    could push equality only. -/
+def offersFreeOf (k : IngredientKind) (city : City) :
+    DbM (Array (Stored EspressoOffer × Stored Restaurant)) :=
+  select [EspressoOffer, Restaurant] (fun (o, r) =>
+    o.val.restaurant == r.ref && o.val.available && r.val.city == city
+      && !(o.val.baseKinds.contains k))
+    (.key fun (o, _) => o.id.toInt64)
+
 /-! ## Reading the rule -/
 
 /-- Every configuration of an offer that suits a diet, with its price —

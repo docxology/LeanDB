@@ -86,6 +86,7 @@ cheapestMatching     espresso_offer×offer_price×restaurant | pushed: (((t1."of
 cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 0        -- (none, none)
 cheapestOptional     espresso_offer×offer_price×restaurant | pushed: ((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?), residual conjuncts: 0        -- (some .iced, none)
 cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?) AND t1."milk" IS ?), residual conjuncts: 0        -- (some .iced, some .oat)
+offersFreeOf         espresso_offer×restaurant | pushed: (((t0."restaurant" IS t1."id" AND t0."available" IS ?) AND t1."city" IS ?) AND ((t0."baseKinds" & ?) = 0)), residual conjuncts: 0
 ```
 
 - *A fully specified configuration pushes entirely.* Hand-flattening the
@@ -121,6 +122,19 @@ cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((((t1."
   => true | some t => op.val.temp == t` spelling reflects as `(vvEq temp?
   none ∧ tt) ∨ ⋁_c (vvEq temp? (some c) ∧ temp IS c)` — both fold to the
   same plans. An optional filter is no longer a runtime pattern.
+- *Set membership pushes as a bit test.* `baseKinds` is an `EnumSet
+  IngredientKind` (LEP-0003 A; 22 variants of the 62 a column admits),
+  so `offersFreeOf k city` — `!(o.val.baseKinds.contains k)` — pushes as
+  `((t0."baseKinds" & ?) = 0)` with the kind's bit as the bound value,
+  residual 0, asserted on the query's log entry (`freeOfPlan`). It is
+  one `Pred.bit` leaf whose negation flips a flag, so it stays exact
+  under `!`; the canonical-TEXT `KindSet` this column replaced pushed
+  equality only, and "sugar-free offers in SF" would have been a
+  full-city fetch with the set parsed in Lean. Row JSON shows the names
+  (`"baseKinds":["sugar"]`), the DDL says `CHECK (("baseKinds" &
+  ~4194303) = 0)`, and the fingerprint hashes the variant names — the
+  base's fingerprint moved from `13094967604080386023` to the
+  transcript's.
 
 **What the tabulation costs.** 125 rows per offer (the 125 valid drinks
 of 180), 725 `offer_price` rows for the six seeded offers (Highwire's
@@ -161,9 +175,11 @@ closed world per notion. `at` is a Lean keyword; the order-line column is
 `placedAt`. `Delta` is `Int64` and `Money` is `Nat`: `PriceRule.evalRaw`
 sums in `Int` and `eval` floors at zero, with `nonNegative` guarding the
 floor from ever mattering. `configurationsFor` needs the base ingredients
-at query time, so `EspressoOffer` carries one extra column, `baseKinds`,
-a canonical-TEXT set of `IngredientKind` (kernels' `fuses` idiom; the
-`EnumSet` of LEP-0003 A). Acceptance 4 is met through it: on a
+at query time, so `EspressoOffer` carries one extra column, `baseKinds :
+EnumSet IngredientKind` (LEP-0003 A, the same column type as kernels'
+`fuses`; stage 1 first shipped it as a canonical-TEXT `KindSet` and
+`offersFreeOf` above is what the move bought). Acceptance 4 is met
+through it: on a
 dairy-free latte `configurationsFor … .vegan` returns 75 configurations
 (3 non-dairy milks × 25), every one with `milk ∈ {oat, almond, soy}` and
 none with `whole`.
