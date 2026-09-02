@@ -7,3 +7,4 @@ import Eats.Config
 import Eats.Offers
 import Eats.OfferQueries
 import Eats.OfferSeed
+import Eats.Base

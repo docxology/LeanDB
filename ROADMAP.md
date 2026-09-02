@@ -17,6 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0 done 2026-09-02 |
 
 ---
 
@@ -161,6 +162,38 @@ and D.
 - Log stores the plan as data (needs R3); replay before `migrate apply`.
 - `Query : Type → Type` per study §5 in both bases; CLI derived from it.
 - LEP-0001 row symbols; `KnownDish` replaces slugs in `eats`.
+
+## R6 — Bases as packages, typed migrations, hosting (2026-09-02 plan)
+
+Three nouns (plan.md §10): package = truth, instance = state, server =
+process. Stages, each keeping the release check green and every base's
+logged plans byte-identical:
+
+- **S0 — done 2026-09-02.** `LeanDb.Base` in the base library
+  (`<Base>/Base.lean`), `Main.lean` one line; schema derived from tables
+  (`Base.specs`, golden-checked against the hand-written list in every
+  base's tests); `Instance` resolved at run time (`--db`, `$LEANDB_DB`,
+  default); `QueryEntry` with params; derived `seed` verb; importer emits
+  the same shape.
+- **S1** — `Base.handle` (one transport-agnostic handler), `openDbRaw` +
+  `Conn.verify`, `migrate`/`version`/`backup` on a live connection (so
+  `serve` can migrate a drifted instance).
+- **S2** — backups (`VACUUM INTO`) before every apply, journal
+  `from_version`/`to_version`/`backup`, `migrate rollback`, `backup` /
+  `restore` / `migrate history`.
+- **S3** — `migrate freeze` writes `<Base>/Migrations/V<n>.lean` (schema
+  snapshot as data + generated raw structures), typed chain
+  (`Migration`, `Step.transformT`), build-time `leandb_check_head`,
+  lineage check at open.
+- **S4** — static query footprints from the plan tactic; `migrate status`
+  reports rows, destructive, transform required/provided, and which
+  queries a change touches; log stores the plan as data; `--replay`
+  (the R5 log item lands here).
+- **S5** — `<base> serve --http <port>` on `Std.Http.Server`, fingerprint
+  handshake; **S6** — `leandb host` multi-base supervisor and
+  `serve --mcp`; **S7** — `Base.withInstance`, `examples/dashboard`
+  importing two bases, `client%` typed remote stubs; **S8** —
+  `leandb new` scaffolder with a git require, tag v0.3.0.
 
 ## Deferred, by name
 

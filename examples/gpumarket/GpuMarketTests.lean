@@ -20,6 +20,11 @@ private def expectOk (r : Except DbError α) (ctx : String) : IO α :=
 private def price (l : Stored Listing) : Nat := l.val.usdHr.milli
 
 def main : IO UInt32 := do
+  -- The base value's derived schema is the hand-written one, table for
+  -- table: `Base.specs` (dedup + dependency order) must not reorder a
+  -- list that is already in dependency order, or the fingerprint moves.
+  unless base.specs == schema do
+    throw <| IO.userError "FAIL: Base.specs must equal the hand-written schema"
   -- pure vocabulary checks: total functions are the lookup tables
   check (Gpu.vramGb .mi325x == 256 && Gpu.vendor .h200 == .nvidia) "vocabulary tables"
   -- consistency, quantified over the whole closed world

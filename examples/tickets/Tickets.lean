@@ -3,3 +3,4 @@ import Tickets.Enums
 import Tickets.Entities
 import Tickets.Queries
 import Tickets.Seed
+import Tickets.Base

@@ -5,3 +5,4 @@ import GpuMarket.Entities
 import GpuMarket.Models
 import GpuMarket.Queries
 import GpuMarket.Seed
+import GpuMarket.Base

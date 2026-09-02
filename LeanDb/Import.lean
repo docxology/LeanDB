@@ -635,23 +635,39 @@ private def rootFile (p : Plan) : String :=
   String.intercalate "\n" [
     s!"import {p.moduleName}.Scalars",
     s!"import {p.moduleName}.Entities",
+    s!"import {p.moduleName}.Base",
     ""]
 
-private def mainFile (p : Plan) (dbPath : String) : String :=
-  let tables := p.tables.toList.map (fun tp => s!".of {p.moduleName}.{tp.structName}")
+private def baseFile (p : Plan) (dbPath : String) : String :=
+  let tables := p.tables.toList.map (fun tp => s!".of {tp.structName}")
+  String.intercalate "\n" [
+    s!"import {p.moduleName}.Entities",
+    "",
+    genHeader,
+    s!"/-! The {p.baseName} base as a value: tables (the schema is derived from",
+    "them), queries, and the default instance path. Other packages that",
+    s!"import `{p.moduleName}` get this value along with the types. -/",
+    "",
+    s!"namespace {p.moduleName}",
+    "",
+    "def base : LeanDb.Base := {",
+    s!"  name := {String.quote p.baseName}",
+    s!"  tables := [{String.intercalate ", " tables}]",
+    s!"  defaultDb := some (System.FilePath.mk {String.quote dbPath})",
+    "}",
+    "",
+    s!"end {p.moduleName}",
+    ""]
+
+private def mainFile (p : Plan) : String :=
   String.intercalate "\n" [
     s!"import {p.moduleName}",
     "",
     genHeader,
-    s!"/-! The {p.baseName} CLI: `LeanDb.Cli.run` over the imported entities. -/",
+    s!"/-! The {p.baseName} CLI: `LeanDb.Cli.run` over the base value. -/",
     "",
     "def main (args : List String) : IO UInt32 :=",
-    "  LeanDb.Cli.run {",
-    s!"    name := {String.quote p.baseName}",
-    s!"    dbPath := System.FilePath.mk {String.quote dbPath}",
-    s!"    specs := {p.moduleName}.schema",
-    s!"    tables := [{String.intercalate ", " tables}]",
-    "  } args",
+    s!"  LeanDb.Cli.run {p.moduleName}.base args",
     ""]
 
 private def lakefileFile (p : Plan) (requirePath : String) : String :=
@@ -689,8 +705,9 @@ def importMd (p : Plan) (source dbPath : String) : String := _root_.Id.run do
     "",
     "## Adoption",
     "",
-    s!"This base opens `{dbPath}` (relative to the package root). Place the",
-    s!"original SQLite file there (e.g. `cp {source} {dbPath}`) — the file is",
+    s!"This base opens `{dbPath}` (relative to the working directory) unless",
+    s!"`--db <path>` or `$LEANDB_DB` says otherwise. Place the original SQLite",
+    s!"file there (e.g. `cp {source} {dbPath}`) — the file is",
     "*adopted*, not converted:",
     "",
     "- On first open the engine writes the schema fingerprint into a new",
@@ -776,7 +793,8 @@ def renderFiles (p : Plan) (requirePath dbPath source toolchain : String) :
     (p.moduleName ++ ".lean", rootFile p),
     (p.moduleName ++ "/Scalars.lean", scalarsFile p),
     (p.moduleName ++ "/Entities.lean", entitiesFile p),
-    ("Main.lean", mainFile p dbPath),
+    (p.moduleName ++ "/Base.lean", baseFile p dbPath),
+    ("Main.lean", mainFile p),
     ("IMPORT.md", importMd p source dbPath),
     ("import-report.json", (reportJson p source dbPath).pretty ++ "\n")]
 

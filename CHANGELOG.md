@@ -67,6 +67,17 @@ lines quoted against it; seven configuration queries and a second test
 executable.
 Design docs: LEP-0002, the kernels/restaurants stress study, `ROADMAP.md`.
 
+A base is a value: `LeanDb.Base` (tables, `query%` entries, seed, default
+instance path) lives in the base's library (`<Base>/Base.lean`) and
+`Main.lean` is `LeanDb.Cli.run <Base>.base`. The schema is derived from
+the tables (`Base.specs`: dedup, stable dependency order — every
+example's fingerprint is unchanged, asserted by each base's tests). The
+instance is chosen at run time: `--db <path>` on any command, else
+`$LEANDB_DB`, else `data/<name>.sqlite`. `query%` records parameter
+names and types (`help` shows them); `seed` is a verb derived from the
+base's declared seed (`query seed` still works). The importer generates
+the same shape.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

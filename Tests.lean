@@ -2496,9 +2496,9 @@ private def testEndToEnd : IO Unit := do
   db.exec "UPDATE \"order\" SET total = 3 WHERE id = 3"
   -- the CLI: the child table is a table like any other; the parent shows the list
   let cli ← expectOk (← withDb dbPath childSchema do
-      let child := Cli.CliTable.of Order.Items
+      let child := CliTable.of Order.Items
       let byName ← child.rowsWhere [("name", "xyz")] 100
-      let parent := Cli.CliTable.of Order
+      let parent := CliTable.of Order
       let inserted ← parent.insertJson (← DbM.ofExcept (match Lean.Json.parse "{\"customer\":\"j\",\"items\":[{\"name\":\"p\",\"qty\":2},{\"name\":\"q\"}]}" with
         | .ok j => .ok j | .error e => .error (.sqlite e)))
       return (byName.compress, inserted.compress)) "cli"
@@ -2573,8 +2573,35 @@ def run : IO Unit := do
 
 end ChildD
 
+/-! ## Base descriptor: derived schema order and instance resolution -/
+
+private def testBaseSpecs : IO Unit := do
+  -- an already-ordered list comes back unchanged, so fingerprints do not move
+  check (orderSpecs schema == schema) "orderSpecs keeps a dependency-ordered list"
+  -- a referrer listed before its target is moved after it; the rest stays stable
+  let reversed := [Entity.spec Book, Entity.spec Author]
+  check ((orderSpecs reversed).map (·.name) == ["author", "book"]) "orderSpecs orders FK target first"
+  -- duplicates (a child table listed via its parent and on its own) collapse
+  let dup := [Entity.spec Author, Entity.spec Book, Entity.spec Author]
+  check ((orderSpecs dup).map (·.name) == ["author", "book"]) "orderSpecs dedups by name"
+  -- Base.specs is the flattened, ordered table list
+  let b : Base := { name := "t", tables := [CliTable.of Book, CliTable.of Author] }
+  check (b.specs.map (·.name) == ["author", "book"]) "Base.specs derives the schema"
+  check (fingerprint b.specs == fingerprint schema) "Base.specs fingerprint equals the hand-written schema"
+  check (b.defaultInstance == ("data" / "t.sqlite")) "default instance path"
+  -- `--db` anywhere in argv wins and is stripped
+  match ← Instance.resolve b ["rows", "--db", "/tmp/x.sqlite", "book"] with
+  | .ok (inst, args) =>
+      check (inst.path == "/tmp/x.sqlite" && args == ["rows", "book"]) "--db resolves and strips"
+      check (inst.backups == ("/tmp" / "backups")) "backups dir next to the instance"
+  | .error m => throw <| IO.userError s!"FAIL: --db: {m}"
+  match ← Instance.resolve b ["--db"] with
+  | .ok _ => throw <| IO.userError "FAIL: --db without a path must be refused"
+  | .error _ => pure ()
+
 def main : IO UInt32 := do
   testCodecs
+  testBaseSpecs
   testDerivedSpec
   testSortBy
   testPlans

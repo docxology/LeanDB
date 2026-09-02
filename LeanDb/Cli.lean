@@ -1,17 +1,18 @@
-import LeanDb.Db
-import LeanDb.Json
+import LeanDb.Base
 import LeanDb.Migrate
 
 namespace LeanDb.Cli
 
 /-! # The derived CLI
 
-A base gets a machine-first CLI by listing its entities and queries; every
+A base gets a machine-first CLI from its `LeanDb.Base` value; every
 verb's behavior and JSON shape is derived from `Entity` instances. Exit
 codes per plan.md §4.5: 0 ok, 2 typed `DbError` (JSON on stderr), 3 usage,
 4 schema/version mismatch (`DbError.exitCode`).
 The argv boundary is the one place strings are inherent; they are parsed
-into types immediately and everything past this module is typed.
+into types immediately and everything past this module is typed. The
+instance is resolved from argv/environment (`Instance.resolve`), never
+compiled into the base.
 -/
 
 open Lean (Json)
@@ -79,99 +80,15 @@ def doneArgs : List String → DbM Unit
 
 def okResult (j : Json) : Json := Json.mkObj [("ok", Json.bool true), ("result", j)]
 
-structure CliTable where
-  name : String
-  insertJson : Json → DbM Json
-  getJson : Int64 → DbM Json
-  updateJson : Int64 → Json → DbM Json
-  deleteRow : Int64 → DbM Json
-  /-- `rows` with conjunctive equality filters (plan.md §4.1: `--eq` and
-      limit are the CLI's whole filter language — anything more is a
-      typed query). -/
-  rowsWhere : List (String × String) → Nat → DbM Json
+/-- The `seed` verb's response, when the base declares a seed. -/
+private def seedJson : Json := Json.mkObj [("ok", Json.bool true), ("seeded", Json.bool true)]
 
-private def okRow (j : Json) : Json := Json.mkObj [("ok", Json.bool true), ("row", j)]
-
-def CliTable.of (α : Type) [Entity α] : CliTable where
-  name := Entity.tableName α
-  insertJson j := do
-    let a ← DbM.ofExcept (rowOfJson α j)
-    return okRow (rowJson α (← insert α a))
-  getJson id := do
-    match ← get (⟨id⟩ : Id α) with
-    | some s => return okRow (rowJson α s)
-    | none => throw (.notFound (Entity.tableName α) id)
-  updateJson id j := do
-    match ← get (⟨id⟩ : Id α) with
-    | some old =>
-        let new ← DbM.ofExcept (rowMergeJson α old.val j)
-        return okRow (rowJson α (← update old new))
-    | none => throw (.notFound (Entity.tableName α) id)
-  deleteRow id := do
-    delete (⟨id⟩ : Id α)
-    return Json.mkObj [("ok", Json.bool true), ("deleted", Lean.toJson id.toInt)]
-  rowsWhere eqs limit := do
-    let spec := Entity.spec α
-    -- (symbol, typed value) per filter; the plan is folded from these
-    -- below, outside the monad (`Pred` lives in `Type 1`, `DbM` carries `Type`)
-    let mut conds : Array ((f : Entity.Field α) × Entity.fieldTy f) := #[]
-    for (col, v) in eqs do
-      -- the boundary parses the name into the symbol at once; from here
-      -- on the column is `f`, never the string
-      match Entity.fieldOfName? α col with
-      | none =>
-          throw (.decode spec.name col
-            s!"no such column; columns: {spec.columns.toList.map (·.name)}")
-      | some f =>
-          let c := Entity.fieldSpec f
-          -- a closed-world column refuses unknown variants loudly — a
-          -- silent empty result is the exact failure mode LeanDB exists
-          -- to kill
-          if let some vs := c.enum then
-            unless vs.contains v do
-              throw (.decode spec.name col
-                s!"{String.quote v} is not in the closed world {vs}")
-          let cv ← match c.sqlType with
-            | .integer =>
-                match v.toInt? with
-                | some i =>
-                    if i < Int64.minValue.toInt || i > Int64.maxValue.toInt then
-                      throw (.decode spec.name col s!"integer out of Int64 range: {v}")
-                    pure (Col.int (Int64.ofInt i))
-                | none => throw (.decode spec.name col s!"expected an integer, got {String.quote v}")
-            | .text => pure (Col.text v)
-            | .real => throw (.decode spec.name col "REAL columns cannot be filtered with --eq")
-          -- the validated value goes through the column's own codec, like
-          -- every other boundary: a validated newtype's canonical encoding
-          -- is what SQLite compares, not the spelling on the command line
-          let tv ← match (Entity.codec f).fromCol cv with
-            | .ok tv => pure tv
-            | .error e => throw (.decode spec.name col e)
-          conds := conds.push ⟨f, tv⟩
-    let pred : Pred [α] := conds.foldl (init := .tt) fun p c => p.andS (.eq (.here c.1) .eq c.2)
-    let rows ← fetchFiltered α pred
-    let rows := rows.toList.take limit
-    return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.length),
-      ("rows", Json.arr (rows.map (rowJson α)).toArray)]
-
-/-- A base, as the CLI sees it: name, default instance path, specs (both
-    derived from the types), tables, and named queries. An entity with
-    child lists (LEP-0003 D) contributes `Entity.specs α` — its table and
-    its child tables — and lists the children as tables of their own
-    (`.of Kernel.Ins`) so `rows kernel_ins --eq …` works like any other
-    table; `rows kernel` shows the lists nested. -/
-structure Base where
-  name : String
-  dbPath : System.FilePath
-  specs : List TableSpec
-  tables : List CliTable
-  queries : List (String × (List String → DbM Json)) := []
-
-private def usageJson (b : Base) : Json :=
+private def usageJson (b : Base) (inst : Instance) : Json :=
   Json.mkObj [
     ("ok", Json.bool true),
     ("base", Json.str b.name),
-    ("usage", Json.arr #[
+    ("instance", Json.str inst.path.toString),
+    ("usage", Json.arr (#[
       Json.str "schema",
       Json.str "insert <table> <json>",
       Json.str "get <table> <id>",
@@ -179,12 +96,17 @@ private def usageJson (b : Base) : Json :=
       Json.str "delete <table> <id>",
       Json.str "rows <table> [--eq col=value]... [--limit n]",
       Json.str "version",
-      Json.str "query <name> [args...]",
+      Json.str "query <name> [args...]"] ++
+      (if b.seed.isSome then #[Json.str "seed"] else #[]) ++ #[
       Json.str "log [limit]",
       Json.str "migrate status | apply [--allow-destructive]",
-      Json.str "serve  (JSON-lines over stdio, persistent connection)"]),
+      Json.str "serve  (JSON-lines over stdio, persistent connection)",
+      Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
-    ("queries", Json.arr (b.queries.map (Json.str ·.1)).toArray)]
+    ("queries", Json.arr (b.queries.map fun q =>
+      Json.mkObj [("name", Json.str q.name),
+        ("params", Json.arr (q.params.map fun (n, t) =>
+          Json.mkObj [("name", Json.str n), ("type", Json.str t)]).toArray)]).toArray)]
 
 private def parseId (s : String) : Except String Int64 :=
   match s.toNat? with
@@ -226,6 +148,9 @@ private def parseRowFlags : List String → List (String × String) → Nat →
       | none => .error s!"unrecognized rows argument {String.quote n}"
   | arg :: _, _, _ => .error s!"unrecognized rows argument {String.quote arg}"
 
+private def queryNames (b : Base) : List String :=
+  b.queries.map (·.name) ++ (if b.seed.isSome then ["seed"] else [])
+
 /-- Resolve argv into one typed database action (or a usage error). -/
 private def command (b : Base) : List String → Except String (DbM Json)
   | ["insert", t, j] => do pure ((← table? b t).insertJson (← parseJson j))
@@ -241,19 +166,24 @@ private def command (b : Base) : List String → Except String (DbM Json)
       let tbl ← table? b t
       let (eqs, limit) ← parseRowFlags flags [] 100
       pure (tbl.rowsWhere eqs limit)
+  | ["seed"] | ["query", "seed"] =>
+      match b.seed with
+      | some s => .ok (do s; pure seedJson)
+      | none => .error s!"this base has no seed; queries: {queryNames b}"
   | "query" :: name :: qargs =>
-      match b.queries.find? (·.1 == name) with
-      | some (_, q) => .ok (q qargs)
-      | none => .error s!"unknown query {String.quote name}; queries: {b.queries.map (·.1)}"
+      match b.queries.find? (·.name == name) with
+      | some q => .ok (q.run qargs)
+      | none => .error s!"unknown query {String.quote name}; queries: {queryNames b}"
   | args => .error s!"unrecognized command {args}"
 
 /-- Served mode: JSON-lines over stdio against one persistent connection.
     Each request line is a JSON array of argv strings; each response is one
     JSON object line. EOF ends the session. -/
-def serve (b : Base) : IO UInt32 := do
-  if let some parent := b.dbPath.parent then
+def serve (b : Base) (inst : Instance) : IO UInt32 := do
+  let specs := b.specs
+  if let some parent := inst.path.parent then
     IO.FS.createDirAll parent
-  match ← openDb b.dbPath b.specs with
+  match ← openDb inst.path specs with
   | .error e =>
       IO.eprintln e.toJson.compress
       return e.exitCode
@@ -273,7 +203,7 @@ def serve (b : Base) : IO UInt32 := do
             out.putStrLn (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
               ("message", Json.str s!"expected a JSON array of argv strings: {m}")]).compress
         | .ok ["schema"] =>
-            out.putStrLn (schemaJson b.name b.specs).compress
+            out.putStrLn (schemaJson b.name specs).compress
         | .ok argv =>
             match command b argv with
             | .error m =>
@@ -286,19 +216,21 @@ def serve (b : Base) : IO UInt32 := do
         out.flush
       return 0
 
-def run (b : Base) (args : List String) : IO UInt32 := do
+/-- Run one command against a resolved instance. -/
+def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
+  let specs := b.specs
   match args with
-  | ["serve"] => serve b
+  | ["serve"] => serve b inst
   | [] | ["help"] | ["--help"] =>
-      IO.println (usageJson b).compress
+      IO.println (usageJson b inst).compress
       return 0
   | ["schema"] =>
-      IO.println (schemaJson b.name b.specs).compress
+      IO.println (schemaJson b.name specs).compress
       return 0
   | ["version"] =>
-      let codeFp := fingerprint b.specs
+      let codeFp := fingerprint specs
       let (instFp, instVer) ← do
-        match ← instanceInfo b.dbPath with
+        match ← instanceInfo inst.path with
         | none => pure (Json.null, Json.null)
         | some (fp, ver) =>
             pure (fp.map Json.str |>.getD Json.null,
@@ -321,9 +253,9 @@ def run (b : Base) (args : List String) : IO UInt32 := do
             ("message", Json.str "migrate status | apply [--allow-destructive]")]).compress
           return 3
       | some (apply, allowDestructive) =>
-          if let some parent := b.dbPath.parent then
+          if let some parent := inst.path.parent then
             IO.FS.createDirAll parent
-          match ← migrate b.dbPath b.specs apply allowDestructive with
+          match ← migrate inst.path specs apply allowDestructive with
           | .error e =>
               IO.eprintln e.toJson.compress
               return 2
@@ -344,14 +276,24 @@ def run (b : Base) (args : List String) : IO UInt32 := do
             ("message", Json.str msg)]).compress
           return 3
       | .ok act =>
-          if let some parent := b.dbPath.parent then
+          if let some parent := inst.path.parent then
             IO.FS.createDirAll parent
-          match ← withDb b.dbPath b.specs act with
+          match ← withDb inst.path specs act with
           | .ok j =>
               IO.println j.compress
               return 0
           | .error e =>
               IO.eprintln e.toJson.compress
               return e.exitCode
+
+/-- The base's `main`: resolve the instance (`--db`, `$LEANDB_DB`, default)
+    and run the command. -/
+def run (b : Base) (args : List String) : IO UInt32 := do
+  match ← Instance.resolve b args with
+  | .error m =>
+      IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"),
+        ("message", Json.str m)]).compress
+      return 3
+  | .ok (inst, args) => runOn b inst args
 
 end LeanDb.Cli

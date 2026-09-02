@@ -122,7 +122,8 @@ Maintainers can run the full engine, example, and importer release pass with
 ## A new base from scratch
 
 A LeanDB database ("base") is an ordinary Lake package depending on
-`leandb`. Three files. Make a directory anywhere and add:
+`leandb`: types, queries, and one `LeanDb.Base` value that ties them
+together; the instance (the SQLite file) is chosen at run time. Three files. Make a directory anywhere and add:
 
 **`lean-toolchain`** — must match the engine's (copy it):
 
@@ -175,26 +176,26 @@ structure Note where
   status : Status := .draft
   deriving Repr, LeanDb.Entity
 
-def schema : List TableSpec := [Entity.spec Note]
-
 /-- Domain logic the query compiler may unfold into SQL. -/
 @[db] def Note.isDraft (n : Note) : Bool := n.status == .draft
 
 def drafts : DbM (Array (Stored Note)) :=
   select [Note] (fun n => n.val.isDraft) (.key (·.val.title.raw))
 
-open Lean (Json) in
-def main (args : List String) : IO UInt32 :=
-  Cli.run {
-    name := "notes"
-    dbPath := "data" / "notes.sqlite"
-    specs := schema
-    tables := [.of Note]
-    queries := [query% drafts]   -- CLI arity/parsing derived from the def's signature
-  } args
+/-- The base as a value: tables (the schema is derived from them) and
+    queries. A larger base puts this in its library so other packages
+    can `import` it. -/
+def base : LeanDb.Base := {
+  name := "notes"
+  tables := [.of Note]
+  queries := [query% drafts]   -- CLI arity/parsing derived from the def's signature
+}
+
+def main (args : List String) : IO UInt32 := Cli.run base args
 ```
 
-Build and use (the instance file is created on first touch):
+Build and use. The instance file is `data/notes.sqlite` unless `--db
+<path>` or `$LEANDB_DB` says otherwise, and it is created on first touch:
 
 ```bash
 lake build
@@ -298,7 +299,8 @@ adds its `_leandb_*` bookkeeping tables on first open.
 
 ## The CLI every base gets
 
-`Cli.run` derives the whole surface from your entity list:
+`Cli.run` derives the whole surface from the base value; `--db <path>`
+(or `$LEANDB_DB`) picks the instance for any command:
 
 | Command | Meaning |
 |---|---|
@@ -308,7 +310,8 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `get <table> <id>` · `delete <table> <id>` | typed row ops; `delete` of a referenced row → `restricted` |
 | `update <table> <id> <partial-json>` | column-level merge, re-validated, written compare-and-swap |
 | `rows <table> [--eq col=value]… [--limit n]` | conjunctive equality filters — the CLI's whole filter language, by design |
-| `query <name> [args…]` | your `query%`-registered queries; args parse by type |
+| `query <name> [args…]` | your `query%`-registered queries; args parse by type (`help` lists each query's parameters) |
+| `seed` | the base's seed, when it declares one |
 | `migrate status` / `migrate apply [--allow-destructive]` | see above |
 | `log [n]` | the query log: verb, reified SQL plan, outcome, row count |
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
@@ -372,7 +375,9 @@ LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (the reference semantic
 LeanDb/Pred.lean     typed plan IR (Pred)  LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
 LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query log
 LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal
-LeanDb/Json.lean     schema/row/error JSON, merge decode   LeanDb/Cli.lean  the CLI driver
+LeanDb/Json.lean     schema/row/error JSON, merge decode
+LeanDb/Base.lean     Base (tables → derived schema, queries, seed), Instance, QueryEntry
+LeanDb/Cli.lean      the CLI driver (CliArg, QueryOut, verbs, serve)
 LeanDb/CliQuery.lean query%                LeanDb/Import.lean  import-sqlite generator
 Tests.lean           engine tests          Main.lean            the leandb executable
 ```

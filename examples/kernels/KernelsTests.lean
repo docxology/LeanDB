@@ -425,6 +425,11 @@ private def runQueries : DbM (Array Lean.Json) := do
   readLog 7
 
 def main : IO UInt32 := do
+  -- The base value's derived schema is the hand-written one, table for
+  -- table: `Base.specs` (dedup + dependency order) must not reorder a
+  -- list that is already in dependency order, or the fingerprint moves.
+  unless base.specs == schema do
+    throw <| IO.userError "FAIL: Base.specs must equal the hand-written schema"
   pureChecks
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   let log ← expectOk (← withDb dbPath schema runQueries) "seed + queries"

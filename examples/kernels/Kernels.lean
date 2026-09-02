@@ -5,3 +5,4 @@ import Kernels.Entities
 import Kernels.Prog
 import Kernels.Queries
 import Kernels.Seed
+import Kernels.Base

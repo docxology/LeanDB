@@ -168,6 +168,11 @@ private def showPlans : DbM Unit := do
   for d in seen do IO.println s!"plan: {d}"
 
 def main : IO UInt32 := do
+  -- The base value's derived schema is the hand-written one, table for
+  -- table: `Base.specs` (dedup + dependency order) must not reorder a
+  -- list that is already in dependency order, or the fingerprint moves.
+  unless base.specs == (schema ++ offersSchema) do
+    throw <| IO.userError "FAIL: Base.specs must equal the hand-written schema"
   vocabulary
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   expectOk (← withDb dbPath schema runQueries) "seed + queries"
