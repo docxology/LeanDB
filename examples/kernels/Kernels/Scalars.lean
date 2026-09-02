@@ -152,6 +152,8 @@ def DimVar.make (s : String) : Except String DimVar :=
 instance : ColCodec DimVar := ColCodec.via (·.name) DimVar.make
 instance : Lean.ToJson DimVar := ⟨fun v => .str v.name⟩
 instance : Lean.FromJson DimVar := ⟨fun j => j.getStr? >>= DimVar.make⟩
+/-- Its JSON is a string; the shape (LEP-0003 B2) says so. -/
+instance : LeanDb.JsonShape DimVar := ⟨LeanDb.JsonShape.shape String⟩
 
 /-- A concrete assignment of shape variables, `M=4096,N=4096,K=4096`.
     `make` sorts by variable and refuses duplicates, so the encoding is

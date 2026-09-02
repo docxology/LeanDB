@@ -6,8 +6,8 @@ import GpuMarket.Enums
 Four tables plus one child table. `Kernel` carries the study's nested
 values three different ways, deliberately, so the base can report on each:
 
-- `sig : KernelSig` — one opaque JSON TEXT column; SQL can test it only
-  for equality.
+- `sig : KernelSig` — one JSON TEXT column with a declared shape
+  (`ColCodec.json`, LEP-0003 B2); SQL can test it only for equality.
 - `launch : LaunchConfig` — three scalars, *also* stored as one JSON
   column (the inline-flatten candidate, kept nested to show what that
   costs: `smemBytes ≤ 100000` is residual).
@@ -16,12 +16,13 @@ values three different ways, deliberately, so the base can report on each:
 - `fuses : FusedOps` — a set of a closed world as canonical TEXT (the
   `EnumSet` gap).
 
-The search columns `inDtype0`/`outDtype0`/`rank0` are copies of facts
-inside `sig`, filled by `Kernel.make` so the common filters push. The
-invariant that they agree with `sig` is cross-field: it is checked on the
-`Kernel.make` path only, and **not** on `update` or on a CLI `insert`
-whose JSON supplies the columns directly — `deriving LeanDb.Entity`
-refuses proof fields today (study §3.2). -/
+The search columns `inDtype0`/`outDtype0`/`rank0` are **derived** (LEP-0003
+B3): their defaults are `derived <fact of sig>`, so `Entity.encode`
+recomputes them from `sig` on every write (a supplied value is ignored),
+`Entity.decode` checks the stored value against `sig` on every read and
+fails with `decode` naming the column if they disagree, and JSON input may
+omit them. The invariant that they agree with `sig` is the engine's,
+on both sides of the boundary — not `Kernel.make`'s. -/
 
 namespace Kernels
 
@@ -34,7 +35,7 @@ structure LaunchConfig where
   block     : Nat
   smemBytes : Nat
   stages    : Nat := 1
-  deriving Repr, DecidableEq, Lean.ToJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def LaunchConfig.make (block smemBytes : Nat) (stages : Nat := 1) : Except String LaunchConfig := do
   if block == 0 || block > 1024 || block % 32 != 0 then
@@ -43,14 +44,10 @@ def LaunchConfig.make (block smemBytes : Nat) (stages : Nat := 1) : Except Strin
   if stages == 0 then throw "stages must be positive"
   return { block, smemBytes, stages }
 
-instance : Lean.FromJson LaunchConfig where
-  fromJson? j := do
-    LaunchConfig.make (← j.getObjValAs? Nat "block") (← j.getObjValAs? Nat "smemBytes")
-      (← j.getObjValAs? Nat "stages")
-
+/-- Validated through `make` at the column boundary; JSON may omit
+    `stages` (its default is 1). -/
 instance : ColCodec LaunchConfig :=
-  ColCodec.via (fun c => (Lean.toJson c).compress)
-               (fun t => Lean.Json.parse t >>= Lean.fromJson?)
+  ColCodec.json LaunchConfig fun c => LaunchConfig.make c.block c.smemBytes c.stages
 
 structure Kernel where
   name          : KernelName
@@ -68,16 +65,17 @@ structure Kernel where
   fuses         : FusedOps
   source        : SourceHash
   license       : License
-  /-- Search column: `sig.ins[0].dtype`. -/
-  inDtype0      : DType
-  /-- Search column: `sig.outs[0].dtype`. -/
-  outDtype0     : DType
-  /-- Search column: `sig.ins[0].rank`. -/
-  rank0         : Nat
+  /-- Derived search column: `sig.ins[0].dtype`, recomputed on write,
+      checked on read. -/
+  inDtype0      : DType := derived sig.inDtype0
+  /-- Derived search column: `sig.outs[0].dtype`. -/
+  outDtype0     : DType := derived sig.outDtype0
+  /-- Derived search column: `sig.ins[0].rank`. -/
+  rank0         : Nat := derived sig.rank0
   deriving Repr, LeanDb.Entity
 
-/-- The only path that keeps the search columns honest. Also refuses a
-    `maxArch` from another vendor or below `minArch`. -/
+/-- Refuses a `maxArch` from another vendor or below `minArch`. The
+    derived columns need no help: their defaults compute them. -/
 def Kernel.make (name : KernelName) (op : OpKind) (lang : Lang) (variant : Variant)
     (sig : KernelSig) (minArch : Arch) (maxArch : Option Arch) (launch : LaunchConfig)
     (deterministic : Bool) (accum : DType) (fuses : FusedOps) (source : SourceHash)
@@ -85,19 +83,8 @@ def Kernel.make (name : KernelName) (op : OpKind) (lang : Lang) (variant : Varia
   if let some mx := maxArch then
     unless mx.supports minArch do
       throw s!"maxArch {LeanDb.ClosedEnum.encodeName mx} does not support minArch {LeanDb.ClosedEnum.encodeName minArch}"
-  let some i0 := sig.ins[0]? | throw "signature has no inputs"
-  let some o0 := sig.outs[0]? | throw "signature has no outputs"
   return { name, op, lang, variant, sig, minArch, maxArch, launch, deterministic, accum,
-           fuses, source, license,
-           inDtype0 := i0.dtype, outDtype0 := o0.dtype, rank0 := i0.rank }
-
-/-- Do the search columns still describe `sig`? True for every row that
-    came through `Kernel.make`; a CLI `update` of `sig` alone can make it
-    false, which is the cross-field gap. -/
-def Kernel.searchColumnsAgree (k : Kernel) : Bool :=
-  match k.sig.ins[0]?, k.sig.outs[0]? with
-  | some i0, some o0 => k.inDtype0 == i0.dtype && k.outDtype0 == o0.dtype && k.rank0 == i0.rank
-  | _, _ => false
+           fuses, source, license }
 
 /-- One measurement. `sku` is gpumarket's closed world: the CHECK over its
     vocabulary and `Gpu.spec` come with the type. -/

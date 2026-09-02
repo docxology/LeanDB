@@ -1,15 +1,18 @@
 # kernels CLI transcript
 
-Generated 2026-09-01 from a fresh `data/` dir. Dtypes, ops, languages,
-architectures and licenses are closed worlds; the SKU world is gpumarket's
-`Gpu`. `sig` and `launch` are opaque JSON TEXT columns; `binding` and
-`fuses` are canonical TEXT. Bench numbers are illustrative.
+Generated 2026-09-01 from a fresh `data/` dir, on LEP-0003 stage B (B1–B3).
+Dtypes, ops, languages, architectures and licenses are closed worlds; the
+SKU world is gpumarket's `Gpu`. `sig` and `launch` are JSON TEXT columns
+with a declared shape (`ColCodec.json`) that the fingerprint covers;
+`inDtype0`/`outDtype0`/`rank0` are derived from `sig` (recomputed on
+write, checked on read); `binding` and `fuses` are canonical TEXT. Bench
+numbers are illustrative.
 
-## schema — five tables; sig/launch are TEXT, the search columns are enum/INTEGER beside them
+## schema — five tables; sig/launch are TEXT with a declared shape (LEP-0003 B2), the derived search columns are enum/INTEGER beside them
 
 ```console
 $ kernels schema
-{"base":"kernels","fingerprint":"15002238114063248552","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["gemm","gemv","batchedGemm","attention","flashAttention","pagedAttention","softmax","layerNorm","rmsNorm","rope","silu","gelu","reduce","scan","embedding","allReduce","allGather","conv2d","topK","sort"],"name":"op","nullable":false,"type":"TEXT"},{"enum":["cuda","hip","triton","cutlass","ck","ptx","mlir"],"name":"lang","nullable":false,"type":"TEXT"},{"name":"variant","nullable":false,"type":"TEXT"},{"name":"sig","nullable":false,"type":"TEXT"},{"enum":["sm80","sm86","sm89","sm90","sm100","gfx90a","gfx942","gfx950"],"name":"minArch","nullable":false,"type":"TEXT"},{"enum":["sm80","sm86","sm89","sm90","sm100","gfx90a","gfx942","gfx950"],"name":"maxArch","nullable":true,"type":"TEXT"},{"name":"launch","nullable":false,"type":"TEXT"},{"name":"deterministic","nullable":false,"type":"INTEGER"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"accum","nullable":false,"type":"TEXT"},{"name":"fuses","nullable":false,"type":"TEXT"},{"name":"source","nullable":false,"type":"TEXT"},{"enum":["mit","apache2","bsd3","proprietary"],"name":"license","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"inDtype0","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"outDtype0","nullable":false,"type":"TEXT"},{"name":"rank0","nullable":false,"type":"INTEGER"}],"name":"kernel"},{"columns":[{"name":"kernel","nullable":false,"references":"kernel","type":"INTEGER"},{"enum":["h100Sxm","h100Pcie","h200","b200","gh200","a100Sxm80","a100Pcie40","l40s","l4","a10","rtx4090","rtx5090","mi300x","mi325x"],"name":"sku","nullable":false,"type":"TEXT"},{"name":"binding","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"precision","nullable":false,"type":"TEXT"},{"name":"latency","nullable":false,"type":"INTEGER"},{"name":"tflops","nullable":false,"type":"INTEGER"},{"name":"bwGBs","nullable":false,"type":"INTEGER"},{"name":"occupancy","nullable":false,"type":"INTEGER"},{"default":10,"name":"warmup","nullable":false,"type":"INTEGER"},{"default":100,"name":"iters","nullable":false,"type":"INTEGER"},{"name":"driver","nullable":false,"type":"TEXT"},{"name":"toolchain","nullable":false,"type":"TEXT"},{"name":"host","nullable":false,"type":"TEXT"},{"name":"measuredAt","nullable":false,"type":"INTEGER"}],"name":"bench"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["h100Sxm","h100Pcie","h200","b200","gh200","a100Sxm80","a100Pcie40","l40s","l4","a10","rtx4090","rtx5090","mi300x","mi325x"],"name":"sku","nullable":false,"type":"TEXT"},{"name":"binding","nullable":false,"type":"TEXT"}],"name":"program"},{"columns":[{"name":"program","nullable":false,"references":"program","type":"INTEGER"},{"name":"position","nullable":false,"type":"INTEGER"},{"name":"kernel","nullable":false,"references":"kernel","type":"INTEGER"}],"name":"program_node"},{"columns":[{"name":"program","nullable":false,"references":"program","type":"INTEGER"},{"name":"toNode","nullable":false,"references":"program_node","type":"INTEGER"},{"name":"toInput","nullable":false,"type":"INTEGER"},{"name":"fromNode","nullable":false,"references":"program_node","type":"INTEGER"},{"name":"fromOutput","nullable":false,"type":"INTEGER"}],"name":"program_edge"}]}
+{"base":"kernels","fingerprint":"535084016606190269","ok":true,"tables":[{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["gemm","gemv","batchedGemm","attention","flashAttention","pagedAttention","softmax","layerNorm","rmsNorm","rope","silu","gelu","reduce","scan","embedding","allReduce","allGather","conv2d","topK","sort"],"name":"op","nullable":false,"type":"TEXT"},{"enum":["cuda","hip","triton","cutlass","ck","ptx","mlir"],"name":"lang","nullable":false,"type":"TEXT"},{"name":"variant","nullable":false,"type":"TEXT"},{"name":"sig","nullable":false,"shape":"KernelSig{vars:[String],ins:[TensorTy{dtype:<f64|f32|tf32|bf16|f16|fp8e4m3|fp8e5m2|fp4e2m1|int8|int4|int32|uint8|bool>,shape:[Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})],layout:Layout(rowMajor|colMajor|strided{strides:[Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})]}|tiled{tile:[Nat],inner:Layout})=,mem:<global|shared|register|constant>=,align:Nat=}],outs:[TensorTy{dtype:<f64|f32|tf32|bf16|f16|fp8e4m3|fp8e5m2|fp4e2m1|int8|int4|int32|uint8|bool>,shape:[Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})],layout:Layout(rowMajor|colMajor|strided{strides:[Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})]}|tiled{tile:[Nat],inner:Layout})=,mem:<global|shared|register|constant>=,align:Nat=}],scalars:[(String,<f64|f32|tf32|bf16|f16|fp8e4m3|fp8e5m2|fp4e2m1|int8|int4|int32|uint8|bool>)],constraints:[DimConstraint(divides{k:Nat,d:Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})}|le{a:Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat}),b:Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})}|eq{a:Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat}),b:Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})})]}","type":"TEXT"},{"enum":["sm80","sm86","sm89","sm90","sm100","gfx90a","gfx942","gfx950"],"name":"minArch","nullable":false,"type":"TEXT"},{"enum":["sm80","sm86","sm89","sm90","sm100","gfx90a","gfx942","gfx950"],"name":"maxArch","nullable":true,"type":"TEXT"},{"name":"launch","nullable":false,"shape":"LaunchConfig{block:Nat,smemBytes:Nat,stages:Nat=}","type":"TEXT"},{"name":"deterministic","nullable":false,"type":"INTEGER"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"accum","nullable":false,"type":"TEXT"},{"name":"fuses","nullable":false,"type":"TEXT"},{"name":"source","nullable":false,"type":"TEXT"},{"enum":["mit","apache2","bsd3","proprietary"],"name":"license","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"inDtype0","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"outDtype0","nullable":false,"type":"TEXT"},{"name":"rank0","nullable":false,"type":"INTEGER"}],"name":"kernel"},{"columns":[{"name":"kernel","nullable":false,"references":"kernel","type":"INTEGER"},{"enum":["h100Sxm","h100Pcie","h200","b200","gh200","a100Sxm80","a100Pcie40","l40s","l4","a10","rtx4090","rtx5090","mi300x","mi325x"],"name":"sku","nullable":false,"type":"TEXT"},{"name":"binding","nullable":false,"type":"TEXT"},{"enum":["f64","f32","tf32","bf16","f16","fp8e4m3","fp8e5m2","fp4e2m1","int8","int4","int32","uint8","bool"],"name":"precision","nullable":false,"type":"TEXT"},{"name":"latency","nullable":false,"type":"INTEGER"},{"name":"tflops","nullable":false,"type":"INTEGER"},{"name":"bwGBs","nullable":false,"type":"INTEGER"},{"name":"occupancy","nullable":false,"type":"INTEGER"},{"default":10,"name":"warmup","nullable":false,"type":"INTEGER"},{"default":100,"name":"iters","nullable":false,"type":"INTEGER"},{"name":"driver","nullable":false,"type":"TEXT"},{"name":"toolchain","nullable":false,"type":"TEXT"},{"name":"host","nullable":false,"type":"TEXT"},{"name":"measuredAt","nullable":false,"type":"INTEGER"}],"name":"bench"},{"columns":[{"name":"name","nullable":false,"type":"TEXT"},{"enum":["h100Sxm","h100Pcie","h200","b200","gh200","a100Sxm80","a100Pcie40","l40s","l4","a10","rtx4090","rtx5090","mi300x","mi325x"],"name":"sku","nullable":false,"type":"TEXT"},{"name":"binding","nullable":false,"type":"TEXT"}],"name":"program"},{"columns":[{"name":"program","nullable":false,"references":"program","type":"INTEGER"},{"name":"position","nullable":false,"type":"INTEGER"},{"name":"kernel","nullable":false,"references":"kernel","type":"INTEGER"}],"name":"program_node"},{"columns":[{"name":"program","nullable":false,"references":"program","type":"INTEGER"},{"name":"toNode","nullable":false,"references":"program_node","type":"INTEGER"},{"name":"toInput","nullable":false,"type":"INTEGER"},{"name":"fromNode","nullable":false,"references":"program_node","type":"INTEGER"},{"name":"fromOutput","nullable":false,"type":"INTEGER"}],"name":"program_edge"}]}
 (exit 0)
 ```
 
@@ -25,7 +28,7 @@ $ kernels query seed
 
 ```console
 $ kernels query kernelInfo gemm-cutlass-sm90-fp8
-{"ok":true,"result":{"fuses":"","id":7,"launch":{"block":384,"smemBytes":232448,"stages":4},"name":"gemm-cutlass-sm90-fp8","op":"gemm","search_columns_agree":true,"sig":"∀ M N K, (fp8e4m3[M,K], fp8e4m3[K,N]:colMajor) → (bf16[M,N]) where K % 128 = 0, N % 16 = 0"}}
+{"ok":true,"result":{"fuses":"","id":7,"inDtype0":"fp8e4m3","launch":{"block":384,"smemBytes":232448,"stages":4},"name":"gemm-cutlass-sm90-fp8","op":"gemm","outDtype0":"bf16","rank0":2,"sig":"∀ M N K, (fp8e4m3[M,K], fp8e4m3[K,N]:colMajor) → (bf16[M,N]) where K % 128 = 0, N % 16 = 0"}}
 (exit 0)
 ```
 
@@ -165,19 +168,31 @@ $ kernels insert kernel '{"name":"bad-sig","op":"gemm","lang":"cuda","variant":"
 (exit 2)
 ```
 
-## search columns that contradict sig are accepted by the CLI insert — the cross-field gap (study §3.2)
+## search columns that contradict sig are ignored by the CLI insert — they are derived, recomputed from sig (LEP-0003 B3 closes study §3.2)
 
 ```console
 $ kernels insert kernel '{"name":"lying-columns","op":"gemm","lang":"cuda","variant":"x","sig":"{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}","minArch":"sm90","maxArch":null,"launch":"{\"block\":256,\"smemBytes\":0,\"stages\":1}","deterministic":true,"accum":"f32","fuses":"","source":"0000000000000000000000000000000000000000000000000000000000000000","license":"mit","inDtype0":"f64","outDtype0":"f64","rank0":7}'
-{"ok":true,"row":{"accum":"f32","deterministic":1,"fuses":"","id":15,"inDtype0":"f64","lang":"cuda","launch":"{\"block\":256,\"smemBytes\":0,\"stages\":1}","license":"mit","maxArch":null,"minArch":"sm90","name":"lying-columns","op":"gemm","outDtype0":"f64","rank0":7,"sig":"{\"constraints\":[],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"vars\":[\"M\"]}","source":"0000000000000000000000000000000000000000000000000000000000000000","variant":"x"}}
+{"ok":true,"row":{"accum":"f32","deterministic":1,"fuses":"","id":15,"inDtype0":"bf16","lang":"cuda","launch":"{\"block\":256,\"smemBytes\":0,\"stages\":1}","license":"mit","maxArch":null,"minArch":"sm90","name":"lying-columns","op":"gemm","outDtype0":"bf16","rank0":1,"sig":"{\"constraints\":[],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"vars\":[\"M\"]}","source":"0000000000000000000000000000000000000000000000000000000000000000","variant":"x"}}
 (exit 0)
 ```
 
-## …and only a Lean-side check can see it
+## …and kernelInfo shows the recomputed values; the Lean-side check is gone
 
 ```console
 $ kernels query kernelInfo lying-columns
-{"ok":true,"result":{"fuses":"","id":15,"launch":{"block":256,"smemBytes":0,"stages":1},"name":"lying-columns","op":"gemm","search_columns_agree":false,"sig":"∀ M, (bf16[M]) → (bf16[M])"}}
+{"ok":true,"result":{"fuses":"","id":15,"inDtype0":"bf16","launch":{"block":256,"smemBytes":0,"stages":1},"name":"lying-columns","op":"gemm","outDtype0":"bf16","rank0":1,"sig":"∀ M, (bf16[M]) → (bf16[M])"}}
+(exit 0)
+```
+
+## a raw-SQL write to a derived column is caught on the next read, by name (exit 2) — then put back
+
+```console
+$ sqlite3 data/kernels.sqlite "UPDATE kernel SET \"inDtype0\"='f64' WHERE name='lying-columns'"
+(exit 0)
+$ kernels rows kernel --eq name=lying-columns
+{"code":"decode","message":"kernel.inDtype0: derived column disagrees with its source","ok":false}
+(exit 2)
+$ sqlite3 data/kernels.sqlite "UPDATE kernel SET \"inDtype0\"='bf16' WHERE name='lying-columns'"
 (exit 0)
 ```
 
@@ -185,7 +200,7 @@ $ kernels query kernelInfo lying-columns
 
 ```console
 $ kernels log 3
-{"count":3,"entries":[{"at":1788299985,"detail":"bench×bench | pushed: ((((t0.\"kernel\" IS t1.\"kernel\" AND t0.\"sku\" IS ?) AND t1.\"sku\" IS ?) AND t0.\"binding\" IS t1.\"binding\") AND t0.\"measuredAt\" < t1.\"measuredAt\"), residual conjuncts: 1","error":null,"id":63,"ok":true,"rows":1,"verb":"select"},{"at":1788299985,"detail":"kernel×bench | pushed: (((t1.\"kernel\" IS t0.\"id\" AND t0.\"op\" IS ?) AND t1.\"sku\" IS ?) AND t1.\"binding\" IS ?), residual conjuncts: 0","error":null,"id":62,"ok":true,"rows":4,"verb":"select"},{"at":1788299985,"detail":"kernel | pushed: (((t0.\"op\" IS ? AND t0.\"inDtype0\" IS ?) AND (((((t0.\"minArch\" IS ? OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?) AND ((((t0.\"minArch\" IS ? OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?) OR t0.\"minArch\" IS ?))) AND (t0.\"maxArch\" IS NULL OR t0.\"maxArch\" IS ?)), residual conjuncts: 0","error":null,"id":61,"ok":true,"rows":3,"verb":"select"}],"ok":true}
+{"count":3,"entries":[{"at":1788324877,"detail":"kernel | pushed: t0.\"name\" IS ?, residual conjuncts: 0","error":null,"id":60,"ok":true,"rows":1,"verb":"select"},{"at":1788324876,"detail":"kernel","error":null,"id":59,"ok":true,"rows":1,"verb":"insert"},{"at":1788324876,"detail":"bench×kernel | pushed: (t0.\"kernel\" IS t1.\"id\" AND t0.\"sku\" IS ?), residual conjuncts: 0","error":null,"id":58,"ok":true,"rows":6,"verb":"select"}],"ok":true}
 (exit 0)
 ```
 
@@ -193,7 +208,7 @@ $ kernels log 3
 
 ```console
 $ kernels migrate status
-{"applied":[],"fingerprint":"15002238114063248552","notes":["schema already up to date"],"ok":true}
+{"applied":[],"fingerprint":"535084016606190269","notes":["schema already up to date"],"ok":true}
 (exit 0)
 ```
 
@@ -201,7 +216,6 @@ $ kernels migrate status
 
 ```console
 $ kernels version
-{"code_fingerprint":"15002238114063248552","in_sync":true,"instance_fingerprint":"15002238114063248552","ok":true,"schema_version":1}
+{"code_fingerprint":"535084016606190269","in_sync":true,"instance_fingerprint":"535084016606190269","ok":true,"schema_version":1}
 (exit 0)
 ```
-

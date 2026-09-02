@@ -127,6 +127,12 @@ class ColCodec (α : Type) where
   nullable : Bool := false
   toCol : α → Col
   fromCol : Col → Except String α
+  /-- The declared shape of the value when the column holds JSON
+      (`ColCodec.json` sets it from the type's `JsonShape`); `none` for a
+      scalar codec. A property of the *codec*, not of the type: a `String`
+      column and a JSON column whose shape is `String` are different
+      things, and only the latter is part of the fingerprint. -/
+  shape : Option String := none
 
 export ColCodec (toCol fromCol)
 
@@ -143,6 +149,7 @@ class SqlOrd (α : Type) : Prop where
   nullable := ColCodec.nullable β
   toCol a := toCol (enc a)
   fromCol c := do dec (← fromCol c)
+  shape := ColCodec.shape β
 
 private def expected (want : String) (got : Col) : Except String α :=
   .error s!"expected {want}, found {got.describe}"
@@ -204,6 +211,7 @@ instance : SqlOrd (Id α) where
 instance [ColCodec α] : ColCodec (Option α) where
   sqlType := ColCodec.sqlType α
   nullable := true
+  shape := ColCodec.shape α
   toCol
     | none => .null
     | some a => toCol a
@@ -253,6 +261,79 @@ class RefTarget (α : Type) where
 instance (priority := 50) : RefTarget α := ⟨none⟩
 instance [RefTarget α] : RefTarget (Option α) := ⟨RefTarget.target α⟩
 
+/-- The declared *shape* of a JSON-encoded value type: a canonical,
+    deterministic description of what its JSON looks like, so the schema
+    fingerprint and `migrate` can see a change inside a JSON column.
+    Instances come from `deriving LeanDb.DbJson` (see `LeanDb.Derive`);
+    primitives and containers are declared below. A shape reaches a
+    column only through `ColCodec.json` (`ColCodec.shape`) — having a
+    `JsonShape` does not make a type's columns JSON columns.
+
+    The grammar (parsed back by `LeanDb.Migrate`):
+    - `Nat`, `String`, … — a primitive, by name; also a recursive
+      reference to the type being described;
+    - `Name{f:S,g:S=}` — a structure; `=` marks a field with a default;
+    - `Name(c1|c2{k:S,d:S}|c3[S,S])` — an inductive: constructors with a
+      named payload (an object), a positional one (an array), or none;
+    - `<a|b|c>` — a closed enum, by its variants;
+    - `[S]` — a list or array; `S?` — an option; `(S,S)` — a pair. -/
+class JsonShape (α : Type) where
+  shape : String
+
+namespace JsonShape
+
+def list (s : String) : String := "[" ++ s ++ "]"
+def option (s : String) : String := s ++ "?"
+def pair (a b : String) : String := "(" ++ a ++ "," ++ b ++ ")"
+def closed (variants : Array String) : String :=
+  "<" ++ String.intercalate "|" variants.toList ++ ">"
+
+/-- `Name{f:S,g:S=}`; the `Bool` is "has a default". -/
+def struct (name : String) (fields : List (String × String × Bool)) : String :=
+  name ++ "{" ++ String.intercalate "," (fields.map fun (f, s, d) =>
+    f ++ ":" ++ s ++ (if d then "=" else "")) ++ "}"
+
+/-- One constructor's payload: nothing, a named record, or positional. -/
+inductive Payload where
+  | none
+  | named (fields : List (String × String))
+  | positional (tys : List String)
+
+def Payload.render : Payload → String
+  | .none => ""
+  | .named fs => "{" ++ String.intercalate "," (fs.map fun (f, s) => f ++ ":" ++ s) ++ "}"
+  | .positional ts => "[" ++ String.intercalate "," ts ++ "]"
+
+/-- `Name(c1|c2{k:S}|c3[S,S])`. -/
+def inductive' (name : String) (ctors : List (String × Payload)) : String :=
+  name ++ "(" ++ String.intercalate "|" (ctors.map fun (c, p) => c ++ p.render) ++ ")"
+
+end JsonShape
+
+instance : JsonShape Nat := ⟨"Nat"⟩
+instance : JsonShape Int := ⟨"Int"⟩
+instance : JsonShape String := ⟨"String"⟩
+instance : JsonShape Bool := ⟨"Bool"⟩
+instance : JsonShape Float := ⟨"Float"⟩
+instance : JsonShape UInt8 := ⟨"UInt8"⟩
+instance : JsonShape UInt16 := ⟨"UInt16"⟩
+instance : JsonShape UInt32 := ⟨"UInt32"⟩
+instance : JsonShape UInt64 := ⟨"UInt64"⟩
+instance : JsonShape Int64 := ⟨"Int64"⟩
+instance : JsonShape Unit := ⟨"Unit"⟩
+instance [JsonShape α] : JsonShape (List α) := ⟨JsonShape.list (JsonShape.shape α)⟩
+instance [JsonShape α] : JsonShape (Array α) := ⟨JsonShape.list (JsonShape.shape α)⟩
+instance [JsonShape α] : JsonShape (Option α) := ⟨JsonShape.option (JsonShape.shape α)⟩
+instance [JsonShape α] [JsonShape β] : JsonShape (α × β) :=
+  ⟨JsonShape.pair (JsonShape.shape α) (JsonShape.shape β)⟩
+
+/-- Identity marker for a *derived* field: a structure field whose
+    default is `derived <expression over earlier fields>` is recomputed by
+    `Entity.encode` and checked by `Entity.decode` (see `LeanDb.Derive`).
+    Lean does not allow attributes on structure fields, so the mark lives
+    in the default itself. -/
+@[inline] def derived (a : α) : α := a
+
 /-- One column of a table, fully described. Derived from types — never
     written by hand outside the deriving machinery. -/
 structure ColumnSpec where
@@ -265,6 +346,11 @@ structure ColumnSpec where
       `DEFAULT`, used when incoming JSON omits the field, and what lets a
       migration add a NOT NULL column to existing rows. -/
   dflt : Option Col := none
+  /-- The declared shape of a JSON column's value (`ColCodec.shape`, set
+      by `ColCodec.json` from the type's `JsonShape`); `none` for scalars.
+      Not DDL — the column is TEXT either way — but part of the
+      fingerprint and of what `migrate` diffs. -/
+  shape : Option String := none
   deriving Repr, BEq, Inhabited
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
@@ -276,6 +362,7 @@ def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
   fkTable := RefTarget.target α
   enum := ColEnum.variants α
   dflt := dflt
+  shape := ColCodec.shape α
 
 structure TableSpec where
   name : String

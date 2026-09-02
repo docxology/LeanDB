@@ -2,9 +2,10 @@ import Kernels
 
 /-! Tests for the kernels base: the typed-composition property at compile
 time (`#check_failure`), the `KernelSig` boundary (codec round trip, `make`
-refusals, CLI-path insert of a malformed signature), and every query over
-seed data. The three headline `kernels log` plans are printed, not
-asserted — they are the evidence the README quotes. -/
+refusals, CLI-path insert of a malformed signature), the derived search
+columns (LEP-0003 B3: recomputed on write, checked on read), and every
+query over seed data. The three headline `kernels log` plans are printed,
+not asserted — they are the evidence the README quotes. -/
 
 open LeanDb Kernels
 open GpuMarket (Gpu)
@@ -82,7 +83,8 @@ private def malformedRow : Lean.Json :=
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "bf16"), ("outDtype0", "bf16"), ("rank0", 2)]
 
-/-- Same row, well-formed signature, search columns that contradict it. -/
+/-- Same row, well-formed signature, search columns that contradict it.
+    They are derived now: the supplied values are ignored and recomputed. -/
 private def lyingRow : Lean.Json :=
   let sig := "{\"vars\":[\"M\"],\"ins\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"outs\":[{\"align\":16,\"dtype\":\"bf16\",\"layout\":\"rowMajor\",\"mem\":\"global\",\"shape\":[{\"var\":{\"v\":\"M\"}}]}],\"scalars\":[],\"constraints\":[]}"
   Lean.Json.mkObj [("name", "lying-columns"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
@@ -117,10 +119,33 @@ private def pureChecks : IO Unit := do
   | .error (.decode "kernel" "sig" msg) => check (msg == "shape variable K is used but not declared in vars") s!"malformed sig message, got {msg}"
   | .error e => throw <| IO.userError s!"FAIL: malformed sig: wrong error {e}"
   | .ok _ => throw <| IO.userError "FAIL: malformed sig was accepted"
-  -- …and the lying search columns are NOT caught there (the §3.2 gap, on record)
+  -- …and lying search columns are recomputed from sig (B3), not stored as supplied
   match rowOfJson Kernel lyingRow with
-  | .ok k => check (!k.searchColumnsAgree) "CLI insert cannot see the cross-field invariant"
+  | .ok k =>
+      check (k.inDtype0 == .bf16 && k.outDtype0 == .bf16 && k.rank0 == 1)
+        "CLI insert recomputes the derived search columns from sig"
   | .error e => throw <| IO.userError s!"FAIL: lying row unexpectedly refused: {e}"
+  -- the derived columns may be omitted altogether
+  let omitted := Lean.Json.mkObj (lyingRow.getObj?.toOption.map (·.toList.filter fun (k, _) =>
+    k != "inDtype0" && k != "outDtype0" && k != "rank0") |>.getD [])
+  match rowOfJson Kernel omitted with
+  | .ok k => check (k.inDtype0 == .bf16 && k.rank0 == 1) "derived search columns may be omitted from JSON"
+  | .error e => throw <| IO.userError s!"FAIL: row without derived columns refused: {e}"
+  -- B1: an omitted defaulted field inside the nested type takes its default
+  match (Lean.Json.parse "{\"dtype\":\"bf16\",\"shape\":[]}" >>= Lean.fromJson? : Except String TensorTy) with
+  | .ok t =>
+      check (t.layout == .rowMajor && t.mem == .global && t.align == 16)
+        "TensorTy JSON may omit layout/mem/align"
+  | .error e => throw <| IO.userError s!"FAIL: defaulted TensorTy fields: {e}"
+  -- B2: the shape the fingerprint sees
+  let sigShape := (Entity.columns Kernel).find? (·.name == "sig") |>.bind (·.shape)
+  check (sigShape.isSome && (sigShape.getD "").startsWith "KernelSig{vars:[String],ins:[TensorTy{dtype:<f64|")
+    s!"sig column carries the KernelSig shape, got {sigShape}"
+  check (((Entity.columns Kernel).find? (·.name == "launch") |>.bind (·.shape)) ==
+      some "LaunchConfig{block:Nat,smemBytes:Nat,stages:Nat=}")
+    "launch column carries the LaunchConfig shape"
+  check (((Entity.columns Kernel).find? (·.name == "inDtype0") |>.bind (·.shape)).isNone)
+    "a closed-enum column has no shape"
   -- instantiate / constraints
   match (DimBinding.decode "K=4096,M=4096,N=4096") >>= gemm.instantiate with
   | .ok (ins, outs) =>
@@ -223,11 +248,14 @@ private def runQueries : DbM (Array Lean.Json) := do
   -- …and refuses a mis-wired edge by name
   let broken := edges.map fun e => ⟨e.id, { e.val with fromOutput := 5 }⟩
   checkD ((Prog.ofRows p nodes broken kernelOf) matches .error _) "ofRows refuses a mis-wired edge"
-  -- the cross-field gap on update: a new sig, stale search columns, accepted
+  -- update of sig alone: the derived search columns follow it (B3 closes §3.2)
   let some rms := kernels.find? (·.val.name.raw == "rmsnorm-triton-sm80-bf16") | throw (.sqlite "FAIL: no rmsnorm")
   let some gemm := kernels.find? (·.val.name.raw == "gemm-cutlass-sm90-bf16") | throw (.sqlite "FAIL: no gemm")
   let updated ← update gemm { gemm.val with sig := rms.val.sig }
-  checkD (!updated.val.searchColumnsAgree) "update of sig alone leaves the search columns stale (§3.2)"
+  let some reread := (← fetchAll Kernel).find? (·.id == gemm.id) | throw (.sqlite "FAIL: updated gemm vanished")
+  checkD (reread.val.inDtype0 == rms.val.sig.inDtype0 && reread.val.rank0 == rms.val.sig.rank0
+    && reread.val.outDtype0 == rms.val.sig.outDtype0)
+    "update of sig alone recomputes the derived search columns"
   discard <| update updated gemm.val
   -- the plans, verbatim, for the README
   discard <| candidates .gemm .sm90 .bf16
@@ -242,10 +270,21 @@ def main : IO UInt32 := do
   IO.println "kernels log — the three headline plans:"
   for entry in log.reverse do
     IO.println s!"  {(entry.getObjValAs? String "detail").toOption.getD "?"}"
-  -- data persists across reopen; the opaque column decodes on the way back
+  -- data persists across reopen; the JSON column decodes on the way back,
+  -- and decoding checked every derived column against sig
   let n ← expectOk (← withDb dbPath schema do
       let ks ← fetchAll Kernel
-      return ks.filter (·.val.searchColumnsAgree) |>.size) "reopen"
-  check (n == 14) "all seeded kernels decode with agreeing search columns after reopen"
+      return ks.size) "reopen"
+  check (n == 14) "all seeded kernels decode after reopen"
+  -- a raw-SQL write to a derived column is caught on the next read, by name
+  let db ← SQLite.open dbPath
+  db.exec "UPDATE kernel SET \"inDtype0\" = 'f64' WHERE name = 'gemm-cutlass-sm90-fp8'"
+  match ← withDb dbPath schema (fetchAll Kernel) with
+  | .error (.decode "kernel" "inDtype0" m) =>
+      check (m == "derived column disagrees with its source") s!"desync message, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: raw-SQL desync: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a raw-SQL desync of inDtype0 was read back"
+  db.exec "UPDATE kernel SET \"inDtype0\" = 'fp8e4m3' WHERE name = 'gemm-cutlass-sm90-fp8'"
+  discard <| expectOk (← withDb dbPath schema (fetchAll Kernel)) "restored row reads again"
   IO.println "kernels base: all tests passed"
   return 0

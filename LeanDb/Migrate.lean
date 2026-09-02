@@ -18,7 +18,13 @@ produces steps:
   surviving columns, drop, rename. A *shrunk* closed world hits the new
   CHECK during the copy and aborts the transaction — vocabulary can only
   shrink through a migration, and only when the data already conforms;
-- dropped column/table → destructive, refused unless explicitly allowed.
+- dropped column/table → destructive, refused unless explicitly allowed;
+- a JSON column whose declared *shape* changed (LEP-0003 B2): additive
+  with defaults (fields added, each with a default; constructors or
+  variants added) → `restampShape`, a step with no SQL that exists so
+  the change is journaled; anything else (a field removed or retyped, a
+  constructor renamed or removed, a nested closed world shrunk) is
+  refused by name — a typed value transformation is not yet available.
 
 Everything applies in one transaction with a foreign-key check before
 commit. `openDb` still refuses fingerprint drift; `migrate` is the one
@@ -32,6 +38,9 @@ inductive MigStep where
   | dropTable (name : String)
   /-- Rebuild `spec.name` under the new spec, copying `copyCols`. -/
   | rebuildTable (spec : TableSpec) (copyCols : List String)
+  /-- A JSON column's declared shape changed additively: no SQL, every
+      stored value still decodes; the step exists to be journaled. -/
+  | restampShape (table col : String)
   deriving Repr
 
 def MigStep.describe : MigStep → String
@@ -41,6 +50,7 @@ def MigStep.describe : MigStep → String
   | .dropTable t => s!"DROP table \"{t}\""
   | .rebuildTable spec cols =>
       s!"rebuild table \"{spec.name}\" (copying {cols.length} columns)"
+  | .restampShape t c => s!"restamp shape of \"{t}\".\"{c}\""
 
 def MigStep.destructive : MigStep → Bool
   | .dropColumn .. | .dropTable .. => true
@@ -58,6 +68,199 @@ def MigStep.sql : MigStep → List String
         s!"INSERT INTO {quoteIdent tmp} ({cols}) SELECT {cols} FROM {quoteIdent spec.name}",
         s!"DROP TABLE {quoteIdent spec.name}",
         s!"ALTER TABLE {quoteIdent tmp} RENAME TO {quoteIdent spec.name}" ]
+  | .restampShape .. => []
+
+/-! ## Shapes
+
+`JsonShape.shape` strings (grammar documented on the class) parsed back
+into a tree, so two schemas' shapes can be *compared*, not just found
+unequal. -/
+
+/-- A parsed shape. An inductive constructor's payload is `(named, fields)`:
+    a named record (object encoding), or positional (`named = false`, the
+    field names empty; array encoding), or nothing (`fields = []`). -/
+inductive Shape where
+  | prim (name : String)
+  | struct (name : String) (fields : List (String × Shape × Bool))
+  | ind (name : String) (ctors : List (String × Bool × List (String × Shape)))
+  | closed (variants : List String)
+  | list (of : Shape)
+  | option (of : Shape)
+  | pair (a b : Shape)
+  deriving Repr, Inhabited
+
+/-- Back to the canonical string (diagnostics). -/
+partial def Shape.render : Shape → String
+  | .prim n => n
+  | .struct n fs => JsonShape.struct n (fs.map fun (f, s, d) => (f, s.render, d))
+  | .ind n cs => JsonShape.inductive' n (cs.map fun (c, named, fs) =>
+      (c, if fs.isEmpty then .none
+          else if named then .named (fs.map fun (f, s) => (f, s.render))
+          else .positional (fs.map fun (_, s) => s.render)))
+  | .closed vs => JsonShape.closed vs.toArray
+  | .list s => JsonShape.list s.render
+  | .option s => JsonShape.option s.render
+  | .pair a b => JsonShape.pair a.render b.render
+
+namespace Shape
+
+private def isDelim (c : Char) : Bool :=
+  c == '{' || c == '}' || c == '(' || c == ')' || c == '<' || c == '>' ||
+  c == '[' || c == ']' || c == ',' || c == '|' || c == ':' || c == '?' || c == '='
+
+private def takeName (cs : List Char) : Except String (String × List Char) :=
+  let name := cs.takeWhile (!isDelim ·)
+  if name.isEmpty then .error s!"expected a name at {String.ofList (cs.take 12)}"
+  else .ok (String.ofList name, cs.drop name.length)
+
+private def expect (c : Char) (cs : List Char) : Except String (List Char) :=
+  match cs with
+  | d :: rest => if d == c then .ok rest else .error s!"expected '{c}', found '{d}'"
+  | [] => .error s!"expected '{c}', found end of shape"
+
+private def suffix (s : Shape) : List Char → Shape × List Char
+  | '?' :: r => suffix (.option s) r
+  | r => (s, r)
+
+private partial def variants (acc : List String) (r : List Char) :
+    Except String (List String × List Char) := do
+  let (v, r) ← takeName r
+  match r with
+  | '|' :: r => variants (acc ++ [v]) r
+  | '>' :: r => return (acc ++ [v], r)
+  | _ => throw "expected '|' or '>' in a closed world"
+
+mutual
+  private partial def parseShape (cs : List Char) : Except String (Shape × List Char) := do
+    let (base, rest) ← parseAtom cs
+    return suffix base rest
+
+  private partial def parseAtom (cs : List Char) : Except String (Shape × List Char) := do
+    match cs with
+    | '[' :: r =>
+        let (s, r) ← parseShape r
+        return (.list s, ← expect ']' r)
+    | '(' :: r =>
+        let (a, r) ← parseShape r
+        let r ← expect ',' r
+        let (b, r) ← parseShape r
+        return (.pair a b, ← expect ')' r)
+    | '<' :: r =>
+        let (vs, r) ← variants [] r
+        return (.closed vs, r)
+    | _ =>
+        let (name, r) ← takeName cs
+        match r with
+        | '{' :: '}' :: r => return (.struct name [], r)
+        | '{' :: r =>
+            let (fs, r) ← parseFields '}' [] r
+            return (.struct name fs, r)
+        | '(' :: r =>
+            let (cs, r) ← parseCtors [] r
+            return (.ind name cs, r)
+        | _ => return (.prim name, r)
+
+  /-- `f:S=,g:S` up to `close`; the `Bool` is the `=` marker. -/
+  private partial def parseFields (close : Char) (acc : List (String × Shape × Bool)) (cs : List Char) :
+      Except String (List (String × Shape × Bool) × List Char) := do
+    let (f, r) ← takeName cs
+    let r ← expect ':' r
+    let (s, r) ← parseShape r
+    let (d, r) := match r with | '=' :: r => (true, r) | r => (false, r)
+    let acc := acc ++ [(f, s, d)]
+    match r with
+    | ',' :: r => parseFields close acc r
+    | c :: r => if c == close then return (acc, r) else throw s!"expected ',' or '{close}', found '{c}'"
+    | [] => throw "unterminated field list"
+
+  private partial def parsePositional (acc : List (String × Shape)) (r : List Char) :
+      Except String (List (String × Shape) × List Char) := do
+    let (s, r) ← parseShape r
+    let acc := acc ++ [("", s)]
+    match r with
+    | ',' :: r => parsePositional acc r
+    | ']' :: r => return (acc, r)
+    | _ => throw "expected ',' or ']' in a positional payload"
+
+  private partial def parseCtors (acc : List (String × Bool × List (String × Shape))) (cs : List Char) :
+      Except String (List (String × Bool × List (String × Shape)) × List Char) := do
+    let (c, r) ← takeName cs
+    let (entry, r) ← match r with
+      | '{' :: r => do
+          let (fs, r) ← parseFields '}' [] r
+          pure ((c, true, fs.map fun (f, s, _) => (f, s)), r)
+      | '[' :: r => do
+          let (fs, r) ← parsePositional [] r
+          pure ((c, false, fs), r)
+      | r => pure ((c, true, []), r)
+    let acc := acc ++ [entry]
+    match r with
+    | '|' :: r => parseCtors acc r
+    | ')' :: r => return (acc, r)
+    | _ => throw "expected '|' or ')' after a constructor"
+end
+
+/-- Parse a `JsonShape` string. -/
+def parse (s : String) : Except String Shape := do
+  let (shape, rest) ← parseShape s.toList
+  unless rest.isEmpty do throw s!"trailing input in shape: {String.ofList rest}"
+  return shape
+
+/-- Is `new` an *additive-with-defaults* change from `old` — every value
+    encoded under `old` still decodes under `new`? `.ok` if so; otherwise
+    the first change that breaks it, named. Type names of structures and
+    inductives are informational (a rename changes no data); everything
+    that changes an encoding is a refusal. -/
+partial def additive (old new : Shape) : Except String Unit := do
+  match old, new with
+  | .prim a, .prim b =>
+      unless a == b do throw s!"type changed from `{a}` to `{b}`"
+  | .struct on ofs, .struct nn nfs =>
+      for (f, os, _) in ofs do
+        match nfs.find? (·.1 == f) with
+        | none => throw s!"field `{f}` removed from `{on}`"
+        | some (_, ns, _) => additive os ns |>.mapError fun m => s!"field `{f}` of `{on}`: {m}"
+      for (f, _, d) in nfs do
+        if (ofs.find? (·.1 == f)).isNone && !d then
+          throw s!"field `{f}` added to `{nn}` without a default"
+  | .ind on ocs, .ind _ ncs =>
+      for (c, onamed, ofs) in ocs do
+        match ncs.find? (·.1 == c) with
+        | none => throw s!"constructor `{c}` renamed/removed from `{on}`"
+        | some (_, nnamed, nfs) =>
+            unless onamed == nnamed && ofs.length == nfs.length do
+              throw s!"payload of constructor `{c}` of `{on}` changed"
+            for ((of', os), (nf, ns)) in ofs.zip nfs do
+              unless of' == nf do
+                throw s!"payload field `{of'}` of constructor `{c}` of `{on}` renamed to `{nf}`"
+              additive os ns |>.mapError fun m => s!"constructor `{c}` of `{on}`: {m}"
+  | .closed ovs, .closed nvs =>
+      for v in ovs do
+        unless nvs.contains v do
+          throw s!"variant `{v}` removed from the closed world {new.render}"
+  | .list a, .list b => additive a b |>.mapError fun m => s!"list element: {m}"
+  | .option a, .option b => additive a b
+  | a, .option b => additive a b   -- a value of `a` is a value of `a?`
+  | .pair a b, .pair c d =>
+      additive a c |>.mapError fun m => s!"first of pair: {m}"
+      additive b d |>.mapError fun m => s!"second of pair: {m}"
+  | a, b => throw s!"type changed from `{a.render}` to `{b.render}`"
+
+end Shape
+
+/-- Classify one column's shape change: `.ok ()` means restamp. -/
+private def shapeChange (table col : String) (old new : Option String) : Except String Unit := do
+  match old, new with
+  | some o, some n =>
+      let os ← Shape.parse o |>.mapError fun m =>
+        s!"table \"{table}\": stored shape of column \"{col}\" is unreadable: {m}"
+      let ns ← Shape.parse n |>.mapError fun m =>
+        s!"table \"{table}\": declared shape of column \"{col}\" is unreadable: {m}"
+      Shape.additive os ns |>.mapError fun m =>
+        s!"table \"{table}\": column \"{col}\" changed shape — {m}. Existing values \
+would not decode under the new type; a typed value transformation is not yet available, \
+so this migration is refused. Migrate by hand."
+  | _, _ => pure ()   -- a shape declared (or dropped) where there was none: nothing to compare
 
 structure MigPlan where
   steps : List MigStep := []
@@ -82,10 +285,21 @@ def planMigration (old new : List TableSpec) : Except String MigPlan := do
           (oldSpec.columns.find? (·.name == c.name)).isNone
         let dropped := oldSpec.columns.toList.filter fun c =>
           (spec.columns.find? (·.name == c.name)).isNone
+        -- shape changes: additive → restamp, anything else → refused by name
+        let reshaped := spec.columns.toList.filter fun c =>
+          match oldSpec.columns.find? (·.name == c.name) with
+          | some o => o.shape != c.shape
+          | none => false
+        for c in reshaped do
+          if let some o := oldSpec.columns.find? (·.name == c.name) then
+            shapeChange spec.name c.name o.shape c.shape
+        -- DDL-level changes, the shape aside
         let changed := spec.columns.toList.filter fun c =>
           match oldSpec.columns.find? (·.name == c.name) with
-          | some o => o != c
+          | some o => { o with shape := c.shape } != c
           | none => false
+        steps := steps ++ (reshaped.filter fun c => !(changed.any (·.name == c.name))).map
+          fun c => .restampShape spec.name c.name
         for c in added do
           unless c.nullable || c.dflt.isSome do
             throw s!"table \"{spec.name}\": new column \"{c.name}\" is NOT NULL with no \

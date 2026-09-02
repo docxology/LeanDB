@@ -38,6 +38,38 @@ def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
       | .text => .text <$> j.getStr?
       | .real => .real <$> (j.getNum? <&> (·.toFloat))
 
+/-- A nested value type that lives in one JSON TEXT column: its JSON
+    encoding both ways plus its declared shape. Instances come from
+    `deriving LeanDb.DbJson` (see `LeanDb.Derive`), which — unlike Lean's
+    own derive — lets an omitted field with a structure default take the
+    default, so an additive change to a nested type still decodes old rows.
+    (Named `DbJson`, not `Json`: a `LeanDb.Json` would shadow `Lean.Json`
+    in every engine module that opens it.) -/
+class DbJson (α : Type) extends ToJson α, Lean.FromJson α, JsonShape α
+
+/-- The codec of a JSON column: compressed JSON in a TEXT column, decoded
+    through `validate` (a smart constructor over the whole value, so a
+    row written by an older build or by the CLI is refused the same way a
+    Lean constructor call would be). The column's `shape` is the type's
+    `JsonShape`; `columnSpec` reads it off the codec. -/
+@[reducible] def ColCodec.json (α : Type) [ToJson α] [Lean.FromJson α] [JsonShape α]
+    (validate : α → Except String α := .ok) : ColCodec α where
+  sqlType := .text
+  toCol a := .text (toJson a).compress
+  fromCol
+    | .text t => Json.parse t >>= Lean.fromJson? >>= validate
+    | c => .error s!"expected TEXT, found {c.describe}"
+  shape := some (JsonShape.shape α)
+
+/-- `fromJson?` of `key` in `json`, or `dflt ()` when the key is absent —
+    how a `deriving LeanDb.DbJson` decoder treats a field with a default.
+    An explicit `null` is a present value, decoded as such. -/
+def jsonFieldOr [Lean.FromJson α] (json : Json) (key : String) (dflt : Unit → α) :
+    Except String α :=
+  match json.getObjVal? key with
+  | .ok v => Lean.fromJson? v
+  | .error _ => .ok (dflt ())
+
 def DbError.toJson (e : DbError) : Json :=
   Json.mkObj [("ok", Json.bool false), ("code", Json.str e.code),
     ("message", Json.str e.message)]
@@ -49,6 +81,7 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
     ++ (c.fkTable.map fun fk => ("references", Json.str fk)).toList
     ++ (c.enum.map fun vs => ("enum", Json.arr (vs.map Json.str))).toList
     ++ (c.dflt.map fun v => ("default", v.toJson)).toList
+    ++ (c.shape.map fun s => ("shape", Json.str s)).toList
 
 def TableSpec.toJson (t : TableSpec) : Json :=
   Json.mkObj [("name", Json.str t.name),
@@ -73,7 +106,8 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
   -- must decode identically or migrations would see phantom diffs)
   let dflt := (j.getObjVal? "default").toOption.bind fun v =>
     (Col.fromJson partial_ v).toOption
-  return { partial_ with dflt }
+  let shape := (j.getObjVal? "shape").toOption.bind (·.getStr?.toOption)
+  return { partial_ with dflt, shape }
 
 def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
   let name ← j.getObjVal? "name" >>= (·.getStr?)
@@ -101,11 +135,16 @@ def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
   Json.mkObj <| ("id", Lean.toJson s.id.toInt64.toInt) ::
     (fields.toList.map fun (c, v) => (c.name, v.toJson))
 
+/-- The columns of `α` with whether each is derived, in declaration order. -/
+private def columnsWithDerived (α : Type) [Entity α] : Array (ColumnSpec × Bool) :=
+  (Entity.fields (α := α)).map fun f => (Entity.fieldSpec f, Entity.isDerived f)
+
 /-- Decode a full row from JSON field-by-field, then through the entity's
     codecs (and thus every smart constructor). An omitted field takes its
     declared default; without one it is `null` if the column is nullable
     and a typed error otherwise. An explicit JSON `null` is always `null`,
-    default or not. -/
+    default or not. A derived column is recomputed from its sources: it
+    may be omitted, and a supplied value is ignored. -/
 def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   let table := Entity.tableName α
   let obj ← match j with
@@ -115,7 +154,8 @@ def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
   for (name, _) in obj.toList do
     unless known.contains name do
       throw (.decode table name s!"unknown field; fields: {known.toList}")
-  let cols ← (Entity.columns α).mapM fun c =>
+  let cols ← (columnsWithDerived α).mapM fun (c, derived) =>
+    if derived then .ok .null else
     match j.getObjVal? c.name with
     | .ok v =>
         match Col.fromJson c v with
@@ -127,11 +167,12 @@ def rowOfJson (α : Type) [Entity α] (j : Json) : Except DbError α := do
         | none =>
             if c.nullable then .ok .null
             else .error (.decode table c.name "missing required field")
-  Entity.decode cols
+  Entity.decodeRecomputing cols
 
 /-- Overlay a partial JSON object onto an existing row at the column level,
     then re-decode — validation applies to the merged result. This is the
-    CLI's `update <table> <id> <partial-json>`. -/
+    CLI's `update <table> <id> <partial-json>`. Derived columns are
+    recomputed from the merged sources, never kept from the old row. -/
 def rowMergeJson (α : Type) [Entity α] (base : α) (j : Json) : Except DbError α := do
   let table := Entity.tableName α
   let obj ← match j with
@@ -141,13 +182,14 @@ def rowMergeJson (α : Type) [Entity α] (base : α) (j : Json) : Except DbError
   for (name, _) in obj.toList do
     unless known.contains name do
       throw (.decode table name s!"unknown field; fields: {known.toList}")
-  let cols ← ((Entity.columns α).zip (Entity.encode base)).mapM fun (c, old) =>
+  let cols ← ((columnsWithDerived α).zip (Entity.encode base)).mapM fun ((c, derived), old) =>
+    if derived then .ok .null else
     match j.getObjVal? c.name with
     | .ok v =>
         match Col.fromJson c v with
         | .ok col => .ok col
         | .error m => .error (.decode table c.name m)
     | .error _ => .ok old
-  Entity.decode cols
+  Entity.decodeRecomputing cols
 
 end LeanDb

@@ -29,6 +29,12 @@ LEP-0004 landed: `Pred.exists`/`Pred.forall` over a related table,
 denoted against a `Snapshot`, rendered as `EXISTS`/`NOT EXISTS`,
 covered by `approx_sound`; `selectP` takes a plan as data and `pred%`
 reifies a lambda into one. eats' `suitable` is a single query.
+
+LEP-0003 B landed: `deriving LeanDb.DbJson` honours structure defaults;
+JSON columns carry a type shape that the fingerprint, `schema_json` and
+the migration diff see (additive-with-defaults changes restamp, others
+are refused by name); `:= derived expr` columns are recomputed on write
+and checked on read. kernels' signature and search columns use them.
 Design docs: LEP-0002, the kernels/restaurants stress study, `ROADMAP.md`.
 
 ## 0.2.0 - 2026-08-25

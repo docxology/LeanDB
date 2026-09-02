@@ -33,8 +33,18 @@ class Entity (α : Type) where
   tableName : String
   /-- Field values in declaration order, id excluded. -/
   encode : α → Array Col
-  /-- Inverse of `encode` over honest data; typed failure otherwise. -/
+  /-- Inverse of `encode` over honest data; typed failure otherwise. A
+      derived column (`LeanDb.derived` in its default) is decoded AND
+      recomputed from its sources; disagreement is a `decode` error naming
+      the column — a raw-SQL write cannot desynchronize it unnoticed. -/
   decode : Array Col → Except DbError α
+  /-- Is this field derived from earlier fields? `encode` recomputes such
+      a column from its sources; JSON input may omit it. -/
+  isDerived : Field → Bool
+  /-- `decode` for a JSON boundary: derived columns are recomputed from
+      their sources rather than read, so the input may omit them or carry
+      a stale value (an `update` that changes the source). -/
+  decodeRecomputing : Array Col → Except DbError α
 
 /- Instance lookup reduces types only at reducible transparency, so a type
    stated through a class projection (`SqlOrd (Entity.fieldTy f)`,
@@ -143,8 +153,14 @@ def validateSchema (specs : List TableSpec) : Except DbError Unit := do
           throw (.schemaInvalid s!"{spec.name}.{col.name} references missing table {String.quote target}")
 
 /-- Schema fingerprint: a hash of the rendered DDL of every table, in
-    declaration order. Checked against `_leandb_meta` at open. -/
+    declaration order, followed by the declared shape of every JSON
+    column (`table.column=shape`, one per line). A schema without shapes
+    hashes exactly its DDL, as it always has. Checked against
+    `_leandb_meta` at open. -/
 def fingerprint (specs : List TableSpec) : String :=
-  toString <| hash <| String.intercalate ";\n" (specs.map (·.ddl))
+  let ddl := String.intercalate ";\n" (specs.map (·.ddl))
+  let shapes := specs.flatMap fun t => t.columns.toList.filterMap fun c =>
+    c.shape.map fun s => s!"{t.name}.{c.name}={s}"
+  toString <| hash <| if shapes.isEmpty then ddl else ddl ++ "\n" ++ String.intercalate "\n" shapes
 
 end LeanDb

@@ -5,13 +5,15 @@ import Kernels.Scalars
 A kernel is shape-polymorphic (`∀ M N K, T[M,K] → T[K,N] → T[M,N]`); a row
 cannot hold a Π-type, so it holds the *code* of one — `KernelSig` — and
 Lean interprets it (`instantiate`, `unify`, `Prog`). Every type here is
-ordinary Lean with derived JSON instances: payload-carrying sums and
-nested lists are fine because none of them is ever a bare column. The one
-column is `KernelSig` itself, stored as one compressed JSON TEXT through
-`ColCodec.via` — opaque to SQL, which is precisely what this base is
-measuring (README).
+ordinary Lean with `deriving LeanDb.DbJson` (LEP-0003 B1/B2): the same
+JSON encoding Lean's own derive produces, except that an omitted field
+with a default takes the default, plus a `JsonShape` the fingerprint and
+`migrate` can see. Payload-carrying sums and nested lists are fine
+because none of them is ever a bare column. The one column is `KernelSig`
+itself, stored as compressed JSON TEXT through `ColCodec.json` — opaque
+to SQL, which is precisely what this base is measuring (README).
 
-Invariants live in `KernelSig.make`, and the `FromJson` instance goes
+Invariants live in `KernelSig.make`, and the column codec validates
 through it, so the JSON boundary (CLI `insert`, the SQLite codec) refuses
 a malformed signature the same way the Lean constructor path does. -/
 
@@ -27,7 +29,7 @@ inductive Dim where
   | mul (k : Nat) (d : Dim)
   | add (a b : Dim)
   | div (d : Dim) (k : Nat)
-  deriving Repr, DecidableEq, Lean.ToJson, Lean.FromJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def Dim.vars : Dim → List DimVar
   | .lit _ => []
@@ -58,7 +60,7 @@ inductive Layout where
   | rowMajor | colMajor
   | strided (strides : List Dim)
   | tiled (tile : List Nat) (inner : Layout)
-  deriving Repr, DecidableEq, Lean.ToJson, Lean.FromJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def Layout.vars : Layout → List DimVar
   | .rowMajor | .colMajor => []
@@ -85,7 +87,7 @@ structure TensorTy where
   layout : Layout := .rowMajor
   mem    : MemSpace := .global
   align  : Nat := 16
-  deriving Repr, DecidableEq, Lean.ToJson, Lean.FromJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def TensorTy.rank (t : TensorTy) : Nat := t.shape.length
 
@@ -118,12 +120,14 @@ def ScalarName.make (s : String) : Except String ScalarName :=
 
 instance : Lean.ToJson ScalarName := ⟨fun v => .str v.raw⟩
 instance : Lean.FromJson ScalarName := ⟨fun j => j.getStr? >>= ScalarName.make⟩
+/-- Its JSON is a string; the shape says so. -/
+instance : LeanDb.JsonShape ScalarName := ⟨LeanDb.JsonShape.shape String⟩
 
 inductive DimConstraint where
   | divides (k : Nat) (d : Dim)
   | le (a b : Dim)
   | eq (a b : Dim)
-  deriving Repr, DecidableEq, Lean.ToJson, Lean.FromJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def DimConstraint.vars : DimConstraint → List DimVar
   | .divides _ d => d.vars
@@ -144,7 +148,7 @@ def DimConstraint.holds (env : DimVar → Option Nat) : DimConstraint → Except
 /-- The signature. A `KernelSig` that exists is well-formed: every
     variable in `ins`/`outs`/`constraints` is bound in `vars`, every
     variable in an output appears in some input (outputs are determined),
-    and there is at least one input and one output (the search columns
+    and there is at least one input and one output (the derived columns
     `inDtype0`/`outDtype0`/`rank0` are read from them). -/
 structure KernelSig where
   vars        : List DimVar
@@ -152,7 +156,7 @@ structure KernelSig where
   outs        : List TensorTy
   scalars     : List (ScalarName × DType)
   constraints : List DimConstraint
-  deriving Repr, DecidableEq, Lean.ToJson
+  deriving Repr, DecidableEq, LeanDb.DbJson
 
 def KernelSig.make (vars : List DimVar) (ins outs : List TensorTy)
     (scalars : List (ScalarName × DType) := []) (constraints : List DimConstraint := []) :
@@ -168,22 +172,31 @@ def KernelSig.make (vars : List DimVar) (ins outs : List TensorTy)
     unless inVars.contains v do throw s!"output shape variable {v.name} appears in no input"
   return { vars, ins, outs, scalars, constraints }
 
-/-- Decoding goes through `make`: JSON that names an undeclared variable
-    is refused at the boundary, whether it arrives from the CLI or from a
-    row written by an older build. -/
-instance : Lean.FromJson KernelSig where
-  fromJson? j := do
-    let vars ← j.getObjValAs? (List DimVar) "vars"
-    let ins ← j.getObjValAs? (List TensorTy) "ins"
-    let outs ← j.getObjValAs? (List TensorTy) "outs"
-    let scalars ← j.getObjValAs? (List (ScalarName × DType)) "scalars"
-    let constraints ← j.getObjValAs? (List DimConstraint) "constraints"
-    KernelSig.make vars ins outs scalars constraints
+/-- `make` over an already-built value: what the column codec validates
+    through, so JSON that names an undeclared variable is refused at the
+    boundary, whether it arrives from the CLI or from a row written by an
+    older build. -/
+def KernelSig.validate (s : KernelSig) : Except String KernelSig :=
+  KernelSig.make s.vars s.ins s.outs s.scalars s.constraints
 
-/-- The one nested column: compressed JSON TEXT. SQL sees a string. -/
-instance : ColCodec KernelSig :=
-  ColCodec.via (fun s => (Lean.toJson s).compress)
-               (fun t => Lean.Json.parse t >>= Lean.fromJson?)
+/-- The one nested column: compressed JSON TEXT with a declared shape.
+    SQL sees a string; the fingerprint and `migrate` see the shape. -/
+instance : ColCodec KernelSig := ColCodec.json KernelSig KernelSig.validate
+
+/-! The facts the derived search columns carry (`Kernel.inDtype0`,
+`Kernel.outDtype0`, `Kernel.rank0`). Total functions: `make` guarantees an
+input and an output exist, so the fallback arms are unreachable for a
+signature that exists — they are there because a structure default must
+be total, not because a kernel can have no inputs. -/
+
+def KernelSig.inDtype0 (s : KernelSig) : DType :=
+  match s.ins with | t :: _ => t.dtype | [] => .f32
+
+def KernelSig.outDtype0 (s : KernelSig) : DType :=
+  match s.outs with | t :: _ => t.dtype | [] => .f32
+
+def KernelSig.rank0 (s : KernelSig) : Nat :=
+  match s.ins with | t :: _ => t.rank | [] => 0
 
 def KernelSig.describe (s : KernelSig) : String :=
   let ins := String.intercalate ", " (s.ins.map TensorTy.describe)

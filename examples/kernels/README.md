@@ -1,13 +1,14 @@
 # kernels — GPU kernels, typed signatures, programs, per-SKU benches
 
 The base from `proposals/stress-domains-kernels-restaurants.md` §1, built
-against the engine as it is (ROADMAP R2). Its job is to make the
-nested-values decision concrete: `KernelSig` lives in **one opaque JSON
-column**, the common filters go through **denormalized search columns**,
-and everything that looks *inside* a signature — instantiation,
-unification, composition into `Prog ins outs` — is Lean. `Bench.sku` is
-gpumarket's `Gpu`: the first cross-base type reuse, and its datasheet
-(`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
+against the engine as it is (ROADMAP R2), then moved onto LEP-0003 stage
+B as it landed. Its job is to make the nested-values decision concrete:
+`KernelSig` lives in **one JSON column with a declared shape**, the
+common filters go through **derived search columns** the engine
+recomputes and checks, and everything that looks *inside* a signature —
+instantiation, unification, composition into `Prog ins outs` — is Lean.
+`Bench.sku` is gpumarket's `Gpu`: the first cross-base type reuse, and
+its datasheet (`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
 
 ```
 Kernels/Enums.lean     DType OpKind Lang Arch MemSpace License; Arch.supports (@[db]), Arch.ofGpu
@@ -35,15 +36,18 @@ about gpumarket's own `defaultTargets` needed changing.
 
 ## What is typed where
 
-- **Row layer.** `Kernel.sig : KernelSig` is `ColCodec.via` through
-  `Lean.toJson`/`Lean.fromJson?` — one `TEXT` column. The `FromJson`
-  instance goes through `KernelSig.make`, so a signature that names an
-  undeclared variable, or an output variable no input binds, is refused
-  by the SQLite codec and by the CLI's `insert` alike (transcript:
-  `kernel.sig: shape variable K is used but not declared in vars`,
-  exit 2). `DimBinding` is canonical TEXT (`K=4096,M=4096,N=4096`, sorted,
-  no duplicates), so equality pushes as `binding IS ?` and the same
-  binding typed in any order matches.
+- **Row layer.** `Kernel.sig : KernelSig` is `ColCodec.json KernelSig
+  KernelSig.validate` — one `TEXT` column of compressed JSON whose
+  *shape* (`JsonShape`, from `deriving LeanDb.DbJson`) is in the schema
+  and the fingerprint. The codec validates through `KernelSig.make`, so a
+  signature that names an undeclared variable, or an output variable no
+  input binds, is refused by the SQLite codec and by the CLI's `insert`
+  alike (transcript: `kernel.sig: shape variable K is used but not
+  declared in vars`, exit 2). `inDtype0`/`outDtype0`/`rank0` are
+  `derived sig.…` fields: the engine recomputes them on every write and
+  checks them on every read. `DimBinding` is canonical TEXT
+  (`K=4096,M=4096,N=4096`, sorted, no duplicates), so equality pushes as
+  `binding IS ?` and the same binding typed in any order matches.
 - **Program layer.** `Prog : List TensorTy → List TensorTy → Type` with
   `kernel` (a `Stored Kernel`, a binding, and a proof that the signature
   instantiates to the node's edge types), `id`, `seq`, `par`, `swap`,
@@ -67,7 +71,10 @@ about gpumarket's own `defaultTargets` needed changing.
 ## Evidence for LEP-0003: what the opaque column could not do
 
 Everything below was measured on this base (`set_option leandb.explain
-true`, `kernels log`); residual counts are from the tactic.
+true`, `kernels log`); residual counts are from the tactic. The first
+three paragraphs are the record as it was measured against the R2
+engine; **"What stage B changed"** at the end of the section says which
+of it no longer holds.
 
 **Predicates I wanted over `sig` and could not push.** Each is one
 `select [Kernel]` conjunct that reads the JSON column; each is `residual
@@ -135,13 +142,14 @@ nothing; the flattened form loses only the field grouping in row JSON,
 which a derive can keep (`launch_block`, or a nested object on output).
 
 **Which encoding to derive, for which fields.**
-- *`@[dbJson]` for `KernelSig`* — recursive, variable-length, and only
-  ever consumed whole by Lean; nothing else fits. Two additions the base
-  shows are necessary: the fingerprint must cover the derived codec's
-  *type shape* so `migrate` sees a `TensorTy` change as a rebuild (or at
-  least a note), and the search columns should be *declared projections*
-  of the JSON field (`inDtype0 := sig.ins[0].dtype`) that `decode`
-  recomputes or checks, so `update` and the CLI cannot desynchronize them.
+- *`deriving LeanDb.DbJson` for `KernelSig`* (the `@[dbJson]` this base
+  first asked for) — recursive, variable-length, and only ever consumed
+  whole by Lean; nothing else fits. Two additions the base showed were
+  necessary, both landed as stage B: the fingerprint covers the derived
+  codec's *type shape* so `migrate` sees a `TensorTy` change, and the
+  search columns are *declared projections* of the JSON field
+  (`inDtype0 := derived sig.inDtype0`) that `decode` checks and `encode`
+  recomputes, so `update` and the CLI cannot desynchronize them.
 - *Inline flatten for `LaunchConfig` and `NumericProps`* — small, fixed,
   scalar fields; full pushdown and migration visibility for free.
 - *Child tables for `sig.ins`/`sig.outs`* (`KernelInput (kernel, position,
@@ -168,3 +176,64 @@ The base keeps the accessor form because it reads as the fact it states.
 Self-joins, ordering through `Timestamp.epochSeconds` across `t0`/`t1`,
 `Option Arch` as `IS NULL OR IS ?`, and gpumarket's `Gpu` as a `CHECK`ed
 column all worked unchanged.
+
+**What stage B changed (LEP-0003 B1–B3, this base rebuilt on it).**
+
+- *B1 — `deriving LeanDb.DbJson`.* `Dim`, `Layout`, `TensorTy`,
+  `DimConstraint`, `KernelSig` and `LaunchConfig` derive it instead of
+  `Lean.ToJson`/`Lean.FromJson`. The encoding is byte-identical to Lean's
+  (the seed rows and the transcript's `sig` strings did not change), but
+  an omitted field with a structure default now takes the default:
+  `{"dtype":"bf16","shape":[]}` decodes as a `TensorTy` with
+  `layout := rowMajor`, `mem := global`, `align := 16` (test). Adding
+  `stride : Nat := 1` to `TensorTy` therefore no longer fails every old
+  row on read — which is what lets B2 call that change safe.
+- *B2 — shape.* Every JSON column carries a `shape` in `schema` and in
+  `schema_json`, and the fingerprint hashes DDL **and** shapes (a schema
+  with no JSON columns hashes exactly its DDL, so every other base's
+  fingerprint is unchanged; this base's moved from `15002238114063248552`
+  to the value in the transcript). The shape of `sig` is the whole
+  `KernelSig` type, recursively, closed enums by their variant list:
+
+  ```
+  KernelSig{vars:[String],ins:[TensorTy{dtype:<f64|f32|tf32|bf16|f16|fp8e4m3|fp8e5m2|fp4e2m1|int8|int4|int32|uint8|bool>,shape:[Dim(lit{n:Nat}|var{v:String}|mul{k:Nat,d:Dim}|add{a:Dim,b:Dim}|div{d:Dim,k:Nat})],layout:Layout(rowMajor|colMajor|strided{strides:[Dim(…)]}|tiled{tile:[Nat],inner:Layout})=,mem:<global|shared|register|constant>=,align:Nat=}],outs:[TensorTy{…}],scalars:[(String,<f64|…|bool>)],constraints:[DimConstraint(divides{k:Nat,d:Dim(…)}|le{a:Dim(…),b:Dim(…)}|eq{a:Dim(…),b:Dim(…)})]}
+  ```
+
+  (`=` marks a field with a default; the transcript has it unabridged.)
+  So the three "what `migrate` cannot see" cases of the record are now:
+  add `stride : Nat := 1` to `TensorTy` → `version` says `in_sync:false`,
+  `migrate status` plans `restamp shape of "kernel"."sig"` (no SQL — the
+  step exists to be journaled), `migrate apply` restamps and every old
+  row decodes; remove a field → refused: `column "sig" changed shape —
+  field `align` removed from `TensorTy` … a typed value transformation
+  is not yet available`; rename a `Layout` constructor → refused naming
+  `constructor `tiled` renamed/removed from `Layout``; shrink `DType`
+  → refused naming the variant. The engine tests (`Tests.lean`, `Lep3`)
+  pin each of these on two `TableSpec`s that differ only in one
+  column's shape, plus the restamp end to end (journaled, fingerprint
+  moved, the old code refused at open with exit 4).
+- *B3 — derived columns.* `inDtype0 := derived sig.inDtype0`,
+  `outDtype0 := derived sig.outDtype0`, `rank0 := derived sig.rank0`.
+  `Kernel.make` no longer fills them and `Kernel.searchColumnsAgree` is
+  gone, as is `kernelInfo`'s `search_columns_agree` — there is nothing
+  left to check in Lean: `encode` recomputes the three from `sig` (the
+  transcript's `lying-columns` insert is stored with `bf16`/`bf16`/1,
+  whatever the JSON said; JSON may omit them), `decode` compares the
+  stored value with the recomputation and fails with
+  `decode` naming the column if they differ. The tests' "update of `sig`
+  alone leaves the search columns stale" became "update of `sig` alone
+  recomputes them", and a raw `UPDATE kernel SET "inDtype0"='f64'` makes
+  the next `fetchAll Kernel` fail with `kernel.inDtype0: derived column
+  disagrees with its source`. Lean does not allow attributes on structure
+  fields, so the mark is the `derived` wrapper in the default rather than
+  the `@[derived]` the LEP wrote.
+
+**What still stands.** Every per-input question in the first paragraph
+— "exactly two inputs", "any input column-major", per-input rank — is
+still residual: a derived column carries one fact about the *first*
+input, and a fixed set of columns still cannot describe a list. That is
+stage D's (child tables, after LEP-0004). `rows --eq` still cannot look
+inside `sig` or `launch`; `smemBytes ≤ 100000` is still residual until
+stage C flattens `LaunchConfig`; `fuses` is still canonical TEXT until
+stage A's `EnumSet`. And a *refused* shape change is refused, not
+migrated: typed value transformations are a later LEP.

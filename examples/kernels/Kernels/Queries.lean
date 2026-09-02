@@ -216,8 +216,9 @@ def program (n : ProgramName) : DbM Json := do
         ("prog", sp.toJson p.val.sku (sp.2.2.estimate lookup))]
 
 open Lean (Json) in
-/-- One kernel, with its signature pretty-printed and the search columns
-    checked against it — the cross-field invariant made visible. -/
+/-- One kernel, with its signature pretty-printed. The search columns are
+    derived: a row that reached this point has them agreeing with `sig`,
+    because `decode` refused it otherwise — there is nothing to check here. -/
 def kernelInfo (n : KernelName) : DbM Json := do
   let some k := (← select [Kernel] (fun c => c.val.name == n))[0]?
     | throw (.notFound "kernel" 0)
@@ -228,6 +229,8 @@ def kernelInfo (n : KernelName) : DbM Json := do
     ("sig", Json.str k.val.sig.describe),
     ("launch", Lean.toJson k.val.launch),
     ("fuses", Json.str k.val.fuses.encode),
-    ("search_columns_agree", Json.bool k.val.searchColumnsAgree)]
+    ("inDtype0", Json.str (ClosedEnum.encodeName k.val.inDtype0)),
+    ("outDtype0", Json.str (ClosedEnum.encodeName k.val.outDtype0)),
+    ("rank0", Lean.toJson k.val.rank0)]
 
 end Kernels

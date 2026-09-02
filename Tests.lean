@@ -1212,6 +1212,274 @@ private def testImportNotCarried : IO Unit := do
 
 end Importer
 
+/-! ## LEP-0003 B: JSON columns with a declared shape, derived columns -/
+
+namespace Lep3
+
+inductive Kind where
+  | a | b
+  deriving Repr, DecidableEq, LeanDb.ClosedEnum, Lean.ToJson, Lean.FromJson
+
+/-- Recursive, named payloads. -/
+inductive Tree where
+  | leaf
+  | node (l : Tree) (v : Nat) (r : Tree)
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+/-- A positional payload (anonymous binders → array encoding). -/
+inductive Seg where
+  | dot
+  | seg : Nat → Nat → Seg
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+structure Point where
+  x : Nat
+  y : Nat := 0
+  kind : Kind := .a
+  tag : Option String := none
+  path : List Tree := []
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+/-- `Point` plus a defaulted field: additive. -/
+structure Widened where
+  x : Nat
+  y : Nat := 0
+  kind : Kind := .a
+  tag : Option String := none
+  path : List Tree := []
+  stride : Nat := 1
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+/-- `Point` minus `y`: not additive. -/
+structure Narrowed where
+  x : Nat
+  kind : Kind := .a
+  tag : Option String := none
+  path : List Tree := []
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+/-- A nested default that depends on an earlier field. -/
+structure Dep where
+  a : Nat
+  b : Nat := a + 1
+  deriving Repr, DecidableEq, LeanDb.DbJson
+
+instance : ColCodec Point :=
+  ColCodec.json Point fun p => if p.x > 1000 then .error "x too large" else .ok p
+
+structure Gadget where
+  name : String
+  shape : Point
+  extra : Option Point
+  deriving Repr, LeanDb.Entity
+
+/-- `total` is derived: recomputed on write, checked on read. -/
+structure LineItem where
+  qty : Nat
+  price : Nat
+  total : Nat := derived (qty * price)
+  deriving Repr, LeanDb.Entity
+
+private def pj (s : String) : IO Lean.Json :=
+  match Lean.Json.parse s with
+  | .ok j => pure j
+  | .error e => throw <| IO.userError s!"FAIL: bad test JSON: {e}"
+
+private def treeShape := "Tree(leaf|node{l:Tree,v:Nat,r:Tree})"
+private def pointShape := s!"Point\{x:Nat,y:Nat=,kind:<a|b>=,tag:String?=,path:[{treeShape}]=}"
+
+private def testDbJson : IO Unit := do
+  -- Lean's encoding, byte for byte: objects with sorted keys, tagged constructors
+  let p : Point := { x := 1, path := [.node .leaf 2 .leaf] }
+  check ((Lean.toJson p).compress ==
+      "{\"kind\":\"a\",\"path\":[{\"node\":{\"l\":\"leaf\",\"r\":\"leaf\",\"v\":2}}],\"tag\":null,\"x\":1,\"y\":0}")
+    s!"DbJson encodes like Lean's derive, got {(Lean.toJson p).compress}"
+  check ((Lean.toJson (Seg.seg 1 2)).compress == "{\"seg\":[1,2]}") "positional payload is an array"
+  check ((Lean.toJson Seg.dot).compress == "\"dot\"") "payload-free constructor is a string"
+  -- round trips, recursion included
+  let t : Tree := .node (.node .leaf 1 .leaf) 2 (.node .leaf 3 (.node .leaf 4 .leaf))
+  check ((Lean.fromJson? (Lean.toJson t) : Except String Tree).toOption == some t) "recursive round trip"
+  check ((Lean.fromJson? (Lean.toJson (Seg.seg 7 8)) : Except String Seg).toOption == some (.seg 7 8)) "positional round trip"
+  check ((Lean.fromJson? (Lean.toJson p) : Except String Point).toOption == some p) "structure round trip"
+  -- the point of B1: an omitted field with a default takes the default
+  check ((Lean.fromJson? (← pj "{\"x\":3}") : Except String Point).toOption ==
+      some { x := 3, y := 0, kind := .a, tag := none, path := [] })
+    "omitted defaulted fields take their defaults"
+  check ((Lean.fromJson? (← pj "{\"x\":3,\"y\":9,\"kind\":\"b\",\"tag\":\"t\"}") : Except String Point).toOption ==
+      some { x := 3, y := 9, kind := .b, tag := some "t", path := [] })
+    "supplied fields override defaults"
+  check ((Lean.fromJson? (← pj "{\"a\":3}") : Except String Dep).toOption == some { a := 3, b := 4 })
+    "a nested default may depend on an earlier field"
+  -- a missing field WITHOUT a default is still an error, named like Lean names it
+  match (Lean.fromJson? (← pj "{\"y\":1}") : Except String Point) with
+  | .error m => check ((m.splitOn "Lep3.Point.x").length > 1) s!"missing required field named, got {m}"
+  | .ok _ => throw <| IO.userError "FAIL: missing required field accepted"
+  match (Lean.fromJson? (← pj "{\"nope\":1}") : Except String Tree) with
+  | .error _ => pure ()
+  | .ok _ => throw <| IO.userError "FAIL: unknown constructor accepted"
+  -- shapes: canonical, deterministic, closed enums by variant list
+  check (JsonShape.shape Tree == treeShape) s!"Tree shape, got {JsonShape.shape Tree}"
+  check (JsonShape.shape Seg == "Seg(dot|seg[Nat,Nat])") s!"Seg shape, got {JsonShape.shape Seg}"
+  check (JsonShape.shape Point == pointShape) s!"Point shape, got {JsonShape.shape Point}"
+  check (JsonShape.shape Dep == "Dep{a:Nat,b:Nat=}") s!"Dep shape, got {JsonShape.shape Dep}"
+  check (JsonShape.shape (List (Option (Nat × String))) == "[(Nat,String)?]") "container shapes"
+  -- the codec: TEXT, compressed JSON, validated
+  check ((fromCol (toCol p) : Except String Point).toOption == some p) "ColCodec.json round trip"
+  check ((toCol p) matches Col.text _) "ColCodec.json stores TEXT"
+  check ((fromCol (toCol ({ x := 2000 } : Point)) : Except String Point) matches .error _)
+    "ColCodec.json decodes through the validator"
+
+private def testShapedColumns : IO Unit := do
+  let cols := Entity.columns Gadget
+  check (cols.map (·.shape) == #[none, some pointShape, some pointShape])
+    s!"JSON columns carry their shape (Option lifts it), scalars none; got {repr (cols.map (·.shape))}"
+  check (cols.map (·.sqlType) == #[.text, .text, .text]) "JSON columns are TEXT"
+  check ((cols.getD 2 default).nullable) "Option JSON column is nullable"
+  -- DDL does not mention the shape; the fingerprint does
+  let ddl := (Entity.spec Gadget).ddl
+  check (ddl == "CREATE TABLE IF NOT EXISTS \"gadget\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL, \"shape\" TEXT NOT NULL, \"extra\" TEXT)")
+    s!"shape is not DDL, got {ddl}"
+  let shapeless : TableSpec := ⟨"gadget", cols.map fun c => { c with shape := none }⟩
+  check (fingerprint [shapeless] == toString (hash shapeless.ddl))
+    "a shape-less schema fingerprints exactly its DDL, as before B2"
+  check (fingerprint [Entity.spec Author] == toString (hash (Entity.spec Author).ddl))
+    "pre-existing schemas are unchanged by B2"
+  check (fingerprint [Entity.spec Gadget] != fingerprint [shapeless])
+    "the shape is part of the fingerprint"
+  -- schema_json carries the shape and round-trips it byte for byte
+  for c in cols do
+    check ((ColumnSpec.fromJson? c.toJson).toOption == some c) s!"ColumnSpec JSON round trip for {c.name}"
+  check ((specsFromJson? (specsToJson [Entity.spec Gadget])).toOption == some [Entity.spec Gadget])
+    "schema JSON round trip with shapes"
+  check (((Entity.spec Gadget).toJson.compress.splitOn "\"shape\":\"Point{").length == 3)
+    "schema JSON shows the shape on both JSON columns"
+
+private def reshaped (shape : String) : TableSpec :=
+  ⟨"gadget", (Entity.columns Gadget).map fun c =>
+    if c.name == "shape" then { c with shape := some shape } else c⟩
+
+private def shapeDbPath : System.FilePath := ".lake" / "leandb_test_shape.sqlite"
+
+private def testShapeMigration : IO Unit := do
+  let old := Entity.spec Gadget
+  -- additive with defaults: a restamp step, no SQL
+  match planMigration [old] [reshaped (JsonShape.shape Widened)] with
+  | .ok plan =>
+      check (plan.steps.map (·.describe) == ["restamp shape of \"gadget\".\"shape\""])
+        s!"field added with a default → restamp, got {plan.steps.map (·.describe)}"
+      check (plan.steps.all fun s => s.sql.isEmpty && !s.destructive) "restamp has no SQL and is not destructive"
+  | .error e => throw <| IO.userError s!"FAIL: additive shape change refused: {e}"
+  -- constructor added, variant added: still additive
+  match planMigration [old] [reshaped (pointShape.replace "node{l:Tree,v:Nat,r:Tree})" "node{l:Tree,v:Nat,r:Tree}|twig)")] with
+  | .ok plan => check (plan.steps.length == 1) "constructor added → restamp"
+  | .error e => throw <| IO.userError s!"FAIL: added constructor refused: {e}"
+  match planMigration [old] [reshaped (pointShape.replace "<a|b>" "<a|b|c>")] with
+  | .ok plan => check (plan.steps.length == 1) "variant added → restamp"
+  | .error e => throw <| IO.userError s!"FAIL: added variant refused: {e}"
+  -- a field removed: refused, naming table, column and field
+  match planMigration [old] [reshaped (JsonShape.shape Narrowed)] with
+  | .ok _ => throw <| IO.userError "FAIL: field removal was not refused"
+  | .error e =>
+      check ((e.splitOn "field `y` removed from `Point`").length == 2 &&
+             (e.splitOn "\"gadget\"").length == 2 && (e.splitOn "\"shape\"").length == 2 &&
+             (e.splitOn "typed value transformation").length == 2)
+        s!"refusal names the field, got {e}"
+  -- a field added WITHOUT a default: refused
+  match planMigration [old] [reshaped (pointShape.replace "x:Nat," "x:Nat,z:Nat,")] with
+  | .ok _ => throw <| IO.userError "FAIL: undefaulted field addition was not refused"
+  | .error e =>
+      check ((e.splitOn "field `z` added to `Point` without a default").length == 2)
+        s!"refusal names the undefaulted field, got {e}"
+  -- a constructor renamed inside a nested type: refused
+  match planMigration [old] [reshaped (pointShape.replace "node{" "branch{")] with
+  | .ok _ => throw <| IO.userError "FAIL: constructor rename was not refused"
+  | .error e =>
+      check ((e.splitOn "constructor `node` renamed/removed from `Tree`").length == 2)
+        s!"refusal names the constructor, got {e}"
+  -- a nested closed world shrunk: refused
+  match planMigration [old] [reshaped (pointShape.replace "<a|b>" "<a>")] with
+  | .ok _ => throw <| IO.userError "FAIL: shrunk nested enum was not refused"
+  | .error e => check ((e.splitOn "variant `b` removed").length == 2) s!"refusal names the variant, got {e}"
+  -- a field retyped: refused
+  match planMigration [old] [reshaped (pointShape.replace "x:Nat" "x:String")] with
+  | .ok _ => throw <| IO.userError "FAIL: retyped field was not refused"
+  | .error e =>
+      check ((e.splitOn "type changed from `Nat` to `String`").length == 2)
+        s!"refusal names the type change, got {e}"
+  -- shape declared where the stored schema had none: nothing to compare, restamp
+  let unshaped : TableSpec := ⟨"gadget", (Entity.columns Gadget).map fun c => { c with shape := none }⟩
+  match planMigration [unshaped] [old] with
+  | .ok plan =>
+      check (plan.steps.length == 2 && plan.steps.all (· matches .restampShape ..))
+        "a newly declared shape restamps"
+  | .error e => throw <| IO.userError s!"FAIL: newly declared shape refused: {e}"
+  -- end to end: the restamp is journaled and moves the fingerprint; the old
+  -- code then sees a mismatch at open, the refusal leaves the file untouched
+  if ← shapeDbPath.pathExists then IO.FS.removeFile shapeDbPath
+  discard <| expectOk (← withDb shapeDbPath [old] do
+    discard <| insert Gadget ⟨"g", { x := 1 }, none⟩) "create at the Point shape"
+  let widened := reshaped (JsonShape.shape Widened)
+  let (_, report?) ← expectOk (← migrate shapeDbPath [widened] (apply := true)) "restamp migrate"
+  check ((report?.map (·.applied)).getD [] == ["restamp shape of \"gadget\".\"shape\""])
+    "restamp step applied and reported"
+  check ((report?.map (·.fingerprint)) == some (fingerprint [widened])) "fingerprint moved to the new shape"
+  expectErr (← withDb shapeDbPath [old] (pure ())) "schema_mismatch" "old shape refused at open (exit 4)"
+  discard <| expectOk (← withDb shapeDbPath [widened] (pure ())) "new shape opens"
+  let db ← SQLite.open shapeDbPath
+  let stmt ← db.prepare "SELECT steps FROM _leandb_migrations ORDER BY rowid DESC LIMIT 1"
+  discard <| stmt.step
+  check (((← stmt.columnText 0).splitOn "restamp shape").length == 2) "restamp is journaled"
+  expectErr (← migrate shapeDbPath [reshaped (JsonShape.shape Narrowed)] (apply := true)) "migrate"
+    "field removal refused on a live instance"
+  discard <| expectOk (← withDb shapeDbPath [widened] (pure ())) "refusal left the instance at the widened shape"
+
+private def itemDbPath : System.FilePath := ".lake" / "leandb_test_derived.sqlite"
+
+private def testDerivedColumns : IO Unit := do
+  check ((Entity.fields (α := LineItem)).map Entity.isDerived == #[false, false, true])
+    "the derived field is marked"
+  check ((Entity.columns LineItem).map (·.dflt) == #[none, none, none])
+    "a derived column has no reified DEFAULT"
+  -- encode recomputes; the supplied value is ignored
+  check (Entity.encode ({ qty := 2, price := 5, total := 999 } : LineItem) == #[.int 2, .int 5, .int 10])
+    "encode recomputes the derived column"
+  -- decode checks
+  check ((Entity.decode #[.int 2, .int 5, .int 10] : Except DbError LineItem).isOk) "agreeing row decodes"
+  match (Entity.decode #[.int 2, .int 5, .int 11] : Except DbError LineItem) with
+  | .error (.decode "line_item" "total" m) => check (m == "derived column disagrees with its source") s!"decode message, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: wrong error for a disagreeing derived column: {e}"
+  | .ok _ => throw <| IO.userError "FAIL: disagreeing derived column decoded"
+  -- JSON may omit it, a supplied value is ignored, a merge recomputes
+  let r1 ← expectOk (rowOfJson LineItem (← pj "{\"qty\":3,\"price\":4}")) "rowOfJson without the derived field"
+  check (r1.total == 12) "rowOfJson computes the derived field"
+  let r2 ← expectOk (rowOfJson LineItem (← pj "{\"qty\":3,\"price\":4,\"total\":7}")) "rowOfJson with a lying derived field"
+  check (r2.total == 12) "rowOfJson ignores a supplied derived value"
+  let r3 ← expectOk (rowMergeJson LineItem r1 (← pj "{\"qty\":10}")) "rowMergeJson of a source"
+  check (r3.total == 40) "rowMergeJson recomputes rather than keeps the stale value"
+  -- end to end: a write through LeanDB cannot desynchronize; a raw write is caught on read
+  if ← itemDbPath.pathExists then IO.FS.removeFile itemDbPath
+  -- (`insert`/`update` hand back the value they were given; what the row
+  -- holds is what a read returns)
+  let stored ← expectOk (← withDb itemDbPath [Entity.spec LineItem] do
+    let s ← insert LineItem { qty := 2, price := 5, total := 0 }
+    discard <| update s { s.val with qty := 3 }
+    fetchAll LineItem) "insert + update"
+  check (stored.map (·.val.total) == #[15]) s!"stored derived value follows its sources, got {stored.map (·.val.total)}"
+  let db ← SQLite.open itemDbPath
+  db.exec "UPDATE line_item SET total = 99"
+  match ← withDb itemDbPath [Entity.spec LineItem] (fetchAll LineItem) with
+  | .error (.decode "line_item" "total" _) => pure ()
+  | .error e => throw <| IO.userError s!"FAIL: raw-SQL desync: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: raw-SQL desync of a derived column was read back"
+
+def run : IO Unit := do
+  testDbJson
+  testShapedColumns
+  testShapeMigration
+  testDerivedColumns
+
+end Lep3
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -1233,5 +1501,6 @@ def main : IO UInt32 := do
   testBlobColumn
   testUniqueConstraint
   testImportNotCarried
+  Lep3.run
   IO.println "all engine tests passed"
   return 0
