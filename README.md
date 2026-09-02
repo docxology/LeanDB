@@ -382,7 +382,11 @@ Design docs: [`plan.md`](plan.md) (interface spec),
 [`LEP-0001`](proposals/LEP-0001-database-derived-row-symbols.md)
 (database-derived row symbols for query ergonomics),
 [`LEP-0002`](proposals/LEP-0002-typed-predicate-ir.md)
-(typed predicate IR: `Field` symbols, `Pred ts`, pushdown soundness by theorem),
+(typed predicate IR: `Field` symbols, `Pred ts`, pushdown soundness by theorem — landed),
+[`LEP-0003`](proposals/LEP-0003-nested-values.md)
+(nested values: `EnumSet`, JSON columns with a declared shape, derived columns, inline flatten, child tables),
+[`LEP-0004`](proposals/LEP-0004-child-table-quantifiers.md)
+(`exists`/`forall` over a related table as one pushed `select`),
 [`claude-discussion.md`](claude-discussion.md) (original design
 discussion). Deferred, by name: MCP/HTTP serve, log replay,
 `--output-lean`, migration source-file synthesis, `--infer-enums` on

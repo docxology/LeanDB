@@ -96,12 +96,19 @@ reserved for R4.
 
 ## R4 — LEP-0003 and LEP-0004
 
-- **LEP-0003, nested values.** Which of `@[dbJson]` / inline flatten /
-  child table to derive, decided from R2's account. `EnumSet` (plan-v2 M3)
-  is the cheapest piece and may land first.
-- **LEP-0004, child-table quantifiers.** `exists`/`forall` in `Pred`,
-  rendering as `EXISTS`/`NOT EXISTS`; `suitable` becomes one `select`.
-  R1 is the acceptance test.
+Both written 2026-09-01 from R1/R2 evidence; implementation order below.
+
+- **LEP-0004, child-table quantifiers** (first — smaller, and D of
+  LEP-0003 depends on it). `exists`/`forall` in `Pred` with a `Snapshot`
+  denotation, alias-function rendering, `selectP` taking a plan as data,
+  `pred%`; `suitable` becomes one `select` rendering `NOT EXISTS`, kept
+  differential against its two-fetch form.
+- **LEP-0003, nested values**, in stages: A `EnumSet` (+ `Pred.bit`);
+  B JSON derive honouring defaults + type shape in the fingerprint and the
+  migration diff (additive-with-defaults restamps, anything else refused
+  by name) + `@[derived]` columns recomputed on write and checked on read;
+  C inline flatten; D child tables (after LEP-0004). kernels is the
+  acceptance base for A–C.
 
 ## R5 — The universe
 
