@@ -163,6 +163,96 @@ D is the largest piece and the one with the most open questions
 `Stored Kernel` or fetched on demand). This proposal names it and fixes
 its relation to the others; its own design note precedes implementation.
 
+## Design notes for C and D (2026-09-01, after A and B landed)
+
+Decisions made here so implementation does not have to.
+
+### C. Inline flatten — decisions
+
+- **`deriving LeanDb.Inline`** on a flat structure generates an `Inline`
+  instance with the `Entity` surface minus the table: `Field`, `fieldTy`,
+  `get`, `codec`, `fieldSpec`, `fields`, `encode`, `decode` (over a slice).
+  It also gets `FieldOf`. An `Inline` type is not an entity: no id, no
+  table, no `Ref` to it.
+- **The parent flattens at derive time.** `deriving LeanDb.Entity` checks
+  each field type for an `Inline` instance (synthesized during
+  elaboration). A field `launch : LaunchConfig` contributes one column per
+  inline field, named `launch_<sub>`, and one *flattened symbol per
+  column* in the parent's `Field` inductive: `Kernel.Field.launch_smemBytes`.
+  `fieldTy` is the sub-field's type, `get` composes, `codec` is the sub
+  codec, `fieldSpec` is the sub column spec under the prefixed name. Flat
+  symbols (rather than a nested path) keep `Col.here` and everything
+  downstream unchanged.
+- **Defaults.** A sub-field's own `:= default` becomes that column's
+  default. A parent-level default for the whole inline value (`launch :
+  LaunchConfig := {}`) is evaluated at derive time, like every default
+  today, and split into per-column defaults.
+- **`Option (Inline)` is refused** at derive time with a named reason:
+  "all sub-columns NULL" is ambiguous once a sub-field is itself nullable.
+  Wrap the whole value in a JSON column (B) if optionality is needed.
+- **One level only** for now: an `Inline` field inside an `Inline` type
+  is refused by name. Nesting is a later extension; nothing in the
+  flattening prevents it.
+- **JSON.** `ColumnSpec` gains `group : Option String` (the parent field
+  name). `rowJson` nests grouped columns as one object
+  (`"launch": {"smemBytes": …}`); `rowOfJson`/`rowMergeJson` accept the
+  nested object *or* the flat keys. `schema` JSON carries `group`.
+  Migrations, DDL and `rows --eq` see plain columns (`--eq
+  launch_smemBytes=…`).
+- **Pushdown.** `colOf?` learns one shape: a projection `g (f x)` where
+  `x` is a `Stored.val` component, `f` a parent field whose type is
+  `Inline`, `g` a sub-field — resolved to the flattened symbol `f_g`. The
+  `via` machinery composes on top (a sub-field that is a validated
+  newtype still unwraps).
+- **Acceptance (kernels):** `LaunchConfig` is inline; `k.val.launch.smemBytes
+  ≤ 100000` pushes with residual 0; row JSON shows `launch` nested; the
+  `NumericProps` hand-flattening is replaced by the same mechanism; every
+  other base's plans and fingerprints unchanged.
+
+### D. Child tables — decisions
+
+- **Shape.** A field `ins : List KernelInput` where `KernelInput` is
+  `Inline` becomes a generated child entity: table `kernel_ins`, columns
+  `parent : Ref Kernel` (FK), `position : Nat`, then `KernelInput`'s
+  columns (flattened as in C). The child's field symbols are the record's
+  symbols; the child *entity* is `Kernel.ins` (a generated structure with
+  an `Entity` instance), so LEP-0004 quantifiers can name it.
+- **The list is part of the value.** `Stored Kernel` carries `ins`;
+  reads reassemble children by parent id, ordered by `position`. The
+  executor fetches children for the fetched parents with one
+  engine-internal `SELECT … WHERE parent IN (?, …)` per child table
+  (SQL text inside `Db.lean`, never a `Pred`), so a select costs one extra
+  round trip per child table, not one per row.
+- **Writes are owned.** `insert` writes the parent then its children,
+  `update` replaces the children wholesale, `delete` removes them — all
+  inside the verb's transaction. The child FK is `ON DELETE CASCADE`: the
+  one cascade in the engine, justified because child rows are *part of
+  the parent's value*, not references to it. Documented as such.
+- **`Entity.specs`.** A parent with children contributes several
+  `TableSpec`s. `Entity.specs α : List TableSpec` (parent first, then
+  children); `Entity.spec` stays the parent's alone. Bases with child
+  tables list `Entity.specs`; `validateSchema` sees ordinary tables.
+- **Pushdown.** `k.val.ins.any (fun i => …)` / `.all` on a child-list
+  field reify to LEP-0004's `exists`/`forall` with `parent := Col.id`,
+  `fk := child.parent`, and the inner lambda reified over `(child ::
+  ts)`. This gives the kernel base's per-input questions in lambda
+  spelling. `ins.length == n` stays residual (an aggregate).
+- **Derived children (LEP-0005).** `ins := derived (rule.tabulate …)`
+  follows from B3 once the derive treats a child-list field like any
+  other: recompute on write (the children are rewritten), check on read.
+  That is the mechanism LEP-0005's tabulation needs and nothing more.
+- **Migrations.** Child tables are ordinary tables; adding a child-list
+  field is a `createTable`; a record field change is a column change on
+  the child table. Nothing new.
+- **Acceptance (kernels):** `sig.ins`/`sig.outs` become child lists of
+  `Kernel` (the signature keeps `vars`/`scalars`/`constraints` as JSON);
+  "every input has rank ≥ 3" and "any input is column-major" push as
+  `NOT EXISTS`/`EXISTS`; `rank0`/`inDtype0` derived from the first child;
+  `Prog.ofRows` unchanged.
+
+Order: C, then D. Each ends with the baseline replay and the release
+check.
+
 ## What is not in scope
 
 - Typed value transformations for refused shape changes.

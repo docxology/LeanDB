@@ -647,6 +647,9 @@ private def testQuantifiers : IO Unit := do
   check ((Pred.Snapshot.empty.rows Book).isEmpty && (bookSnap.rows Author).isEmpty
       && (bookSnap.rows Book).size == 3)
     "snapshot rows by table"
+  check ((bookSnap.rows Book).map (·.id.toInt64) == books.map (·.id.toInt64)
+      && (bookSnap.rows Book).map (·.val.title) == books.map (·.val.title))
+    "every added row comes back through the codec round trip"
   -- approx recurses into the body: the opaque leaf is counted and dropped,
   -- and what remains never excludes a row the plan accepts
   check (evenTitlesP.residuals == 1 && evenTitlesP.approx.residuals == 0) "residual inside a body"

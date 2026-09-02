@@ -175,13 +175,18 @@ def Col.proj : {ts : List Type} → {τ : Type} → {i : ColCodec τ} → Col ts
     encoded columns. `rows β` reads `β`'s table back through its codec; a
     row that does not decode as `β` is not a row of `β`'s table. The
     executor fills one with `fetchAll` (`Pred.snapshot`), tests build one
-    from fixtures with `add`.
+    from fixtures with `add`. The constructor is private: the only ways in
+    are `empty` and `add`, which encodes `Stored β` rows, so `rows β`'s
+    decode is the codec's round trip and cannot lose a row for honest
+    data — a hand-built snapshot cannot smuggle undecodable columns in
+    and make a `forall` vacuously true.
 
     Rows are kept encoded rather than as `Stored β` because a total
     function *of a type* cannot return a typed array without an unchecked
     cast. The price is one decode of the child table per lookup, which
     `denote` pays once per quantifier node, not once per outer row. -/
 structure Snapshot where
+  private mk ::
   tables : List (String × Array (Int64 × Array LeanDb.Col))
 
 /-- No child rows at all: every quantifier-free plan denotes the same
