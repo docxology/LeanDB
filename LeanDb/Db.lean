@@ -231,14 +231,16 @@ def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.table
   if changed == 0 then throw (.notFound table id.toInt64)
 
 /-- Rows of `α`'s table matching a pushed predicate, in id order. The
-    predicate is rendered alias-free, so only conjuncts over `α`'s own
-    columns may reach here (`Pred.forTable`); callers pass an opaque-free
+    table is aliased `t0` and every index of the predicate renders as
+    `t0` — only conjuncts over `α`'s own columns may reach here
+    (`Pred.forTable`), and a quantifier among them needs the alias to
+    correlate its subquery with the outer row. Callers pass an opaque-free
     tree (`Pred.approx`). -/
 def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts) :
     DbM (Array (Stored α)) := do
   if pred.isTrivial then return ← fetchAll α
-  let (whereSql, binds) := pred.render false
-  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} WHERE {whereSql} ORDER BY id"
+  let (whereSql, binds) := pred.render fun _ => "t0"
+  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 binds
@@ -267,7 +269,7 @@ def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
   let sel := specs.zipIdx.map fun (spec, i) =>
     String.intercalate ", " (s!"t{i}.id" :: spec.columns.toList.map fun c => s!"t{i}.{quoteId c.name}")
   let order := specs.zipIdx.map fun (_, i) => s!"t{i}.id"
-  let (whereSql, binds) := pushed.render true
+  let (whereSql, binds) := pushed.renderT
   let sql := s!"SELECT {String.intercalate ", " sel} FROM {String.intercalate ", " froms} " ++
     s!"WHERE {whereSql} ORDER BY {String.intercalate ", " order}"
   -- One label per selected column, in the same order as `sel` above, so a
@@ -288,6 +290,20 @@ def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
     liftExcept (RowsOf.decodeFrom (ts := ts) cols 0)
   return finishRows ts rows where' sortBy
 
+/-- Run a pushed plan and a decider: the opaque-free `pushed` ships to
+    SQL — the joined executor when it relates tables, per-table fetches
+    otherwise — and `where'` is applied to what comes back. The one path
+    under both `select` and `selectP`, so they cannot diverge. -/
+private def runPlanned (ts : List Type) [RowsOf ts] (pushed : Pred ts)
+    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : DbM (Array (Rows ts)) :=
+  if pushed.hasJoin then
+    selectJoined ts pushed where' sortBy
+  else
+    selectSpec ts (plannedSource pushed) where' sortBy
+
+private def selectDetail (ts : List Type) [RowsOf ts] (p : Pred ts) : String :=
+  s!"{String.intercalate "×" ((RowsOf.specs ts).map (·.name))} | {p.describe}"
+
 /-- The typed select. The trailing `plan` is reified from `where'` by the
     `leandb_plan` tactic at each call site as a `Pred ts`; what ships to
     SQL is its pushable projection `approx` (`Pred.approx_sound`: it never
@@ -299,13 +315,35 @@ def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve)
     (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
-  let names := String.intercalate "×" ((RowsOf.specs ts).map (·.name))
-  let pushed := plan.plan.approx
-  withLog "select" s!"{names} | {plan.plan.describe}" (·.size) <|
-    if pushed.hasJoin then
-      selectJoined ts pushed where' sortBy
-    else
-      selectSpec ts (plannedSource pushed) where' sortBy
+  withLog "select" (selectDetail ts plan.plan) (·.size) <|
+    runPlanned ts plan.plan.approx where' sortBy
+
+/-- The snapshot a plan quantifies over (LEP-0004): every child table it
+    mentions, whole, via `fetchAll`. One fetch per quantified child per
+    select — bounded by the child table, not by the product; a few hundred
+    rows in these bases. Narrowing it to the children of the fetched
+    parents (`IN (…)`) is a later optimization. -/
+def Pred.snapshot {ts : List Type} (p : Pred ts) : DbM Pred.Snapshot :=
+  go p.children .empty
+where
+  go : List ((β : Type) × Entity β) → Pred.Snapshot → DbM Pred.Snapshot
+    | [], snap => pure snap
+    | ⟨β, ent⟩ :: rest, snap => do
+        let rows ← @fetchAll β ent
+        go rest (@Pred.Snapshot.add snap β ent rows)
+
+/-- The typed select over a plan given as data (LEP-0004) — the only way
+    to write a plan that quantifies over a child table, since a lambda over
+    `Rows ts` cannot mention rows it was not given. Same executor as
+    `select` (`runPlanned`), same log line; the decider is the plan's own
+    denotation over a snapshot of its child tables, so the
+    lambda-always-runs invariant holds literally: `finishRows` filters by
+    `p.denote`, and pushdown (`p.approx`) can only narrow the fetch. -/
+def selectP (ts : List Type) [RowsOf ts] (p : Pred ts)
+    (sortBy : SortBy (Rows ts) := .preserve) : DbM (Array (Rows ts)) :=
+  withLog "select" (selectDetail ts p) (·.size) do
+    let snap ← p.snapshot
+    runPlanned ts p.approx (p.denote snap) sortBy
 
 /-- `select` with pushdown disabled — the executable reference, for
     differential testing against the planned path. -/

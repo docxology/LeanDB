@@ -45,6 +45,9 @@ carries its own meaning (`denote`), so `approx` drops it soundly and the
 lambda decides it. The tactic never fails: on any surprise the whole
 predicate becomes one opaque leaf (no narrowing, `residuals = 1`) —
 correct, just unoptimized.
+
+The same reflection is exposed as a term elaborator, `pred%`, for plans
+written as data (`selectP`, quantifier bodies — LEP-0004).
 -/
 
 namespace LeanDb.PlanElab
@@ -486,12 +489,36 @@ private def fallbackPlan (goalTy : Expr) : MetaM Expr := do
     throwError "leandb_plan: goal is not PlanFor"
   return mkApp2 (mkConst ``Pred.opaque) (goalTy.getArg! 0) (goalTy.getArg! 1)
 
+/-- Reflect, or fall back; log when `leandb.explain` is set. -/
+private def planFor (goalTy : Expr) : MetaM Expr := do
+  let plan ← try reflectPlan goalTy catch _ => fallbackPlan goalTy
+  if leandb.explain.get (← getOptions) then
+    logInfo m!"leandb plan: {← instantiateMVars plan}"
+  return plan
+
 elab "leandb_plan" : tactic => do
   let g ← getMainGoal
   let ty ← g.getType
-  let plan ← try reflectPlan ty catch _ => fallbackPlan ty
-  if leandb.explain.get (← getOptions) then
-    logInfo m!"leandb plan: {← instantiateMVars plan}"
-  g.assign (← mkExpectedTypeHint plan ty)
+  g.assign (← mkExpectedTypeHint (← planFor ty) ty)
+
+/-- `pred% [T1, T2] fun (a, b) => … : Pred [T1, T2]` — the plan
+    `leandb_plan` would reify for that lambda, as a term. This is how a
+    plan is written as data: for `selectP`, and for the bodies of
+    `Pred.exists`/`Pred.forall` (LEP-0004), which quantify over rows no
+    lambda over the outer tables could mention. Same recognizer, same
+    fallback — a conjunct the tactic cannot translate becomes an opaque
+    leaf, and the whole predicate one on any surprise. -/
+elab "pred% " ts:term:max f:term:max : term => do
+  let listType := mkApp (mkConst ``List [.succ .zero]) (mkSort (.succ .zero))
+  let tsE ← Term.elabTermEnsuringType ts (some listType)
+  Term.synthesizeSyntheticMVarsNoPostponing
+  let tsE ← instantiateMVars tsE
+  let fTy := mkForall `r .default (mkApp (mkConst ``LeanDb.Rows) tsE) (mkConst ``Bool)
+  let fE ← Term.elabTermEnsuringType f (some fTy)
+  Term.synthesizeSyntheticMVarsNoPostponing
+  let fE ← instantiateMVars fE
+  let goalTy := mkApp2 (mkConst ``LeanDb.PlanFor) tsE fE
+  let plan ← planFor goalTy
+  mkExpectedTypeHint plan (mkApp (mkConst ``LeanDb.Pred) tsE)
 
 end LeanDb.PlanElab

@@ -2,9 +2,10 @@ import Eats
 
 /-! Tests for the eats base: seed, then assert on each query's *results*
 (never on its plan — pushdown is an optimization the reference semantics
-define away), check that wrong-world programs are rejected at compile
-time, and finally print the logged plans for `openFor` and the
-ingredient-side fetch of `suitable` so the report shows what pushed. -/
+define away), hold `suitable` (one `selectP`, LEP-0004) equal to its
+two-phase form on every `(family, diet, city)`, check that wrong-world
+programs are rejected at compile time, and finally print the logged plans
+for `openFor` and `suitable` so the report shows what pushed. -/
 
 open LeanDb Eats
 
@@ -128,15 +129,40 @@ private def runQueries : DbM Unit := do
   checkD (hist.map (·.val.price.minor) == #[1850, 1750, 1650]) "history newest first"
   checkD (hist.map (·.val.source) == #[.deliveryApp, .receipt, .menu]) "history sources"
 
+/-- LEP-0004 differential: `suitable` (one `selectP`, `NOT EXISTS`) equals
+    `suitableTwoPhase` (two fetches, set difference) on every
+    `(family, diet, city)` in the seed's closed worlds. -/
+private def suitableDifferential : DbM Unit := do
+  let key (rows : Array (Stored Dish × Stored Restaurant)) : Array (Int64 × Int64) :=
+    rows.map fun (d, r) => (d.id.toInt64, r.id.toInt64)
+  let mut nonEmpty := 0
+  for fam in ClosedEnum.all (α := DishFamily) do
+    for diet in ClosedEnum.all (α := Diet) do
+      for city in ClosedEnum.all (α := City) do
+        let one ← suitable fam diet city
+        let two ← suitableTwoPhase fam diet city
+        checkD (key one == key two)
+          s!"suitable {repr fam} {repr diet} {repr city}: one select {key one} vs two-phase {key two}"
+        if !one.isEmpty then nonEmpty := nonEmpty + 1
+  checkD (nonEmpty > 0) "differential covered non-empty answers"
+  -- the logged plan: the quantifier pushed as NOT EXISTS, nothing residual
+  let entries ← readLog 5
+  let details := entries.map fun e => (e.getObjValAs? String "detail").toOption.getD ""
+  checkD (details.any fun d => d.startsWith "dish×restaurant×canonical_dish"
+      && (d.splitOn "NOT EXISTS (SELECT 1 FROM \"dish_ingredient\" AS s0").length == 2
+      && (d.splitOn "residual conjuncts: 0").length == 2)
+    s!"suitable logs a NOT EXISTS plan with residual 0, got {details}"
+
 /-- The logged plans this base is about: `openFor` (three tables incl.
-    hours) and the ingredient-side fetch of `suitable`. Printed, not
-    asserted. -/
+    hours), `suitable` (the quantifier), and the ingredient-side fetch of
+    its two-phase form. Printed, not asserted. -/
 private def showPlans : DbM Unit := do
-  let entries ← readLog 200
+  let entries ← readLog 10000
   let mut seen : Array String := #[]
   for e in entries.reverse do
     let detail := (e.getObjValAs? String "detail").toOption.getD ""
-    if (detail.startsWith "restaurant×dish×hours" || detail.startsWith "dish_ingredient×ingredient")
+    if (detail.startsWith "restaurant×dish×hours" || detail.startsWith "dish_ingredient×ingredient"
+        || detail.startsWith "dish×restaurant×canonical_dish")
         && !seen.contains detail then
       seen := seen.push detail
   for d in seen do IO.println s!"plan: {d}"
@@ -145,6 +171,7 @@ def main : IO UInt32 := do
   vocabulary
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   expectOk (← withDb dbPath schema runQueries) "seed + queries"
+  expectOk (← withDb dbPath schema suitableDifferential) "suitable differential"
   -- results identical to the unplanned reference semantics
   let (planned, reference) ← expectOk (← withDb dbPath schema do
       let planned ← select [Restaurant, Dish, Hours] (fun (r, d, h) =>

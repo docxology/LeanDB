@@ -24,6 +24,11 @@ residual is an `opaque` leaf, `denote` gives every plan a meaning, and
 `approx_sound` proves the pushed fragment never excludes a row the lambda
 accepts. `PushPred` is gone; every base's logged plan is byte-identical.
 `rows --eq` decodes its value through the column's codec.
+
+LEP-0004 landed: `Pred.exists`/`Pred.forall` over a related table,
+denoted against a `Snapshot`, rendered as `EXISTS`/`NOT EXISTS`,
+covered by `approx_sound`; `selectP` takes a plan as data and `pred%`
+reifies a lambda into one. eats' `suitable` is a single query.
 Design docs: LEP-0002, the kernels/restaurants stress study, `ROADMAP.md`.
 
 ## 0.2.0 - 2026-08-25

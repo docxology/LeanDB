@@ -15,7 +15,7 @@ has the query that needs it.
 | R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
 | R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
-| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | next — to be written from R1/R2 evidence |
+| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done 2026-09-01; LEP-0003 B in progress |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
 ---
@@ -98,11 +98,13 @@ reserved for R4.
 
 Both written 2026-09-01 from R1/R2 evidence; implementation order below.
 
-- **LEP-0004, child-table quantifiers** (first — smaller, and D of
-  LEP-0003 depends on it). `exists`/`forall` in `Pred` with a `Snapshot`
-  denotation, alias-function rendering, `selectP` taking a plan as data,
-  `pred%`; `suitable` becomes one `select` rendering `NOT EXISTS`, kept
-  differential against its two-fetch form.
+- **LEP-0004, child-table quantifiers** — landed. `exists`/`forall` in
+  `Pred` (now an inductive family over `ts`), `Snapshot` denotation,
+  `approx_sound` extended, alias-function rendering (`describe` byte-
+  identical), `selectP` taking a plan as data, `pred%`, `Pred.all`/`any`.
+  eats' `suitable` is one `selectP` rendering nested `NOT EXISTS`, with a
+  780-combination differential against its two-fetch form. Baseline:
+  identical everywhere but the two `suitable` lines.
 - **LEP-0003, nested values**, in stages: A `EnumSet` (+ `Pred.bit`);
   B JSON derive honouring defaults + type shape in the fingerprint and the
   migration diff (additive-with-defaults restamps, anything else refused

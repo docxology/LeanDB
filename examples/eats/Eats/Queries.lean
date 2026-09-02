@@ -85,19 +85,42 @@ private def antiJoin (dishes : Array (Stored Dish × Stored Restaurant × Stored
 
 /-- "Places that serve ramen I can eat" — vegetarian, or no pork/beef.
     The question is `∀` over a child table: every ingredient row of the
-    dish is allowed by the diet or removable. `select` computes a filtered
-    product; it can find dishes that *have* an offending ingredient, never
-    dishes that have none. So this is **two fetches and a set difference
-    in Lean** — the candidates, then every offending ingredient row — and
-    it is LEP-0004's golden: with child-table quantifiers it becomes one
-    `select` rendering `NOT EXISTS`.
+    dish is allowed by the diet or removable. No lambda over the outer
+    rows can say that — it mentions rows they were not given — so the plan
+    is written as data (LEP-0004): `pred%` reifies the candidate filter
+    exactly as `select` would, `Pred.all` quantifies over `DishIngredient`
+    rows keyed to the dish, and an inner `Pred.exists` reaches the 1:1
+    `Ingredient` row (a join expressed as a quantifier, exact because the
+    key is 1:1).
 
-    Both fetches push with residual 0: on the ingredient side the join,
-    `!removable`, and `diet.allows` — the planner case-splits the captured
-    `diet` (study §3.4) and the `kind` column, and each branch folds to a
-    closed `kind IS ?` disjunction. Absence of data is not a guarantee:
-    only dishes with `ingredientsComplete` are candidates. -/
+    Everything pushes, residual 0: one `selectP`, rendering the quantifier
+    as a correlated `NOT EXISTS` subquery with the captured `diet`
+    case-split into a closed `kind IS ?` disjunction inside it (`eats log`
+    shows the plan). Absence of data is not a guarantee: only dishes with
+    `ingredientsComplete` are candidates. `suitableTwoPhase` is the same
+    question as two fetches and a set difference in Lean; the tests hold
+    the two equal on every `(family, diet, city)` in the seed. -/
 def suitable (fam : DishFamily) (diet : Diet) (city : City) :
+    DbM (Array (Stored Dish × Stored Restaurant)) := do
+  let rows ← selectP [Dish, Restaurant, CanonicalDish]
+    (.and
+      (pred% [Dish, Restaurant, CanonicalDish] fun (d, r, c) =>
+        d.val.restaurant == r.ref && d.val.canonical == c.ref
+          && c.val.family == fam && r.val.city == city
+          && d.val.available && d.val.ingredientsComplete)
+      (Pred.all (.here DishIngredient.Field.dish)
+        (Pred.exists (.here DishIngredient.Field.ingredient) .id
+          (pred% [Ingredient, DishIngredient, Dish, Restaurant, CanonicalDish]
+            fun (i, di, _, _, _) => diet.allows i.val.kind || di.val.removable))))
+    (.key fun (_, r, _) => r.val.name)
+  return rows.map fun (d, r, _) => (d, r)
+
+/-- `suitable` before LEP-0004, kept as the differential's reference:
+    the candidates, then every offending ingredient row, then the set
+    difference in Lean (`antiJoin`). Both fetches push with residual 0 —
+    on the ingredient side the join, `!removable`, and `diet.allows` via
+    the same case split — but the `∀` itself never reaches SQL. -/
+def suitableTwoPhase (fam : DishFamily) (diet : Diet) (city : City) :
     DbM (Array (Stored Dish × Stored Restaurant)) := do
   let dishes ← candidates fam city
   let offending ← select [DishIngredient, Ingredient] (fun (di, i) =>
@@ -109,10 +132,11 @@ structure AdHocDiet where
   avoid : List IngredientKind
   deriving Repr
 
-/-- The same question for an ad-hoc diet. Same two fetches; the ingredient
-    conjunct is residual *by nature* — the planner cannot emit a
-    disjunction whose length it does not know at compile time. Closed
-    profiles push; ad-hoc ones do not. -/
+/-- The same question for an ad-hoc diet, in the two-phase form: the
+    ingredient conjunct is residual *by nature* — the planner cannot emit
+    a disjunction whose length it does not know at compile time — and a
+    residual inside a quantifier body would only widen its subquery to
+    vacuous truth. Closed profiles push; ad-hoc ones do not. -/
 def suitableAdHoc (fam : DishFamily) (diet : AdHocDiet) (city : City) :
     DbM (Array (Stored Dish × Stored Restaurant)) := do
   let dishes ← candidates fam city

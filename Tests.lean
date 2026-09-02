@@ -354,7 +354,7 @@ private def opaqueParamPlan (d : Diet) : PlanFor (ts := [Ingredient]) (fun (i : 
     placeholder order, and the residual count. -/
 private def checkPlan (p : PlanFor w) (sql : String) (binds : Array Col) (residual : Nat)
     (label : String) : IO Unit :=
-  let got := (p.plan.approx.render true, p.plan.residuals)
+  let got := (p.plan.approx.renderT, p.plan.residuals)
   unless got == ((sql, binds), residual) do
     throw <| IO.userError s!"FAIL: {label}: got {repr got}"
 
@@ -459,8 +459,9 @@ the lambda it was reified from, opaque leaves included. -/
 -- `some` lifts a column to its `Option`, for col-vs-col through `some`
 #check (Pred.Col.via (Pred.Col.here Author.Field.age) some (fun _ => rfl) : Pred.Col [Author] (Option Nat) _)
 -- the theorem, elaborated
-example (p : Pred ts) (r : Rows ts) (h : p.denote r = true) : p.approx.denote r = true :=
-  Pred.approx_sound p r h
+example (snap : Pred.Snapshot) (p : Pred ts) (r : Rows ts) (h : p.denote snap r = true) :
+    p.approx.denote snap r = true :=
+  Pred.approx_sound snap p r h
 
 private def ada : Stored Author := ⟨⟨1⟩, ⟨"Ada", 36⟩⟩
 private def alan : Stored Author := ⟨⟨2⟩, ⟨"Alan", 41⟩⟩
@@ -487,42 +488,42 @@ private def testTypedPred : IO Unit := do
   -- denote agrees with the lambda
   let ageL := fun (a : Stored Author) => a.val.age ≥ 40
   for a in [ada, alan] do
-    check (ageP.denote a == ageL a) s!"ord denotes like the lambda on {a.val.name}"
+    check (ageP.denote .empty a == ageL a) s!"ord denotes like the lambda on {a.val.name}"
   let joinL := fun (r : Stored Book × Stored Author) =>
     r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating == none
   for b in [computable, notes, unrated] do
     for a in [ada, alan] do
-      check (joinP.denote (b, a) == joinL (b, a))
+      check (joinP.denote .empty (b, a) == joinL (b, a))
         s!"join denotes like the lambda on ({b.val.title}, {a.val.name})"
-  check ((joinP.denote (unrated, alan), joinP.denote (computable, alan)) == (true, false))
+  check ((joinP.denote .empty (unrated, alan), joinP.denote .empty (computable, alan)) == (true, false))
     "join denotation is not vacuous"
   let nullP : Pred [Book] := .isNull (.here Book.Field.rating)
-  check (nullP.denote notes == true && nullP.denote computable == false) "isNull denotes NULL"
-  check (nullP.neg.denote notes == false && nullP.neg.denote computable == true) "neg of isNull"
-  check (oddP.denote ada == true && oddP.denote alan == false) "opaque denotes its function"
-  check (ageP.neg.denote ada == true && ageP.neg.denote alan == false) "neg of ord is exact"
+  check (nullP.denote .empty notes == true && nullP.denote .empty computable == false) "isNull denotes NULL"
+  check (nullP.neg.denote .empty notes == false && nullP.neg.denote .empty computable == true) "neg of isNull"
+  check (oddP.denote .empty ada == true && oddP.denote .empty alan == false) "opaque denotes its function"
+  check (ageP.neg.denote .empty ada == true && ageP.neg.denote .empty alan == false) "neg of ord is exact"
   -- approx drops opaques; residuals counts them
   let mixed : Pred [Author] := .and ageP oddP
   check (mixed.residuals == 1 && mixed.hasOpaque) "one residual conjunct"
   check (mixed.approx.residuals == 0 && !mixed.approx.hasOpaque) "approx has no residual"
-  check ((mixed.approx.render true) == (ageP.render true)) "approx of (pushed ∧ opaque) is the pushed side"
-  check (((Pred.or ageP oddP).approx.render true).1 == "1") "or with an opaque side widens to true"
+  check ((mixed.approx.renderT) == (ageP.renderT)) "approx of (pushed ∧ opaque) is the pushed side"
+  check (((Pred.or ageP oddP).approx.renderT).1 == "1") "or with an opaque side widens to true"
   for a in [ada, alan] do
-    check (!(mixed.denote a) || mixed.approx.denote a) s!"approx_sound, observed on {a.val.name}"
+    check (!(mixed.denote .empty a) || mixed.approx.denote .empty a) s!"approx_sound, observed on {a.val.name}"
   -- render, pinned: these strings are what the untyped renderer produced
-  check (ageP.render true == ("t0.\"age\" >= ?", #[.int 40]))
-    s!"age render, got {repr (ageP.render true)}"
-  check (joinP.render true ==
+  check (ageP.renderT == ("t0.\"age\" >= ?", #[.int 40]))
+    s!"age render, got {repr (ageP.renderT)}"
+  check (joinP.renderT ==
       ("((t0.\"author\" IS t1.\"id\" AND t1.\"age\" >= ?) AND t0.\"rating\" IS ?)", #[.int 40, .null]))
-    s!"join render, got {repr (joinP.render true)}"
-  check (iteP.render true ==
+    s!"join render, got {repr (joinP.renderT)}"
+  check (iteP.renderT ==
       ("((t0.\"age\" < ? AND t0.\"name\" IS ?) OR (t0.\"age\" >= ? AND t0.\"age\" > ?))",
         #[.int 30, .text "x", .int 30, .int 50]))
-    s!"ite render, got {repr (iteP.render true)}"
-  check (joinP.render false ==
-      ("((\"author\" IS \"id\" AND \"age\" >= ?) AND \"rating\" IS ?)", #[.int 40, .null]))
-    s!"alias-free render, got {repr (joinP.render false)}"
-  check ((ageP.render true).1 == "t0.\"age\" >= ?" && (ageP.render false).1 == "\"age\" >= ?")
+    s!"ite render, got {repr (iteP.renderT)}"
+  check (joinP.render (fun _ => "t0") ==
+      ("((t0.\"author\" IS t0.\"id\" AND t0.\"age\" >= ?) AND t0.\"rating\" IS ?)", #[.int 40, .null]))
+    s!"single-table render aliases every index to t0, got {repr (joinP.render (fun _ => "t0"))}"
+  check ((ageP.renderT).1 == "t0.\"age\" >= ?" && (ageP.render (fun _ => "t0")).1 == "t0.\"age\" >= ?")
     "render text, pinned"
   check (mixed.describe == "pushed: t0.\"age\" >= ?, residual conjuncts: 1")
     s!"describe format, got {mixed.describe}"
@@ -530,26 +531,26 @@ private def testTypedPred : IO Unit := do
   check (joinP.hasJoin && !ageP.hasJoin) "hasJoin"
   check (joinP.tables == [0, 1] && ageP.tables == [0]) "tables"
   check (joinP.conjuncts.length == 3) "conjuncts"
-  check ((joinP.forTable 1).render false == ("\"age\" >= ?", #[.int 40]))
+  check ((joinP.forTable 1).render (fun _ => "t0") == ("t0.\"age\" >= ?", #[.int 40]))
     "forTable keeps only the conjuncts touching that table"
-  check ((joinP.forTable 0).render false == ("\"rating\" IS ?", #[.null]))
+  check ((joinP.forTable 0).render (fun _ => "t0") == ("t0.\"rating\" IS ?", #[.null]))
     "forTable 0 keeps the rating test"
   -- value/value folds at plan build
-  check ((Pred.vvOrd (ts := [Author]) (0 : Nat) .ge 1).render true == ("0", #[]))
+  check ((Pred.vvOrd (ts := [Author]) (0 : Nat) .ge 1).renderT == ("0", #[]))
     "vvOrd folds 0 ≥ 1 to ff"
-  check ((Pred.vvEq (ts := [Author]) Status.done .eq Status.done).render true == ("1", #[]))
+  check ((Pred.vvEq (ts := [Author]) Status.done .eq Status.done).renderT == ("1", #[]))
     "vvEq folds on the encoded name"
-  check ((Pred.vvEq (ts := [Author]) (none : Option Nat) .eq none).render true == ("1", #[]))
+  check ((Pred.vvEq (ts := [Author]) (none : Option Nat) .eq none).renderT == ("1", #[]))
     "vvEq is null-safe (none IS none)"
   -- through a newtype projection: same column, compared on the representation
   let priceP : Pred [Priced] := .ord (.via (.here Priced.Field.price) (·.v) (fun _ => rfl)) .le 500
-  check (priceP.render true == ("t0.\"price\" <= ?", #[.int 500]))
-    s!"via renders the underlying column, got {repr (priceP.render true)}"
-  check (priceP.denote cheap == true && priceP.denote dear == false) "via denotes through the projection"
+  check (priceP.renderT == ("t0.\"price\" <= ?", #[.int 500]))
+    s!"via renders the underlying column, got {repr (priceP.renderT)}"
+  check (priceP.denote .empty cheap == true && priceP.denote .empty dear == false) "via denotes through the projection"
 
 /-! ### Coherence of the tactic's plans
 
-`(reify where').denote r = where' r`: the plan `leandb_plan` emitted is
+`(reify where').denote .empty r = where' r`: the plan `leandb_plan` emitted is
 the lambda, row for row — pushed leaves through their encodings, opaque
 leaves through the conjunct they carry. Together with `approx_sound` this
 is the whole safety argument: what ships to SQL accepts everything the
@@ -558,7 +559,7 @@ lambda accepts. -/
 private def checkCoherent {ts : List Type} {w : Rows ts → Bool} (p : PlanFor w)
     (rows : Array (Rows ts)) (label : String) : IO Unit := do
   for r in rows do
-    check (p.plan.denote r == w r) s!"coherence: {label}"
+    check (p.plan.denote .empty r == w r) s!"coherence: {label}"
 
 private def authors : Array (Stored Author) :=
   #[ada, alan, ⟨⟨3⟩, ⟨"x", 40⟩⟩, ⟨⟨4⟩, ⟨"Grace", 29⟩⟩, ⟨⟨5⟩, ⟨"x", 51⟩⟩, ⟨⟨6⟩, ⟨"Ed", 30⟩⟩]
@@ -574,6 +575,133 @@ private def priced : Array (Stored Priced) :=
   #[cheap, dear, ⟨⟨3⟩, ⟨⟨500⟩, ⟨5, 7⟩⟩⟩, ⟨⟨4⟩, ⟨⟨700⟩, ⟨0, 5⟩⟩⟩, ⟨⟨5⟩, ⟨⟨10⟩, ⟨9, 5⟩⟩⟩]
 private def ingredients : Array (Stored Ingredient) :=
   #[⟨⟨1⟩, ⟨"pork", .meat⟩⟩, ⟨⟨2⟩, ⟨"salmon", .fish⟩⟩, ⟨⟨3⟩, ⟨"tofu", .plant⟩⟩]
+
+/-! ### Child-table quantifiers (LEP-0004)
+
+`exists`/`forall` over a related table: the relation is typed by both keys
+being `Id α`, so a quantifier over the wrong foreign key is
+unrepresentable; `denote` quantifies over a `Snapshot`; `neg` swaps them
+exactly; `approx` recurses into the body and the executor's re-check
+restores what it widened; the rendering is a correlated subquery. -/
+
+-- parent reference and child key agree on the entity: representable
+#check (Pred.forall (ts := [Author]) .id (.here Book.Field.author) .tt : Pred [Author])
+-- fk not an `Id`
+#check_failure (Pred.forall (ts := [Author]) .id (.here Book.Field.title) .tt : Pred [Author])
+-- `Id` of the wrong entity: `Book.author : Id Author` is no key onto `Book`
+#check_failure (Pred.forall (ts := [Book]) .id (.here Book.Field.author) .tt : Pred [Book])
+
+/-- Authors all of whose books are rated. -/
+private def allRatedP : Pred [Author] :=
+  Pred.all (.here Book.Field.author) (.isNotNull (.here Book.Field.rating))
+/-- Authors with an unrated book. -/
+private def unratedP : Pred [Author] :=
+  Pred.any (.here Book.Field.author) (.isNull (.here Book.Field.rating))
+/-- Authors all of whose books have an even-length title: the body is an
+    opaque leaf, so `approx` widens the quantifier to vacuous truth. -/
+private def evenTitlesP : Pred [Author] :=
+  Pred.all (.here Book.Field.author) (.opaque fun (b, _) => b.val.title.length % 2 == 0)
+/-- Authors with a book titled after themselves — the body reaches the
+    outer row. -/
+private def selfTitledP : Pred [Author] :=
+  Pred.any (.here Book.Field.author)
+    (.eq2 (.here Book.Field.title) .eq (.there (.here Author.Field.name)))
+/-- Nested: some book of the author whose (1:1) author row is 40 or older —
+    a join expressed as a quantifier, at depth 1. -/
+private def nestedP : Pred [Author] :=
+  Pred.any (.here Book.Field.author)
+    (Pred.exists (.here Book.Field.author) .id (.ord (.here Author.Field.age) .ge 40))
+/-- Over two tables: the author (table 1) has a book with this book's
+    (table 0) title — the quantifier relates both outer tables. -/
+private def crossP : Pred [Book, Author] :=
+  Pred.exists (.there .id) (.here Book.Field.author)
+    (.eq2 (.here Book.Field.title) .eq (.there (.here Book.Field.title)))
+
+private def bookSnap : Pred.Snapshot := Pred.Snapshot.empty.add Book books
+
+/-- The two-fetch answer, by hand. -/
+private def allRatedByHand : Array (Stored Author) :=
+  authors.filter fun a => books.all fun b => b.val.author != a.ref || b.val.rating.isSome
+private def unratedByHand : Array (Stored Author) :=
+  authors.filter fun a => books.any fun b => b.val.author == a.ref && b.val.rating.isNone
+
+private def ids (rows : Array (Stored Author)) : Array Int64 := rows.map (·.id.toInt64)
+
+private def testQuantifiers : IO Unit := do
+  -- denote over a fixture snapshot is the hand-written two-fetch answer
+  check (ids (authors.filter (allRatedP.denote bookSnap)) == ids allRatedByHand
+      && ids allRatedByHand == #[3, 4, 5, 6])
+    s!"forall denotes the two-fetch answer, got {ids (authors.filter (allRatedP.denote bookSnap))}"
+  check (ids (authors.filter (unratedP.denote bookSnap)) == ids unratedByHand
+      && ids unratedByHand == #[1, 2])
+    s!"exists denotes the two-fetch answer, got {ids (authors.filter (unratedP.denote bookSnap))}"
+  -- under an empty snapshot forall is vacuous and exists is empty
+  check (authors.all (allRatedP.denote .empty) && !(authors.any (unratedP.denote .empty)))
+    "empty snapshot: forall vacuous, exists false"
+  -- neg is exact and swaps the quantifiers
+  for a in authors do
+    check (allRatedP.neg.denote bookSnap a == !(allRatedP.denote bookSnap a))
+      s!"neg of forall on {a.val.name}"
+    check (allRatedP.neg.denote bookSnap a == unratedP.denote bookSnap a)
+      s!"neg of forall is the exists on {a.val.name}"
+  check ((Pred.Snapshot.empty.rows Book).isEmpty && (bookSnap.rows Author).isEmpty
+      && (bookSnap.rows Book).size == 3)
+    "snapshot rows by table"
+  -- approx recurses into the body: the opaque leaf is counted and dropped,
+  -- and what remains never excludes a row the plan accepts
+  check (evenTitlesP.residuals == 1 && evenTitlesP.approx.residuals == 0) "residual inside a body"
+  check (ids (authors.filter (evenTitlesP.denote bookSnap)) == #[1, 3, 4, 5, 6])
+    "opaque body denotes its function"
+  check (authors.all (evenTitlesP.approx.denote bookSnap)) "approx of an opaque body is vacuous"
+  for a in authors do
+    check (!(evenTitlesP.denote bookSnap a) || evenTitlesP.approx.denote bookSnap a)
+      s!"approx_sound through a quantifier, observed on {a.val.name}"
+  -- the plan surface
+  check (allRatedP.tables == [0] && !allRatedP.hasJoin) "a quantifier on table 0 is not a join"
+  check (crossP.tables == [1, 0] && crossP.hasJoin) "a quantifier reaching two outer tables is a join"
+  check ((Pred.and allRatedP unratedP).children.map (fun c => @Entity.tableName c.1 c.2) == ["book"])
+    "children deduplicate by table"
+  check (nestedP.children.map (fun c => @Entity.tableName c.1 c.2) == ["book", "author"])
+    "children collect nested quantifiers"
+  -- render, pinned
+  check (unratedP.renderT ==
+      ("EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t0.\"id\" AND s0.\"rating\" IS NULL)", #[]))
+    s!"exists render, got {repr unratedP.renderT}"
+  check (allRatedP.renderT ==
+      ("NOT EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t0.\"id\" AND s0.\"rating\" IS NULL)", #[]))
+    s!"forall render negates the body, got {repr allRatedP.renderT}"
+  check (selfTitledP.renderT ==
+      ("EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t0.\"id\" AND s0.\"title\" IS t0.\"name\")", #[]))
+    s!"body reaches the outer alias, got {repr selfTitledP.renderT}"
+  check (nestedP.renderT ==
+      ("EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t0.\"id\" AND EXISTS (SELECT 1 FROM \"author\" AS s1 WHERE s1.\"id\" IS s0.\"author\" AND s1.\"age\" >= ?))",
+        #[.int 40]))
+    s!"nested render, got {repr nestedP.renderT}"
+  check (crossP.renderT ==
+      ("EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t1.\"id\" AND s0.\"title\" IS t0.\"title\")", #[]))
+    s!"two-table render, got {repr crossP.renderT}"
+  check (evenTitlesP.approx.renderT ==
+      ("NOT EXISTS (SELECT 1 FROM \"book\" AS s0 WHERE s0.\"author\" IS t0.\"id\" AND 0)", #[]))
+    s!"approx of an opaque body renders vacuous, got {repr evenTitlesP.approx.renderT}"
+  check (allRatedP.render (fun _ => "t0") == allRatedP.renderT)
+    "single-table aliasing agrees on table 0"
+  -- `pred%`: the tactic's reflection as a term
+  let agePP : Pred [Author] := pred% [Author] fun a => a.val.age ≥ 40
+  check (agePP.renderT == agePlan.plan.renderT && agePP.residuals == 0)
+    "pred% reflects like leandb_plan"
+  let n := 41
+  let capPP : Pred [Author] := pred% [Author] fun a => a.val.age ≥ n
+  check (capPP.renderT == (capturedPlan 41).plan.renderT) "pred% binds captured variables"
+  let joinPP : Pred [Book, Author] := pred% [Book, Author] fun (b, a) =>
+    b.val.author == a.ref && a.val.age ≥ 40 && b.val.rating == none
+  check (joinPP.renderT == joinPlan.plan.renderT) "pred% over a tuple lambda"
+  for r in bookAuthors do
+    check (joinPP.denote .empty r == joinPlan.plan.denote .empty r) "pred% plan is coherent"
+  let allRatedPP : Pred [Author] :=
+    Pred.all (.here Book.Field.author) (pred% [Book, Author] fun (b, _) => b.val.rating.isSome)
+  check (allRatedPP.renderT == allRatedP.renderT) "pred% as a quantifier body"
+  let residualPP : Pred [Author] := pred% [Author] opaquePred
+  check (residualPP.residuals == 1) "pred% falls back to an opaque leaf"
 
 private def testCoherence : IO Unit := do
   checkCoherent agePlan authors "agePlan"
@@ -792,6 +920,67 @@ private def testParamSplitEndToEnd : IO Unit := do
   check (veg == #["lentils", "tofu"]) s!"vegetarian sees plants only, got {veg}"
   check (pesc == #["lentils", "salmon", "tofu"]) s!"pescatarian adds fish, got {pesc}"
   check (omni == #["lentils", "pork", "salmon", "tofu"]) s!"omnivore sees everything, got {omni}"
+
+private def quantDbPath : System.FilePath := ".lake" / "leandb_test_quant.sqlite"
+
+/-- LEP-0004 end to end: `selectP` over a SQLite file — the per-table path
+    (a quantifier on table 0 rides the aliased single-table fetch), the
+    joined path, and the re-check restoring what `approx` widened — each
+    against the two-fetch computation and against `selectUnplanned` over
+    the same snapshot. -/
+private def testQuantifiersEndToEnd : IO Unit := do
+  if ← quantDbPath.pathExists then IO.FS.removeFile quantDbPath
+  let r ← withDb quantDbPath schema do
+    let ada ← insert Author ⟨"Ada", 36⟩
+    let alan ← insert Author ⟨"Alan", 41⟩
+    discard <| insert Author ⟨"Grace", 29⟩
+    discard <| insert Book ⟨"On Computable Numbers", alan.ref, some 4.5⟩
+    discard <| insert Book ⟨"Notes on the Analytical Engine", ada.ref, none⟩
+    discard <| insert Book ⟨"Unrated", alan.ref, none⟩
+    let byName : SortBy (Stored Author) := .key (·.val.name)
+    let names (rows : Array (Stored Author)) := rows.map (·.val.name)
+    -- the two-fetch computation
+    let allAuthors ← fetchAll Author
+    let allBooks ← fetchAll Book
+    let twoFetch (ok : Stored Book → Bool) : Array String :=
+      (allAuthors.filter fun a => allBooks.all fun b => b.val.author != a.ref || ok b).map (·.val.name)
+    -- forall, pushed whole: NOT EXISTS on the single-table fetch
+    let allRated ← selectP [Author] allRatedP byName
+    unless names allRated == #["Grace"] && names allRated == twoFetch (·.val.rating.isSome) do
+      throw (.sqlite s!"FAIL: selectP forall: {names allRated}")
+    let unrated ← selectP [Author] unratedP byName
+    unless names unrated == #["Ada", "Alan"] do
+      throw (.sqlite s!"FAIL: selectP exists: {names unrated}")
+    -- an opaque body: SQL returns everyone, the re-check restores the answer
+    let even ← selectP [Author] evenTitlesP byName
+    unless names even == #["Ada", "Grace"]
+        && names even == twoFetch (·.val.title.length % 2 == 0) do
+      throw (.sqlite s!"FAIL: selectP with an opaque body: {names even}")
+    let snap ← evenTitlesP.snapshot
+    let reference ← selectUnplanned [Author] (evenTitlesP.denote snap) byName
+    unless names even == names reference do
+      throw (.sqlite s!"FAIL: differential over the same snapshot: {names even} vs {names reference}")
+    -- the joined path: books whose author has another unrated book
+    let other : Pred [Book, Author] :=
+      .and (.eq2 (.here Book.Field.author) .eq (.there .id))
+        (Pred.exists (.there .id) (.here Book.Field.author)
+          (.and (.isNull (.here Book.Field.rating)) (.eq2 .id .ne (.there .id))))
+    let joined ← selectP [Book, Author] other (.key fun (b, _) => b.val.title)
+    let joinedRef ← selectUnplanned [Book, Author] (other.denote (← other.snapshot))
+      (.key fun (b, _) => b.val.title)
+    let titles := joined.map fun (b, a) => (b.val.title, a.val.name)
+    unless titles == #[("On Computable Numbers", "Alan")]
+        && titles == joinedRef.map (fun (b, a) => (b.val.title, a.val.name)) do
+      throw (.sqlite s!"FAIL: joined selectP with a quantifier: {titles}")
+    -- the log shows the quantifier and the residual
+    let entries ← readLog 10
+    let details := entries.map fun e => (e.getObjValAs? String "detail").toOption.getD ""
+    unless details.any (fun d => d.startsWith "author | pushed: NOT EXISTS (SELECT 1 FROM \"book\" AS s0"
+        && (d.splitOn "residual conjuncts: 0").length == 2) do
+      throw (.sqlite s!"FAIL: log lacks the NOT EXISTS plan: {details}")
+    unless details.any (fun d => (d.splitOn "AND 0), residual conjuncts: 1").length == 2) do
+      throw (.sqlite s!"FAIL: log lacks the widened plan with residual 1: {details}")
+  discard <| expectOk r "quantifier queries"
 
 /-! ## Migrations (additive auto-apply, loud destruction, world rebuilds) -/
 
@@ -1029,6 +1218,7 @@ def main : IO UInt32 := do
   testSortBy
   testPlans
   testTypedPred
+  testQuantifiers
   testCoherence
   testClosedEnum
   testDefaults
@@ -1036,6 +1226,7 @@ def main : IO UInt32 := do
   testEndToEnd
   testClosedEndToEnd
   testParamSplitEndToEnd
+  testQuantifiersEndToEnd
   testMigrations
   testSqlQuoting
   testEmptyEntity
