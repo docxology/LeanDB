@@ -150,6 +150,19 @@ response `code`. Requests run one at a time behind a mutex (one SQLite
 handle). A request carrying `X-LeanDb-Fingerprint` for another schema
 is refused with `schema_mismatch` (409).
 
+Importable bases. A project that `require`s a base package gets its
+types, its `base` value and its query defs: `Base.withInstance` runs
+them in-process against an instance file (with the base's own schema
+check), and `LeanDb.Client` runs them over the wire — `Client.connect`
+spawns `<base> serve`, shakes hands on the fingerprint (a client
+compiled against another schema is refused before it asks), and
+`client% f` turns a query def's signature into a `ClientM` stub whose
+arguments render through `CliRender` and whose result decodes through
+`QueryIn`, so the remote call is typed like the local one;
+`Client.argv` sends any argv. `examples/dashboard` is a non-base
+project importing `tickets` and `eats`: it seeds and queries both
+in-process and checks the remote `slaBreached` against the local one.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

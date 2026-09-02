@@ -1,0 +1,22 @@
+name = "dashboard"
+version = "0.1.0"
+defaultTargets = ["dashboard"]
+
+# A project that is not a base: it imports two bases and uses their
+# types, data and queries — in-process against their instance files, and
+# over the wire against a served one.
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[require]]
+name = "tickets"
+path = "../tickets"
+
+[[require]]
+name = "eats"
+path = "../eats"
+
+[[lean_exe]]
+name = "dashboard"
+root = "Main"

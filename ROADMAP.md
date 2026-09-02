@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S5 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S5, S7 done 2026-09-02 |
 
 ---
 
@@ -209,10 +209,15 @@ logged plans byte-identical:
   over one `Base.handle`, statuses from response codes, a mutex around
   the session, the `X-LeanDb-Fingerprint` handshake; curl smoke in the
   release check.
+- **S7 — done 2026-09-02.** `Base.withInstance`; `LeanDb.Client`
+  (`Client.connect` over `<base> serve` with the fingerprint handshake,
+  `client%` typed stubs via `CliRender`/`QueryIn`, `Client.argv`);
+  `examples/dashboard` imports `tickets` and `eats`, runs both
+  in-process and `slaBreached` over the wire (in the release check). An
+  HTTP client transport is not built: `Std` has no HTTP client; the
+  stdio transport is the wire.
 - **S6** — `leandb host` multi-base supervisor and `serve --mcp`;
-  **S7** — `Base.withInstance`, `examples/dashboard` importing two
-  bases, `client%` typed remote stubs; **S8** — `leandb new` scaffolder
-  with a git require, tag v0.3.0.
+  **S8** — `leandb new` scaffolder with a git require, tag v0.3.0.
 
 ## Deferred, by name
 

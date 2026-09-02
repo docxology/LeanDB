@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-for base in tickets crm shop gpus gpumarket pricewatch eats kernels legacy; do
+for base in tickets crm shop gpus gpumarket pricewatch eats kernels legacy dashboard; do
   if ! cmp -s lean-toolchain "examples/$base/lean-toolchain"; then
     echo "release check failed: examples/$base/lean-toolchain differs from root" >&2
     exit 1
@@ -30,6 +30,13 @@ for base in tickets crm shop gpus gpumarket pricewatch eats kernels; do
     fi
   )
 done
+
+# dashboard: a non-base project importing tickets and eats, in-process and over the wire
+(
+  cd examples/dashboard
+  lake build
+  .lake/build/bin/dashboard
+)
 
 # HTTP smoke: tickets over serve --http answers the typed routes and /rpc
 (

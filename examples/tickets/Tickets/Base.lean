@@ -17,6 +17,9 @@ instance : CliArg Timestamp := ⟨fun s =>
   | some n => .ok ⟨n⟩
   | none => .error s!"expected an epoch-seconds timestamp, got {String.quote s}"⟩
 
+/-- The wire form of a timestamp, for a client's `client%` stubs. -/
+instance : CliRender Timestamp := ⟨fun t => toString t.epochSeconds⟩
+
 def base : LeanDb.Base := {
   name := "tickets"
   tables := [.of User, .of Ticket, .of Comment]
