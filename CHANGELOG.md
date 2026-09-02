@@ -163,6 +163,18 @@ arguments render through `CliRender` and whose result decodes through
 project importing `tickets` and `eats`: it seeds and queries both
 in-process and checks the remote `slaBreached` against the local one.
 
+Hosting many bases: `leandb host --port <port> <name>=<exe>[,<arg>…]…`
+spawns each base in `serve` mode and serves them under
+`/bases/<name>/…` with the same routes a base serves alone (`GET
+/bases` lists them with fingerprints; the argv is the wire between the
+processes). MCP: `<base> serve --mcp` speaks the Model Context Protocol
+over stdio with a tool list derived from the base — `rows_<t>`,
+`get_<t>`, `insert_<t>`, `update_<t>`, `delete_<t>` per table,
+`query_<q>` per registered query with its parameters as the input
+schema, plus `schema`, `version`, `log`, `migrate_status`, `seed` — every
+call one argv through `Base.handle`, so an agent picks from the list and
+cannot invent a query.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

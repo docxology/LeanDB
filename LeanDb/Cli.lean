@@ -105,6 +105,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "restore <file>",
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
       Json.str "serve --http <port> [--bind <host>]  (HTTP/1.1; every route is sugar over the CLI)",
+      Json.str "serve --mcp  (Model Context Protocol over stdio; tools derived from tables and queries)",
       Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
     ("queries", Json.arr (b.queries.map fun q =>
@@ -647,11 +648,20 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
     CLI module (which it imports) can reach it. -/
 initialize httpServer : IO.Ref (Option (Base → Instance → String → UInt16 → IO UInt32)) ← IO.mkRef none
 
+/-- The MCP server, registered by `LeanDb.Mcp` the same way. -/
+initialize mcpServer : IO.Ref (Option (Base → Instance → IO UInt32)) ← IO.mkRef none
+
 /-- Run one command against a resolved instance. `help`, `schema` and
     `version` touch no file; everything else opens a session. -/
 def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
   match args with
   | ["serve"] => serve b inst
+  | ["serve", "--mcp"] =>
+      match ← mcpServer.get with
+      | some mcp => mcp b inst
+      | none =>
+          IO.eprintln (usageErr "MCP serving is not linked into this base").compress
+          return 3
   | "serve" :: "--http" :: rest =>
       match ← httpServer.get with
       | some http =>

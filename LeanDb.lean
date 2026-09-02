@@ -15,4 +15,6 @@ import LeanDb.Cli
 import LeanDb.CliQuery
 import LeanDb.Http
 import LeanDb.Client
+import LeanDb.Mcp
+import LeanDb.Host
 import LeanDb.Import

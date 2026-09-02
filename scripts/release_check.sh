@@ -61,6 +61,47 @@ done
   fi
 )
 
+# MCP smoke: tools/list names a table verb and a query; tools/call runs one
+(
+  cd examples/tickets
+  mcp_db=$(mktemp /tmp/leandb-mcp.XXXXXX)
+  rm -f "$mcp_db"
+  out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"seed","arguments":{}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query_slaBreached","arguments":{"now":1700000000}}}' \
+    | .lake/build/bin/tickets --db "$mcp_db" serve --mcp)
+  rm -f "$mcp_db"
+  if [[ "$out" != *'"name":"rows_ticket"'* || "$out" != *'"name":"query_slaBreached"'* || "$out" != *'"isError":false'* ]]; then
+    echo "release check failed: tickets serve --mcp smoke test failed" >&2
+    exit 1
+  fi
+)
+
+# host smoke: two bases under one port
+(
+  host_db=$(mktemp -d /tmp/leandb-host.XXXXXX)
+  .lake/build/bin/leandb host --port 7434 \
+    "tickets=examples/tickets/.lake/build/bin/tickets,--db,$host_db/t.sqlite" \
+    "eats=examples/eats/.lake/build/bin/eats,--db,$host_db/e.sqlite" >/dev/null 2>&1 &
+  host_pid=$!
+  sleep 3
+  ok=1
+  curl -sf http://127.0.0.1:7434/bases | grep -q '"name":"eats"' || ok=0
+  curl -sf -X POST http://127.0.0.1:7434/bases/eats/seed | grep -q '"seeded":true' || ok=0
+  curl -sf http://127.0.0.1:7434/bases/eats/query/openFor/tiramisu/fri/21:30 | grep -q '"ok":true' || ok=0
+  curl -sf http://127.0.0.1:7434/bases/tickets/version | grep -q '"code_fingerprint"' || ok=0
+  kill "$host_pid" 2>/dev/null || true
+  wait "$host_pid" 2>/dev/null || true
+  pkill -f "$host_db" 2>/dev/null || true
+  rm -rf "$host_db"
+  if [[ "$ok" != 1 ]]; then
+    echo "release check failed: leandb host smoke test failed" >&2
+    exit 1
+  fi
+)
+
 (
   cd examples/legacy
   lake build

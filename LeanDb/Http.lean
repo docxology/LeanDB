@@ -90,13 +90,14 @@ private def respond (status : Status) (j : Json) : ContextAsync (Response Body.A
   let r ← (Response.withStatus status).json j.compress
   return { line := r.line, body := Body.Any.ofBody r.body, extensions := r.extensions }
 
-/-- One request through `dispatch`. `fingerprint` is the served schema's. -/
-def handleRequest (fingerprint : String) (dispatch : List String → IO Json)
-    (req : Request Body.Stream) : ContextAsync (Response Body.Any) := do
-  -- the handshake: a client compiled against another schema is told so
-  if let some claimed := req.line.headers.get? (Header.Name.ofString! "x-leandb-fingerprint") then
-    unless toString claimed == fingerprint do
-      return ← respond .conflict (DbError.schemaMismatch (toString claimed) fingerprint).toJson
+/-- Where a request goes: the segments to route, the fingerprint of the
+    schema behind them, and the argv dispatcher. A single served base
+    resolves everything to itself; a host resolves `/bases/<name>/…`. -/
+abbrev Resolver := List String → IO (Except (Nat × String) (List String × String × (List String → IO Json)))
+
+/-- One request through the resolver. -/
+def handleRequest (resolve : Resolver) (req : Request Body.Stream) :
+    ContextAsync (Response Body.Any) := do
   let method := (toString req.line.method).toUpper
   let segs := (req.line.uri.path.toDecodedSegments.toList).filter (!·.isEmpty)
   let query := req.line.uri.query.toList.filterMap fun (k, v) => do
@@ -104,12 +105,20 @@ def handleRequest (fingerprint : String) (dispatch : List String → IO Json)
     some (k, (v.bind (·.decode)).getD "")
   let bytes : ByteArray ← Body.Stream.readAll req.body
   let body := if bytes.isEmpty then none else String.fromUTF8? bytes
-  match route method segs query body with
+  match ← resolve segs with
   | .error (404, m) => respond .notFound (errJson "usage" m)
   | .error (_, m) => respond .badRequest (errJson "usage" m)
-  | .ok argv =>
-      let j ← dispatch argv
-      respond (statusOf j) j
+  | .ok (segs, fingerprint, dispatch) =>
+      -- the handshake: a client compiled against another schema is told so
+      if let some claimed := req.line.headers.get? (Header.Name.ofString! "x-leandb-fingerprint") then
+        unless toString claimed == fingerprint do
+          return ← respond .conflict (DbError.schemaMismatch (toString claimed) fingerprint).toJson
+      match route method segs query body with
+      | .error (404, m) => respond .notFound (errJson "usage" m)
+      | .error (_, m) => respond .badRequest (errJson "usage" m)
+      | .ok argv =>
+          let j ← dispatch argv
+          respond (statusOf j) j
 
 private def parseHost (host : String) : Except String Net.IPv4Addr :=
   match host.splitOn "." |>.map (·.toNat?) with
@@ -119,21 +128,38 @@ private def parseHost (host : String) : Except String Net.IPv4Addr :=
       else .error s!"bad IPv4 address {host}"
   | _ => .error s!"expected a dotted IPv4 address, got {host}"
 
-/-- Serve `dispatch` on `host:port` until shutdown. -/
-def serveWith (host : String) (port : UInt16) (fingerprint : String)
-    (dispatch : List String → IO Json) (banner : Json) : IO UInt32 := do
+/-- Serve a resolver on `host:port` until shutdown. -/
+def serveResolver (host : String) (port : UInt16) (resolve : Resolver) (banner : Json) : IO UInt32 := do
   let ip ← match parseHost host with
     | .ok ip => pure ip
     | .error m =>
         IO.eprintln (errJson "usage" m).compress
         return 3
   let addr : Net.SocketAddress := .v4 { addr := ip, port }
-  let handler := Std.Http.Server.Handler.ofFn (handleRequest fingerprint dispatch)
+  let handler := Std.Http.Server.Handler.ofFn (handleRequest resolve)
   IO.eprintln banner.compress
   Async.block do
     let server ← Std.Http.Server.serve addr handler
     server.waitShutdown
   return 0
+
+/-- Serve one dispatcher (a single base). -/
+def serveWith (host : String) (port : UInt16) (fingerprint : String)
+    (dispatch : List String → IO Json) (banner : Json) : IO UInt32 :=
+  serveResolver host port (fun segs => return .ok (segs, fingerprint, dispatch)) banner
+
+/-- Serve many bases under `/bases/<name>/…`; `GET /bases` lists them.
+    `bases name` gives a base's fingerprint and dispatcher. -/
+def serveHosted (host : String) (port : UInt16) (list : Json)
+    (bases : String → Option (String × (List String → IO Json))) (banner : Json) : IO UInt32 :=
+  serveResolver host port (fun segs => do
+    match segs with
+    | [] | ["bases"] => return .ok ([], "", fun _ => pure list)
+    | "bases" :: name :: rest =>
+        match bases name with
+        | some (fp, dispatch) => return .ok (rest, fp, dispatch)
+        | none => return .error (404, s!"no base {name}")
+    | _ => return .error (404, "routes live under /bases/<name>/…")) banner
 
 /-- `<base> serve --http <port> [--bind <host>]`. -/
 def serve (b : Base) (inst : Instance) (host : String) (port : UInt16) : IO UInt32 := do

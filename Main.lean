@@ -18,6 +18,7 @@ def usageJson : Json :=
     ("tool", Json.str "leandb"),
     ("usage", Json.arr #[
       Json.str "import-sqlite <file.db> --name <base-name> --out <dir> [--require-path <path-to-leandb>] [--db-path <path>]",
+      Json.str "host --port <port> [--bind <host>] <name>=<exe>[,<arg>,…]…  (serve many bases under /bases/<name>/…)",
       Json.str "--help"]),
     ("defaults", Json.mkObj [
       ("require-path", Json.str "../.."),
@@ -125,5 +126,6 @@ def main (args : List String) : IO UInt32 := do
       match parseImportArgs rest with
       | .error msg => usageErr s!"import-sqlite: {msg}"
       | .ok a => runImport a
+  | "host" :: rest => LeanDb.Host.run rest
   | cmd :: _ =>
       usageErr s!"unrecognized command {String.quote cmd}"
