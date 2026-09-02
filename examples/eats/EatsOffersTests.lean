@@ -136,6 +136,7 @@ private def runQueries : DbM Unit := do
   checkD ((← cheapestConfigured .iced .large .almond .double false .oakland).size == 1) "almond in Oakland"
   checkD ((← cheapestConfigured .iced .small .whole .double false .sanFrancisco).isEmpty) "no small iced anywhere"
   -- the runtime-pattern and Option-parameter forms give the same answer
+  -- (the Option form's plans are asserted in `optionalPlans`)
   let matching ← cheapestMatching [.temp .iced, .milk .oat] .sanFrancisco
   checkD (matching[0]?.map (·.2.1.val.price.minor) == some 525) "cheapest iced oat: Samovar regular single 525"
   checkD (matching.all fun (_, op, _) => op.val.temp == .iced && op.val.milk == .oat) "pattern filter holds"
@@ -175,6 +176,25 @@ private def runQueries : DbM Unit := do
   checkD (line.val.quoted == ⟨600⟩ && line.val.toConfig == icedLargeOat) "the order line snapshot"
   checkD ((← quote highwire.ref { milk := .almond }) == ⟨535⟩) "quote almond at Highwire"
 
+/-- The optional filter, pushed: for every combination of its `Option`
+    arguments the logged plan of `cheapestOptional` has residual 0, and
+    the pushed SQL is the joins, `available`, the city, plus one `IS ?`
+    per argument that is `some` — a `none` argument folds its conjunct
+    to `tt` and leaves nothing. Asserted on the query's own log entry. -/
+private def optionalPlans : DbM Unit := do
+  let inner := "(((t1.\"offer\" IS t0.\"id\" AND t0.\"restaurant\" IS t2.\"id\") AND t0.\"available\" IS ?) AND t2.\"city\" IS ?)"
+  let withTemp := s!"({inner} AND t1.\"temp\" IS ?)"
+  let withBoth := s!"({withTemp} AND t1.\"milk\" IS ?)"
+  let cases : List (Option Temp × Option Milk × String) :=
+    [(none, none, inner), (some .iced, none, withTemp), (some .iced, some .oat, withBoth)]
+  for (temp?, milk?, sql) in cases do
+    discard <| cheapestOptional temp? milk? .sanFrancisco
+    let entries ← readLog 1
+    let detail := (entries[0]?.bind fun e => (e.getObjValAs? String "detail").toOption).getD ""
+    let expected := s!"espresso_offer×offer_price×restaurant | pushed: {sql}, residual conjuncts: 0"
+    checkD (detail == expected)
+      s!"cheapestOptional {repr temp?} {repr milk?}: expected {expected}, logged {detail}"
+
 /-- The hand-maintenance cost, demonstrated: `update` of the rule alone
     is accepted, and the stored summaries and tabulation are now wrong. A
     Lean check (`summariesAgree`) is the only thing that notices. -/
@@ -204,6 +224,7 @@ def main : IO UInt32 := do
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   expectOk (validateSchema fullSchema) "schema"
   expectOk (← withDb dbPath fullSchema runQueries) "seed + queries"
+  expectOk (← withDb dbPath fullSchema optionalPlans) "optional plans"
   -- results identical to the unplanned reference semantics
   let (planned, reference) ← expectOk (← withDb dbPath fullSchema do
       let planned ← cheapestConfigured .iced .large .oat .double false .sanFrancisco

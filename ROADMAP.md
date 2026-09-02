@@ -134,10 +134,12 @@ hand-maintained bounds, tabulated `OfferPrice`, `OrderLine`; queries
 `priceOf`, `cheapestConfigured` (residual 0), `cheapestMatching`
 (runtime pattern: residual 1), `offersWith`, `configurationsFor`,
 `quote`, `placeOrder`; `eats_offers_tests`; evidence in
-`examples/eats/README.md`. Findings: an `Option α` filter parameter is
-fully residual (tactic extension: split a captured `Option α` for closed
-`α`); hand-maintained bounds and tabulation desynchronize under `update`
-exactly as kernels' search columns did before LEP-0003 B3.
+`examples/eats/README.md`. Findings: an `Option α` filter parameter was
+fully residual — **fixed the same day**: the tactic now splits a captured
+`Option α` for closed `α`, and `cheapestOptional` pushes with residual 0
+for every argument combination; hand-maintained bounds and tabulation
+desynchronize under `update` exactly as kernels' search columns did
+before LEP-0003 B3.
 
 Engine stages (`deriving Config`, `Pattern`/`PriceRule` as library types,
 derived child rows, the rule-coverage migration check) follow LEP-0003 C

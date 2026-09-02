@@ -8,7 +8,7 @@ records the measurements. The pattern to notice: a *fully specified*
 configuration is five closed-enum/Bool equalities and pushes entirely;
 a *runtime pattern* (a list of options the CLI typed) is a value the
 tactic cannot split on and stays residual; an `Option`-typed optional
-filter sits in between (the probe at the end). -/
+filter pushes too, one `IS ?` per argument given (the last query). -/
 
 namespace Eats
 
@@ -73,10 +73,13 @@ def cheapestMatching (p : Pattern) (city : City) :
       && r.val.city == city && Pattern.matches p op.val.toConfig)
     (.key fun (_, op, _) => op.val.price)
 
-/-- The probe: optional filters as `Option` parameters. `Option Temp` is
-    not a `ClosedEnum`, so the captured-parameter case split does not
-    fire and the two option conjuncts are expected to stay residual —
-    see README for the measured plan. -/
+/-- Optional filters as `Option` parameters — "iced if asked, oat if
+    asked". `temp?`/`milk?` are captured `Option Temp`/`Option Milk`; the
+    tactic case-splits each on its closed world `none :: all.map some`
+    with value/value guards on the parameter, which fold at plan build:
+    a `none` argument folds its conjunct to `tt`, a `some c` argument to
+    `t1."temp" IS ?`. Every combination pushes with residual 0 (asserted
+    in `EatsOffersTests.lean`; the logged plans are in the README). -/
 def cheapestOptional (temp? : Option Temp) (milk? : Option Milk) (city : City) :
     DbM (Array (Stored EspressoOffer × Stored OfferPrice × Stored Restaurant)) :=
   select [EspressoOffer, OfferPrice, Restaurant] (fun (o, op, r) =>

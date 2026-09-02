@@ -1748,6 +1748,107 @@ def run : IO Unit := do
 
 end EnumSetA
 
+/-! ## Optional filters: case splits on a captured `Option α` parameter
+
+"Filter by X if given": `(k? : Option Kind)` used as `k?.isNone || some
+col == k?` or as `match k? with | none => true | some t => col == t`. The
+world of `k?` is `none :: (ClosedEnum.all Kind).map some`; the split's
+guards are value/value tests on `Option Kind`, so `k? = none` folds the
+conjunct to `tt` and `k? = some c` to the column test. -/
+
+private def optionalKindPlan (k? : Option Kind) : PlanFor (ts := [Ingredient])
+    (fun (i : Stored Ingredient) => k?.isNone || some i.val.kind == k?) := by leandb_plan
+
+private def optionalKindMatchPlan (k? : Option Kind) : PlanFor (ts := [Ingredient])
+    (fun (i : Stored Ingredient) => match k? with | none => true | some t => i.val.kind == t) := by
+  leandb_plan
+
+/-- The negation of an optional filter is exact: `none` gives `ff`,
+    `some c` gives `IS NOT`. -/
+private def optionalKindNegPlan (k? : Option Kind) : PlanFor (ts := [Ingredient])
+    (fun (i : Stored Ingredient) => !(k?.isNone || some i.val.kind == k?)) := by leandb_plan
+
+/-- `some col == some c` with the column *under* the `some`: the column
+    sits inside the match arm, so the split on `k?` fires first and the
+    branch is recognized by unwrapping both `some`s. -/
+private def someSomePlan (k? : Option Kind) : PlanFor (ts := [Ingredient])
+    (fun (i : Stored Ingredient) =>
+      match k? with | none => true | some t => some i.val.kind == some t) := by leandb_plan
+
+/-- A captured `Option Nat` is not a closed world: the conjunct stays
+    residual. -/
+private def optionalNatPlan (n? : Option Nat) : PlanFor (ts := [Ingredient])
+    (fun (i : Stored Ingredient) => n?.isNone || some i.val.name.length == n?) := by leandb_plan
+
+private def kindWorld : Array (Option Kind) := #[none] ++ (ClosedEnum.all (α := Kind)).map some
+
+private def testOptionalParamPlans : IO Unit := do
+  checkPlan (optionalKindPlan none) "1" #[] 0
+    "optional filter (isNone spelling), none: the conjunct folds to tt"
+  checkPlan (optionalKindPlan (some .meat)) "t0.\"kind\" IS ?" #[.text "meat"] 0
+    "optional filter (isNone spelling), some: the column test alone"
+  checkPlan (optionalKindMatchPlan none) "1" #[] 0
+    "optional filter (match spelling), none: the conjunct folds to tt"
+  checkPlan (optionalKindMatchPlan (some .meat)) "t0.\"kind\" IS ?" #[.text "meat"] 0
+    "optional filter (match spelling), some: the column test alone"
+  checkPlan (optionalKindNegPlan none) "0" #[] 0 "negated optional filter, none: ff"
+  checkPlan (optionalKindNegPlan (some .meat)) "t0.\"kind\" IS NOT ?" #[.text "meat"] 0
+    "negated optional filter, some: IS NOT"
+  checkPlan (someSomePlan none) "1" #[] 0 "some col == some c under the split, none"
+  checkPlan (someSomePlan (some .fish)) "t0.\"kind\" IS ?" #[.text "fish"] 0
+    "some col == some c under the split unwraps to the column test"
+  checkPlan (optionalNatPlan none) "1" #[] 1 "captured Option Nat stays residual (none)"
+  checkPlan (optionalNatPlan (some 4)) "1" #[] 1 "captured Option Nat stays residual (some)"
+  for k? in kindWorld do
+    check ((optionalKindPlan k?).plan.residuals == 0)
+      s!"optional filter (isNone spelling) {repr k?} pushes with residual 0"
+    check ((optionalKindMatchPlan k?).plan.residuals == 0)
+      s!"optional filter (match spelling) {repr k?} pushes with residual 0"
+    check ((optionalKindNegPlan k?).plan.residuals == 0)
+      s!"negated optional filter {repr k?} pushes with residual 0"
+    checkCoherent (optionalKindPlan k?) ingredients s!"optionalKindPlan {repr k?}"
+    checkCoherent (optionalKindMatchPlan k?) ingredients s!"optionalKindMatchPlan {repr k?}"
+    checkCoherent (optionalKindNegPlan k?) ingredients s!"optionalKindNegPlan {repr k?}"
+    checkCoherent (someSomePlan k?) ingredients s!"someSomePlan {repr k?}"
+  checkCoherent (optionalNatPlan none) ingredients "optionalNatPlan none"
+  checkCoherent (optionalNatPlan (some 4)) ingredients "optionalNatPlan (some 4)"
+
+private def optionalDbPath : System.FilePath := ".lake" / "leandb_test_optional.sqlite"
+
+/-- Differential: for `none` and each `some`, both spellings and the
+    negation agree with `selectUnplanned`, and with the expected rows. -/
+private def testOptionalParamEndToEnd : IO Unit := do
+  if ← optionalDbPath.pathExists then IO.FS.removeFile optionalDbPath
+  let r ← withDb optionalDbPath [Entity.spec Ingredient] do
+    discard <| insert Ingredient ⟨"pork", .meat⟩
+    discard <| insert Ingredient ⟨"salmon", .fish⟩
+    discard <| insert Ingredient ⟨"tofu", .plant⟩
+    discard <| insert Ingredient ⟨"lentils", .plant⟩
+    let byName : SortBy (Stored Ingredient) := .key (·.val.name)
+    let names (rows : Array (Stored Ingredient)) := rows.map (·.val.name)
+    let differential (label : String) (w : Stored Ingredient → Bool) : DbM (Array String) := do
+      let planned ← select [Ingredient] w byName
+      let reference ← selectUnplanned [Ingredient] w byName
+      unless names planned == names reference do
+        throw (.sqlite s!"FAIL: {label}: planned {names planned} vs reference {names reference}")
+      return names planned
+    let mut out : Array (Array String) := #[]
+    for k? in kindWorld do
+      let a ← differential s!"optional (isNone) {repr k?}" fun i => k?.isNone || some i.val.kind == k?
+      let b ← differential s!"optional (match) {repr k?}" fun i =>
+        match k? with | none => true | some t => i.val.kind == t
+      let c ← differential s!"negated optional {repr k?}" fun i => !(k?.isNone || some i.val.kind == k?)
+      unless a == b do throw (.sqlite s!"FAIL: spellings disagree for {repr k?}: {a} vs {b}")
+      out := out.push a
+      out := out.push c
+    return out
+  let rows ← expectOk r "optional filter queries"
+  check (rows == #[#["lentils", "pork", "salmon", "tofu"], #[],
+                   #["pork"], #["lentils", "salmon", "tofu"],
+                   #["salmon"], #["lentils", "pork", "tofu"],
+                   #["lentils", "tofu"], #["pork", "salmon"]])
+    s!"optional filter rows: {rows}"
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -1771,5 +1872,7 @@ def main : IO UInt32 := do
   testImportNotCarried
   Lep3.run
   EnumSetA.run
+  testOptionalParamPlans
+  testOptionalParamEndToEnd
   IO.println "all engine tests passed"
   return 0

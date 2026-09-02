@@ -83,7 +83,9 @@ priceOf              offer_price | pushed: (((((t0."offer" IS ? AND t0."temp" IS
 cheapestConfigured   espresso_offer×offer_price×restaurant | pushed: ((((((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?) AND t1."size" IS ?) AND t1."milk" IS ?) AND t1."shots" IS ?) AND t1."decaf" IS ?), residual conjuncts: 0
 offersWith           espresso_offer×offer_price×restaurant | pushed: ((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."milk" IS ?), residual conjuncts: 0
 cheapestMatching     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 1
-cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 2
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 0        -- (none, none)
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: ((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?), residual conjuncts: 0        -- (some .iced, none)
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?) AND t1."milk" IS ?), residual conjuncts: 0        -- (some .iced, some .oat)
 ```
 
 - *A fully specified configuration pushes entirely.* Hand-flattening the
@@ -98,22 +100,27 @@ cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((t1."of
   it cannot emit a conjunction whose length it does not know at compile
   time. Same reason as `suitableAdHoc`'s `avoid.contains`. The joins and
   the city still push, so the fetch is the city's rows, not the table.
-- *The `Option`-parameter probe: does not push.* `cheapestOptional (temp?
-  : Option Temp) (milk? : Option Milk)` with
-  `(temp?.isNone || some op.val.temp == temp?)` is residual 2 — each
-  option conjunct is opaque. With `leandb.explain` the reflected plan is
-  `… .andS (Pred.opaque fun row => temp?.isNone || some row.2.1.val.temp == temp?)`;
-  the `match temp? with | none => true | some t => op.val.temp == t`
-  spelling is opaque the same way; and the closed-parameter control
-  (`temp : Temp`, `op.val.temp == temp`) is `Pred.eq (Col.here
-  OfferPrice.Field.temp).there EqOp.eq temp`, pushed. The captured-
-  parameter split (`findEnumParam`) asks `ClosedEnum (Option Temp)` and
-  gets nothing. **Engine finding:** case-splitting a captured `Option α`
-  parameter for closed `α` — `none` guard ∧ `true`, plus `⋁_c (param IS
-  some c ∧ col IS c)` — would make every optional filter pushable in one
-  step; it is the same `splitWorld` with `none` as an extra constructor
-  and a value/value guard on the parameter. Until then an optional
-  filter is a runtime pattern, and residual.
+- *The `Option`-parameter probe: landed.* `cheapestOptional (temp? :
+  Option Temp) (milk? : Option Milk)` with
+  `(temp?.isNone || some op.val.temp == temp?)` measured residual 2 when
+  this was written — each option conjunct opaque, because the captured-
+  parameter split (`findEnumParam`) asked `ClosedEnum (Option Temp)` and
+  got nothing. That engine finding is now the engine: the split also
+  covers a captured `Option α` for closed `α`, over the world `none ::
+  (ClosedEnum.all α).map some`, guarded by value/value tests on the
+  parameter (`temp? IS none ∧ …`, `temp? IS some c ∧ …`) that fold when
+  the plan value is built. The three `cheapestOptional` lines above are
+  the logged plans for `(none, none)`, `(some .iced, none)` and `(some
+  .iced, some .oat)`: a `none` argument folds its conjunct to `tt` and
+  leaves nothing; a `some` argument leaves `t1."temp" IS ?` /
+  `t1."milk" IS ?`. Residual 0 for every combination, asserted on the
+  query's own log entries in `EatsOffersTests.lean`. With
+  `leandb.explain`, `temp?.isNone` reflects as `(vvEq temp? none ∧ tt) ∨
+  ⋁_c (vvEq temp? (some c) ∧ ff)` and `some op.val.temp == temp?` as
+  `⋁_c (temp IS c ∧ vvEq (some c) temp?)`; the `match temp? with | none
+  => true | some t => op.val.temp == t` spelling reflects as `(vvEq temp?
+  none ∧ tt) ∨ ⋁_c (vvEq temp? (some c) ∧ temp IS c)` — both fold to the
+  same plans. An optional filter is no longer a runtime pattern.
 
 **What the tabulation costs.** 125 rows per offer (the 125 valid drinks
 of 180), 725 `offer_price` rows for the six seeded offers (Highwire's

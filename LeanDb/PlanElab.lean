@@ -41,7 +41,13 @@ type cannot be emitted at all:
   function that matches on its parameter before its column argument, or
   a derived form like `!(d.forbids.contains k)`):
   `⋁_c (param IS 'c' ∧ reify (conjunct[param := c]))` — the guard is a
-  value/value test (`Pred.vvEq`), which folds when the plan value is built.
+  value/value test (`Pred.vvEq`), which folds when the plan value is built;
+- the same split on a captured parameter of type `Option α`, `α` a closed
+  enum — the optional filter, `param.isNone || some col == param` or
+  `match param with | none => true | some c => col == c` — over the world
+  `none :: (ClosedEnum.all α).map some`: `(param IS NULL ∧ …) ∨ ⋁_c (param
+  IS 'c' ∧ …)`, guarded by value/value tests again, so a `none` argument
+  leaves `tt` for the conjunct and a `some c` argument the column test.
 
 A top-level conjunct the tactic cannot translate becomes
 `Pred.opaque (fun row => conjunct)` — the residual, as a leaf that still
@@ -302,7 +308,19 @@ private def mkVV (ctx : Ctx) (a : Expr) (op : CmpOp) (b : Expr) : MetaM Expr := 
     `vvOrd` demand `SqlOrd τ`, so a nullable or closed-enum column (whose
     `none`/constructor order does not match SQLite NULL/TEXT ordering)
     fails to build and falls through. -/
-private def cmpStrict (ctx : Ctx) (op : CmpOp) (a b : Expr) : MetaM (Option Expr) := do
+private partial def cmpStrict (ctx : Ctx) (op : CmpOp) (a b : Expr) : MetaM (Option Expr) := do
+  -- `some a OP some b` is `a OP b`, and `some _ OP none` is decided: the
+  -- shapes a substituted optional filter leaves (`some col == some c`),
+  -- where the column sits under the `some`
+  if op.isEq then
+    let aW ← whnfR a
+    let bW ← whnfR b
+    let aSome := aW.isAppOfArity ``Option.some 2
+    let bSome := bW.isAppOfArity ``Option.some 2
+    if aSome && bSome then
+      return ← cmpStrict ctx op (aW.getArg! 1) (bW.getArg! 1)
+    if (aSome && bW.isAppOfArity ``Option.none 1) || (bSome && aW.isAppOfArity ``Option.none 1) then
+      return some (if op == .eq then ffE ctx else ttE ctx)
   let ca? ← colOf? ctx a
   let cb? ← colOf? ctx b
   match ca?, cb? with
@@ -390,7 +408,9 @@ private partial def strict (ctx : Ctx) (fuel : Nat) (e : Expr) :
     if let some (c, _) ← colOf? ctx (e.getArg! 1) then
       let ctor := if e.isAppOfArity ``Option.isNone 2 then ``Pred.isNull else ``Pred.isNotNull
       return ← attempt (mkAppM ctor #[c])
-    return none
+    -- not a column: an optional filter's `param.isNone`, decided by the
+    -- case split on the parameter's world
+    return ← caseSplit fuel e
   -- `EnumSet.contains col a`: a bit test when `a` is a closed value; when
   -- `a` is itself a closed-enum column, the case split below substitutes
   -- each constructor and lands here again
@@ -422,22 +442,24 @@ where
       first: `⋁_c (col IS 'c' ∧ strict (e[col := c]))`. When none is
       left, a captured parameter of closed-enum type (a free variable
       that is not a row component): `⋁_c (param IS 'c' ∧ strict (e[param := c]))`,
-      the guard a value/value test. Both are exhaustive because the world
-      is closed, and each branch is guarded by the equality that
-      justifies its substitution. -/
+      the guard a value/value test; then a captured `Option α` parameter
+      for closed `α`, over `none :: (ClosedEnum.all α).map some`, guarded
+      the same way. All are exhaustive because the world is closed, and
+      each branch is guarded by the equality that justifies its
+      substitution. -/
   caseSplit (fuel : Nat) (e : Expr) : MetaM (Option Expr) := do
     if fuel == 0 then return none
     if let some (colExpr, c, enumName) ← findEnumCol e then
-      return ← splitWorld fuel e colExpr enumName fun ctor => attempt (mkCmp c .eq ctor)
-    let some (param, enumName) ← findEnumParam e | return none
-    splitWorld fuel e param enumName fun ctor => attempt (mkVV ctx param .eq ctor)
-  /-- `⋁_c (tag c ∧ strict (e[x := c]))` over the constructors of `enumName`. -/
-  splitWorld (fuel : Nat) (e x : Expr) (enumName : Name) (tag : Expr → MetaM (Option Expr)) :
+      return ← splitWorld fuel e colExpr (← enumWorld enumName) fun ctor => attempt (mkCmp c .eq ctor)
+    if let some (param, enumName) ← findEnumParam e then
+      return ← splitWorld fuel e param (← enumWorld enumName) fun ctor => attempt (mkVV ctx param .eq ctor)
+    let some (param, world) ← findOptEnumParam e | return none
+    splitWorld fuel e param world fun ctor => attempt (mkVV ctx param .eq ctor)
+  /-- `⋁_c (tag c ∧ strict (e[x := c]))` over the values `world` of a closed type. -/
+  splitWorld (fuel : Nat) (e x : Expr) (world : Array Expr) (tag : Expr → MetaM (Option Expr)) :
       MetaM (Option Expr) := do
-    let info ← getConstInfoInduct enumName
     let mut acc := ffE ctx
-    for ctorName in info.ctors do
-      let ctor := mkConst ctorName
+    for ctor in world do
       let e' := e.replace fun y => if y == x then some ctor else none
       let some branch ← strict ctx (fuel - 1) e' | return none
       let some guard ← tag ctor | return none
@@ -466,6 +488,28 @@ where
         if (← synthInstance? (← mkAppM ``LeanDb.ClosedEnum #[ty])).isSome then
           return some (x, tyName)
     return none
+  /-- First free variable of type `Option α`, `α` a closed enum, that is
+      not a row component — an optional filter — with its world,
+      `none :: (ClosedEnum.all α).map some`. Runs after `findEnumParam`,
+      so plain closed-enum parameters split first. -/
+  findOptEnumParam (e : Expr) : MetaM (Option (Expr × Array Expr)) := do
+    let st := collectFVars {} e
+    for fv in st.fvarIds do
+      let x := mkFVar fv
+      if ctx.comps.contains x then continue
+      let ty ← whnfR (← instantiateMVars (← inferType x))
+      unless ty.isAppOfArity ``Option 1 do continue
+      let .const _ us := ty.getAppFn | continue
+      let α ← whnfR (ty.getArg! 0)
+      let .const αName _ := α | continue
+      unless (← synthInstance? (← mkAppM ``LeanDb.ClosedEnum #[α])).isSome do continue
+      let noneE := mkApp (mkConst ``Option.none us) α
+      let somes := (← enumWorld αName).map fun c => mkApp2 (mkConst ``Option.some us) α c
+      return some (x, #[noneE] ++ somes)
+    return none
+  /-- The constructors of a closed enum, as terms. -/
+  enumWorld (enumName : Name) : MetaM (Array Expr) :=
+    return (← getConstInfoInduct enumName).ctors.toArray.map mkConst
   collectApps (e : Expr) (acc : Array Expr) : Array Expr :=
     match e with
     | .app f a => collectApps f (collectApps a (acc.push e))

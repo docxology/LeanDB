@@ -40,6 +40,10 @@ LEP-0003 A landed: `EnumSet α` bitmask columns over a closed world —
 mask CHECK, open-time drift scan, JSON as an array of names, `Pred.bit`
 so membership pushes; kernels' `fuses`.
 
+Pushdown: a captured `Option α` parameter over a closed world case-splits
+(`none` and each `some c`), so "filter by X if given" pushes in both the
+`isNone ||` and the `match` spelling; `some a == some b` unwraps.
+
 LEP-0005 stage 1 (eats): configurable espresso offers — a finite
 configuration type with a validity predicate, typed option patterns, a
 price rule with `decide`d lints, a tabulated `offer_price` table, order
