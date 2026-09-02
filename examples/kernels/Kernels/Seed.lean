@@ -57,7 +57,7 @@ private def kernel! (name : String) (op : OpKind) (lang : Lang) (variant : Strin
   let k ← seedM name do
     Kernel.make (← KernelName.make name) op lang (← Variant.make variant) (← s)
       minArch maxArch (← LaunchConfig.make block smem stages) deterministic accum
-      (FusedOps.make fuses) (← SourceHash.make (fakeHash name)) license
+      (EnumSet.ofList fuses) (← SourceHash.make (fakeHash name)) license
   insert Kernel k
 
 private def bench! (k : Stored Kernel) (sku : Gpu) (binding : String) (prec : DType)

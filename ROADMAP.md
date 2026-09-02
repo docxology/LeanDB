@@ -15,7 +15,7 @@ has the query that needs it.
 | R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
 | R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
-| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done; LEP-0003 B1–B3 done 2026-09-01; A, C, D open |
+| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | LEP-0004 done; LEP-0003 A, B1–B3 done 2026-09-01; C, D open |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
 ---
@@ -113,8 +113,13 @@ Both written 2026-09-01 from R1/R2 evidence; implementation order below.
   (attributes are not allowed on fields) recomputed on write and checked
   on read. kernels: `KernelSig`/`LaunchConfig` through `ColCodec.json`,
   search columns derived, raw-SQL desync refused on read; every
-  shape-less base's fingerprint unchanged. Open: A `EnumSet` (+
-  `Pred.bit`), C inline flatten, D child tables.
+  shape-less base's fingerprint unchanged. **A landed:** `EnumSet α` as an
+  INTEGER bitmask with a mask CHECK, drift scan, names-array JSON,
+  `Pred.bit` (membership pushes as `(col & ?) != 0`, `a ∈ s` recognized),
+  migrations append/truncate only (reorder/middle-removal refused — bits
+  would change meaning), fingerprint covers the variant names; kernels'
+  `fuses` uses it. Open: C inline flatten, D child tables; eats'
+  hand-rolled `KindSet` can switch to `EnumSet`.
 
 ## R4b — LEP-0005, configurable entities
 

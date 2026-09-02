@@ -293,6 +293,18 @@ def planMigration (old new : List TableSpec) : Except String MigPlan := do
         for c in reshaped do
           if let some o := oldSpec.columns.find? (·.name == c.name) then
             shapeChange spec.name c.name o.shape c.shape
+        -- EnumSet worlds: bit k means variant k, so only a change that keeps
+        -- every surviving variant at its bit — append, or truncate — is a
+        -- migration of the data. Anything else silently re-labels stored
+        -- bits; refused by name.
+        for c in spec.columns do
+          if let some o := oldSpec.columns.find? (·.name == c.name) then
+            if let (some ovs, some nvs) := (o.enumSet, c.enumSet) then
+              let common := min ovs.size nvs.size
+              unless ovs.extract 0 common == nvs.extract 0 common do
+                throw s!"table \"{spec.name}\": EnumSet column \"{c.name}\" changed its variant \
+order ({ovs} → {nvs}) — stored bits would change meaning. Append or truncate \
+variants only, or migrate by hand."
         -- DDL-level changes, the shape aside
         let changed := spec.columns.toList.filter fun c =>
           match oldSpec.columns.find? (·.name == c.name) with

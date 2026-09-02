@@ -19,6 +19,7 @@ def main (args : List String) : IO UInt32 := do
         return Json.mkObj [("ok", Json.bool true), ("seeded", Json.bool true)]),
       query% candidates,
       query% forArch,
+      query% fusing,
       query% highRank,
       query% fastest,
       query% regressions,

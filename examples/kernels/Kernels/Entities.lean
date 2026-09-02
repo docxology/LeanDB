@@ -13,8 +13,9 @@ values three different ways, deliberately, so the base can report on each:
   costs: `smemBytes ≤ 100000` is residual).
 - `deterministic`/`accum` — `NumericProps` inline-flattened by hand into
   sibling columns; both push.
-- `fuses : FusedOps` — a set of a closed world as canonical TEXT (the
-  `EnumSet` gap).
+- `fuses : EnumSet OpKind` — a set of a closed world as an INTEGER
+  bitmask (LEP-0003 A): membership pushes as a bit test, the DDL CHECK
+  bounds the mask, row JSON shows the names.
 
 The search columns `inDtype0`/`outDtype0`/`rank0` are **derived** (LEP-0003
 B3): their defaults are `derived <fact of sig>`, so `Entity.encode`
@@ -62,7 +63,7 @@ structure Kernel where
   deterministic : Bool
   /-- `NumericProps`, flattened: accumulation dtype. -/
   accum         : DType
-  fuses         : FusedOps
+  fuses         : EnumSet OpKind
   source        : SourceHash
   license       : License
   /-- Derived search column: `sig.ins[0].dtype`, recomputed on write,
@@ -78,7 +79,7 @@ structure Kernel where
     derived columns need no help: their defaults compute them. -/
 def Kernel.make (name : KernelName) (op : OpKind) (lang : Lang) (variant : Variant)
     (sig : KernelSig) (minArch : Arch) (maxArch : Option Arch) (launch : LaunchConfig)
-    (deterministic : Bool) (accum : DType) (fuses : FusedOps) (source : SourceHash)
+    (deterministic : Bool) (accum : DType) (fuses : EnumSet OpKind) (source : SourceHash)
     (license : License) : Except String Kernel := do
   if let some mx := maxArch then
     unless mx.supports minArch do

@@ -4,7 +4,7 @@ import Kernels
 time (`#check_failure`), the `KernelSig` boundary (codec round trip, `make`
 refusals, CLI-path insert of a malformed signature), the derived search
 columns (LEP-0003 B3: recomputed on write, checked on read), and every
-query over seed data. The three headline `kernels log` plans are printed,
+query over seed data. The four headline `kernels log` plans are printed,
 not asserted — they are the evidence the README quotes. -/
 
 open LeanDb Kernels
@@ -35,6 +35,10 @@ deriving instance Inhabited for Kernels.DimVar, Kernels.DimBinding, Kernels.Kern
 #check_failure LeanDb.delete (α := GpuMarket.Gpu) ⟨1⟩
 -- A predicate over the wrong table does not typecheck.
 #check_failure LeanDb.select [Kernel] (fun (m : Stored Bench) => m.val.sku == Gpu.h100Sxm)
+-- LEP-0003 A acceptance: the bit-test leaf over the `fuses` column is a plan.
+#check (Pred.bit (.here Kernel.Field.fuses) .silu true : Pred [Kernel])
+-- …and over a column that is not an `EnumSet` it is not.
+#check_failure (Pred.bit (.here Kernel.Field.op) .silu true : Pred [Kernel])
 
 /-! ## Typed composition
 
@@ -79,7 +83,7 @@ private def malformedRow : Lean.Json :=
   Lean.Json.mkObj [("name", "bad-sig"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
     ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
     ("launch", "{\"block\":256,\"smemBytes\":0,\"stages\":1}"), ("deterministic", true),
-    ("accum", "f32"), ("fuses", ""), ("license", "mit"),
+    ("accum", "f32"), ("fuses", Lean.Json.arr #[]), ("license", "mit"),
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "bf16"), ("outDtype0", "bf16"), ("rank0", 2)]
 
@@ -90,7 +94,7 @@ private def lyingRow : Lean.Json :=
   Lean.Json.mkObj [("name", "lying-columns"), ("op", "gemm"), ("lang", "cuda"), ("variant", "x"),
     ("sig", sig), ("minArch", "sm90"), ("maxArch", Lean.Json.null),
     ("launch", "{\"block\":256,\"smemBytes\":0,\"stages\":1}"), ("deterministic", true),
-    ("accum", "f32"), ("fuses", ""), ("license", "mit"),
+    ("accum", "f32"), ("fuses", Lean.Json.arr #["silu", "gelu"]), ("license", "mit"),
     ("source", Lean.Json.str ("".pushn '0' 64)),
     ("inDtype0", "f64"), ("outDtype0", "f64"), ("rank0", 7)]
 
@@ -124,7 +128,22 @@ private def pureChecks : IO Unit := do
   | .ok k =>
       check (k.inDtype0 == .bf16 && k.outDtype0 == .bf16 && k.rank0 == 1)
         "CLI insert recomputes the derived search columns from sig"
+      -- the EnumSet column comes in as names (LEP-0003 A)
+      check (k.fuses == EnumSet.ofList [.silu, .gelu] && k.fuses.names == ["silu", "gelu"])
+        "fuses decodes from an array of names"
   | .error e => throw <| IO.userError s!"FAIL: lying row unexpectedly refused: {e}"
+  -- an unknown fused op is refused by name; so is a stray bit
+  match rowOfJson Kernel (Lean.Json.mkObj (lyingRow.getObj?.toOption.map (·.toList.map fun (k, v) =>
+      if k == "fuses" then (k, Lean.Json.arr #["swish"]) else (k, v)) |>.getD [])) with
+  | .error (.decode "kernel" "fuses" m) => check ((m.splitOn "\"swish\"").length == 2) s!"unknown fused op message, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: unknown fused op: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: an unknown fused op was accepted"
+  -- the column's spec: INTEGER, the world's names, a mask CHECK in the DDL
+  let fusesSpec := (Entity.columns Kernel).find? (·.name == "fuses")
+  check ((fusesSpec.map (·.sqlType)) == some .integer && (fusesSpec.bind (·.enumSet)) == some (ClosedEnum.variants OpKind)
+    && (fusesSpec.bind (·.enum)).isNone) "fuses is an INTEGER column carrying OpKind's world"
+  check (((Entity.spec Kernel).ddl.splitOn "\"fuses\" INTEGER NOT NULL CHECK ((\"fuses\" & ~1048575) = 0)").length == 2)
+    s!"fuses DDL carries the 20-variant mask CHECK, got {(Entity.spec Kernel).ddl}"
   -- the derived columns may be omitted altogether
   let omitted := Lean.Json.mkObj (lyingRow.getObj?.toOption.map (·.toList.filter fun (k, _) =>
     k != "inDtype0" && k != "outDtype0" && k != "rank0") |>.getD [])
@@ -193,6 +212,17 @@ private def runQueries : DbM (Array Lean.Json) := do
   checkD ((← candidates .gemm .sm90 .f16).isEmpty) "maxArch sm89 excludes sm90"
   checkD (names (← candidates .gemm .gfx942 .bf16) == #["gemm-ck-gfx942-bf16", "gemm-ck-gfx942-bf16-silu"])
     "cross-vendor is never supported"
+  -- fusing: membership in the EnumSet column pushes as a bit test (LEP-0003 A)
+  checkD (names (← fusing .silu) == #["gemm-ck-gfx942-bf16-silu"]) "fusing silu finds the silu-epilogue GEMM"
+  checkD ((← fusing .gelu).isEmpty) "nothing fuses gelu"
+  let silu ← fusing .silu
+  checkD ((silu.map fun k => (rowJson Kernel k).compress).any fun j => (j.splitOn "\"fuses\":[\"silu\"]").length == 2)
+    "row JSON shows the fused ops by name"
+  let plainRows ← select [Kernel] (fun k => !(k.val.fuses.contains .silu)) (.key (·.val.name))
+  checkD (plainRows.size == 13 && !(names plainRows).contains "gemm-ck-gfx942-bf16-silu") "negated membership"
+  checkD (((← readLog 1).getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "kernel | pushed: ((t0.\"fuses\" & ?) = 0), residual conjuncts: 0")
+    s!"negated fusing plan, got {← readLog 1}"
   -- fastest: join + canonical binding TEXT
   let some (k, m) ← fastest .gemm .h100Sxm g1 | throw (.sqlite "FAIL: fastest found nothing")
   checkD (k.val.name.raw == "gemm-cutlass-sm90-bf16-bf16out" && m.val.latency.us == 168)
@@ -261,13 +291,14 @@ private def runQueries : DbM (Array Lean.Json) := do
   discard <| candidates .gemm .sm90 .bf16
   discard <| fastest .gemm .h100Sxm g1
   discard <| regressions .h100Sxm
-  readLog 3
+  discard <| fusing .silu
+  readLog 4
 
 def main : IO UInt32 := do
   pureChecks
   if ← dbPath.pathExists then IO.FS.removeFile dbPath
   let log ← expectOk (← withDb dbPath schema runQueries) "seed + queries"
-  IO.println "kernels log — the three headline plans:"
+  IO.println "kernels log — the four headline plans:"
   for entry in log.reverse do
     IO.println s!"  {(entry.getObjValAs? String "detail").toOption.getD "?"}"
   -- data persists across reopen; the JSON column decodes on the way back,

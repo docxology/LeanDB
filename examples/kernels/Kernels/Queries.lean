@@ -49,6 +49,13 @@ def forArch (op : OpKind) (arch : Arch) : DbM (Array (Stored Kernel)) :=
         && (k.val.maxArch.isNone || k.val.maxArch == some arch))
     (.key (·.val.name))
 
+/-- Kernels whose epilogue fuses `op`. `fuses` is an `EnumSet OpKind`
+    (LEP-0003 A): membership pushes as a bit test on the INTEGER mask,
+    `("fuses" & ?) != 0`, residual 0 — the question a set is for, which
+    the canonical-TEXT encoding it replaced could not answer in SQL. -/
+def fusing (op : OpKind) : DbM (Array (Stored Kernel)) :=
+  select [Kernel] (fun k => k.val.fuses.contains op) (.key (·.val.name))
+
 /-- Kernels whose first input is rank ≥ 3 *and* whose signature says so —
     the search column pushes, the second test reads `sig` and is residual
     by nature. Kept as the smallest honest example of the gap. -/
@@ -228,7 +235,7 @@ def kernelInfo (n : KernelName) : DbM Json := do
     ("op", Json.str (ClosedEnum.encodeName k.val.op)),
     ("sig", Json.str k.val.sig.describe),
     ("launch", Lean.toJson k.val.launch),
-    ("fuses", Json.str k.val.fuses.encode),
+    ("fuses", Lean.toJson k.val.fuses.names),
     ("inDtype0", Json.str (ClosedEnum.encodeName k.val.inDtype0)),
     ("outDtype0", Json.str (ClosedEnum.encodeName k.val.outDtype0)),
     ("rank0", Lean.toJson k.val.rank0)]

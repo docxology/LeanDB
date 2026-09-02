@@ -36,6 +36,10 @@ the migration diff see (additive-with-defaults changes restamp, others
 are refused by name); `:= derived expr` columns are recomputed on write
 and checked on read. kernels' signature and search columns use them.
 
+LEP-0003 A landed: `EnumSet α` bitmask columns over a closed world —
+mask CHECK, open-time drift scan, JSON as an array of names, `Pred.bit`
+so membership pushes; kernels' `fuses`.
+
 LEP-0005 stage 1 (eats): configurable espresso offers — a finite
 configuration type with a validity predicate, typed option patterns, a
 price rule with `decide`d lints, a tabulated `offer_price` table, order

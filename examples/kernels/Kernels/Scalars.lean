@@ -8,10 +8,11 @@ Validated newtypes, each with its own smart constructor and a
 `Timestamp`, … pushes to SQL through the projection (`m.val.latency.us`)
 and equality pushes on every one of them.
 
-Two of these are *encodings of structure into one TEXT column*:
+One of these is an *encoding of structure into one TEXT column*:
 `DimBinding` (a sorted assignment, order-independent, so equality is
-`TEXT IS`) and `FusedOps` (a sorted set of a closed world — the `EnumSet`
-gap named in plan-v2 M3). Both push equality and nothing else. -/
+`TEXT IS`). It pushes equality and nothing else. The set of fused ops
+used to be the same kind of thing (`FusedOps`, canonical TEXT); it is an
+`EnumSet OpKind` now (LEP-0003 A), declared on the entity directly. -/
 
 namespace Kernels
 
@@ -191,30 +192,5 @@ def DimBinding.decode (s : String) : Except String DimBinding := do
 
 instance : ColCodec DimBinding := ColCodec.via DimBinding.encode DimBinding.decode
 instance : ToString DimBinding := ⟨DimBinding.encode⟩
-
-/-- A set of ops a kernel fuses into its epilogue, as a sorted, deduplicated
-    comma-separated TEXT of variant names. Equality pushes; membership
-    ("fuses silu") does not — that is the `EnumSet` gap. -/
-structure FusedOps where
-  ops : List OpKind
-  deriving Repr, DecidableEq
-
-def FusedOps.make (ops : List OpKind) : FusedOps :=
-  ⟨(ops.eraseDups.toArray.qsort fun a b => compare a b == .lt).toList⟩
-
-def FusedOps.encode (f : FusedOps) : String :=
-  String.intercalate "," (f.ops.map LeanDb.ClosedEnum.encodeName)
-
-def FusedOps.decode (s : String) : Except String FusedOps := do
-  if s.isEmpty then return ⟨[]⟩
-  let ops ← (s.splitOn ",").mapM fun name =>
-    match LeanDb.ClosedEnum.decodeName (α := OpKind) name with
-    | some op => pure op
-    | none => throw s!"fused op {String.quote name} is not in the closed world"
-  return FusedOps.make ops
-
-instance : ColCodec FusedOps := ColCodec.via FusedOps.encode FusedOps.decode
-
-def FusedOps.contains (f : FusedOps) (op : OpKind) : Bool := f.ops.contains op
 
 end Kernels

@@ -1,22 +1,23 @@
 # kernels — GPU kernels, typed signatures, programs, per-SKU benches
 
 The base from `proposals/stress-domains-kernels-restaurants.md` §1, built
-against the engine as it is (ROADMAP R2), then moved onto LEP-0003 stage
-B as it landed. Its job is to make the nested-values decision concrete:
-`KernelSig` lives in **one JSON column with a declared shape**, the
-common filters go through **derived search columns** the engine
-recomputes and checks, and everything that looks *inside* a signature —
+against the engine as it is (ROADMAP R2), then moved onto LEP-0003 stages
+B and A as they landed. Its job is to make the nested-values decision
+concrete: `KernelSig` lives in **one JSON column with a declared shape**,
+the common filters go through **derived search columns** the engine
+recomputes and checks, the fused-op set is an **`EnumSet` bitmask** whose
+membership pushes, and everything that looks *inside* a signature —
 instantiation, unification, composition into `Prog ins outs` — is Lean.
 `Bench.sku` is gpumarket's `Gpu`: the first cross-base type reuse, and
 its datasheet (`Gpu.spec`, `Gpu.tflops`) drives `roofline`.
 
 ```
 Kernels/Enums.lean     DType OpKind Lang Arch MemSpace License; Arch.supports (@[db]), Arch.ofGpu
-Kernels/Scalars.lean   Micros MilliTflops Permille KernelName Variant SourceHash … DimVar DimBinding FusedOps
+Kernels/Scalars.lean   Micros MilliTflops Permille KernelName Variant SourceHash … DimVar DimBinding
 Kernels/Sig.lean       Dim Layout TensorTy DimConstraint KernelSig (make, codec, instantiate), unify
-Kernels/Entities.lean  Kernel Bench Program ProgramNode ProgramEdge; LaunchConfig; Kernel.make
+Kernels/Entities.lean  Kernel (fuses : EnumSet OpKind) Bench Program ProgramNode ProgramEdge; LaunchConfig; Kernel.make
 Kernels/Prog.lean      Prog ins outs; launches, estimate, emit (skeleton), ofRows (the gate)
-Kernels/Queries.lean   candidates fastest composable synthesize regressions roofline program kernelInfo
+Kernels/Queries.lean   candidates fusing fastest composable synthesize regressions roofline program kernelInfo
 Kernels/Seed.lean      14 kernels, 19 benches (illustrative), one stored program
 ```
 
@@ -27,7 +28,8 @@ k=./.lake/build/bin/kernels
 $k query seed
 $k query synthesize gemm,rmsNorm h100Sxm M=4096,N=4096,K=4096
 $k query regressions h100Sxm
-$k log 3
+$k query fusing silu
+$k log 4
 ```
 
 `CLI_TRANSCRIPT.md` is the full session from a fresh `data/` dir. The
@@ -48,6 +50,11 @@ about gpumarket's own `defaultTargets` needed changing.
   checks them on every read. `DimBinding` is canonical TEXT
   (`K=4096,M=4096,N=4096`, sorted, no duplicates), so equality pushes as
   `binding IS ?` and the same binding typed in any order matches.
+  `fuses : EnumSet OpKind` is an INTEGER bitmask — bit *k* is `OpKind`'s
+  *k*-th constructor — with `CHECK (("fuses" & ~1048575) = 0)` in the
+  DDL, an open-time scan for bits outside the world, the names in the
+  fingerprint, and `["silu"]` in row JSON; `k.val.fuses.contains op`
+  pushes as `("fuses" & ?) != 0`.
 - **Program layer.** `Prog : List TensorTy → List TensorTy → Type` with
   `kernel` (a `Stored Kernel`, a binding, and a proof that the signature
   instantiates to the node's edge types), `id`, `seq`, `par`, `swap`,
@@ -59,7 +66,8 @@ about gpumarket's own `defaultTargets` needed changing.
   names, dtype/shape per edge — not CUDA); `Prog.estimate` sums benches.
 - **Queries.** `candidates` pushes every conjunct (`Arch.supports` becomes
   a case split over `minArch`, folded at plan build to the disjunction of
-  the architectures the captured arch supports); `fastest` is a pushed join sorted client-side;
+  the architectures the captured arch supports); `fusing` is one pushed
+  bit test; `fastest` is a pushed join sorted client-side;
   `regressions` is a pushed self-join with the 10% arithmetic residual;
   `composable` narrows on `inDtype0` then unifies in Lean; `synthesize`
   searches candidates depth-first, threading edge types, and returns
@@ -73,8 +81,8 @@ about gpumarket's own `defaultTargets` needed changing.
 Everything below was measured on this base (`set_option leandb.explain
 true`, `kernels log`); residual counts are from the tactic. The first
 three paragraphs are the record as it was measured against the R2
-engine; **"What stage B changed"** at the end of the section says which
-of it no longer holds.
+engine; **"What stage B changed"** and **"What stage A changed"** at the
+end of the section say which of it no longer holds.
 
 **Predicates I wanted over `sig` and could not push.** Each is one
 `select [Kernel]` conjunct that reads the JSON column; each is `residual
@@ -156,9 +164,9 @@ which a derive can keep (`launch_block`, or a nested object on output).
   dtype, rank, layoutKind)`) — the only encoding under which "exactly two
   inputs", "any input column-major" and per-input rank push, and they push
   as LEP-0004's `exists`/`forall`. `ProgramEdge` already is one.
-- *`EnumSet` for `fuses`* — the canonical-TEXT set is the cheapest thing
-  that works today and the cheapest thing to replace; membership is the
-  one question a set is for.
+- *`EnumSet` for `fuses`* — landed as stage A (below): the canonical-TEXT
+  set was the cheapest thing that worked and the cheapest thing to
+  replace; membership is the one question a set is for, and it pushes now.
 - *Canonical TEXT for `DimBinding`* is right as it is: equality is the
   only question asked of it, and it pushes.
 
@@ -228,12 +236,46 @@ column all worked unchanged.
   fields, so the mark is the `derived` wrapper in the default rather than
   the `@[derived]` the LEP wrote.
 
+**What stage A changed (LEP-0003 A, `EnumSet`).** `fuses` moved from
+"canonical TEXT, equality only" to `EnumSet OpKind`: one INTEGER column
+holding a bitmask, bit *k* for `OpKind`'s *k*-th constructor. What that
+bought, each shown in the transcript and pinned in `KernelsTests`:
+
+- *Membership pushes.* `fusing op` is `select [Kernel] (fun k =>
+  k.val.fuses.contains op)`; the log line is `kernel | pushed:
+  ((t0."fuses" & ?) != 0), residual conjuncts: 0`, the bound value the
+  op's bit. `!(k.val.fuses.contains .silu)` is the same test against
+  `= 0` — one `Pred.bit` leaf whose negation flips a flag, so it stays
+  exact under `!`. `op ∈ k.val.fuses` is accepted too. `--eq fuses=1024`
+  is set *equality* through the codec, not membership — the CLI filter is
+  still `IS`.
+- *The world is in the schema.* The DDL says `CHECK (("fuses" & ~1048575)
+  = 0)` — the mask of 20 variants — so a raw write of bit 20 is refused
+  by the file; the open-time drift scan runs the same test for bits
+  written under an older world; the fingerprint hashes the variant
+  *names* (the DDL sees only the mask, and a renamed variant changes
+  what a stored bit means); `schema` lists them as `enumSet`. This
+  base's fingerprint moved from `535084016606190269` to the transcript's.
+- *Growing the world is a rebuild that keeps every bit; shrinking it is
+  refused by the data.* Appending an `OpKind` constructor changes the
+  mask, so `migrate` rebuilds the table (old rows keep their bits);
+  removing the last constructor rebuilds under the smaller CHECK, which
+  fails on any row still using that bit and rolls back — exactly as
+  closed-enum columns behave. Removing a constructor from the *middle*,
+  or reordering, would silently re-label the bits above it, so
+  `migrate` refuses it by name ("changed its variant order"). The
+  engine tests cover all three on a two-column table.
+- *JSON is names.* Row JSON shows `"fuses":["silu"]`; `insert` takes an
+  array of names (`"swish"` is refused naming the world) or the bare
+  mask for round-tripping (bit 20 is refused by index: `kernel.fuses:
+  bit 20 is not in the closed world (20 variants)`). The `FusedOps`
+  scalar, its codec and its `make` are deleted.
+
 **What still stands.** Every per-input question in the first paragraph
 — "exactly two inputs", "any input column-major", per-input rank — is
 still residual: a derived column carries one fact about the *first*
 input, and a fixed set of columns still cannot describe a list. That is
 stage D's (child tables, after LEP-0004). `rows --eq` still cannot look
 inside `sig` or `launch`; `smemBytes ≤ 100000` is still residual until
-stage C flattens `LaunchConfig`; `fuses` is still canonical TEXT until
-stage A's `EnumSet`. And a *refused* shape change is refused, not
-migrated: typed value transformations are a later LEP.
+stage C flattens `LaunchConfig`. And a *refused* shape change is
+refused, not migrated: typed value transformations are a later LEP.

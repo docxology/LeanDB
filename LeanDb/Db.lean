@@ -409,6 +409,12 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
               unless vs.contains v do
                 return .error (.enumDrift spec.name c.name v)
             else break
+        -- an EnumSet column: no stored bit outside the world's mask
+        if let some vs := c.enumSet then
+          let stmt ← db.prepare
+            s!"SELECT {quoteId c.name} FROM {quoteId spec.name} WHERE ({quoteId c.name} & ~{enumSetMask vs.size}) != 0 LIMIT 1"
+          if ← stmt.step then
+            return .error (.enumDrift spec.name c.name (toString (← stmt.columnInt64 0)))
     writeMeta db "schema_fingerprint" fp
     writeMeta db "schema_json" (specsToJson specs).compress
     if (← readMeta db "schema_version").isNone then

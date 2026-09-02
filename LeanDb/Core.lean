@@ -253,6 +253,99 @@ instance (priority := 50) : ColEnum α := ⟨none⟩
 instance [ColEnum α] : ColEnum (Option α) := ⟨ColEnum.variants α⟩
 instance (priority := 100) [ClosedEnum α] : ColEnum α := ⟨some (ClosedEnum.variants α)⟩
 
+/-- A set over a closed world as an INTEGER bitmask (LEP-0003 A): bit `k`
+    is variant `k` in declaration order (`ClosedEnum.variants`, which
+    `all` agrees with). At most 62 variants, so every legal mask is a
+    positive `Int64`; a larger world is refused at the column boundary
+    (`fromCol`, `validateSchema`) — the in-memory operations wrap above
+    bit 63 and are only meaningful under that bound. The DDL carries
+    `CHECK ((col & ~mask) = 0)`, the open-time drift scan the same test,
+    and `Pred.bit` pushes membership as `(col & bit) != 0`. -/
+structure EnumSet (α : Type) [ClosedEnum α] where
+  bits : UInt64
+  deriving DecidableEq, Repr
+
+/-- The all-variants mask of a world of `n` variants — also the CHECK
+    bound. Saturates at 64 bits (a world that size is refused anyway). -/
+def enumSetMask (n : Nat) : UInt64 :=
+  if n ≥ 64 then (0 : UInt64) - 1 else ((1 : UInt64) <<< n.toUInt64) - 1
+
+/-- The most variants an `EnumSet` column admits. -/
+def EnumSet.maxVariants : Nat := 62
+
+namespace EnumSet
+
+variable {α : Type} [ClosedEnum α]
+
+/-- A variant's position in declaration order — its bit index. -/
+def index (a : α) : Nat :=
+  ((ClosedEnum.variants α).findIdx? (· == ClosedEnum.encodeName a)).getD 0
+
+/-- The single-bit mask of a variant. -/
+def bitOf (a : α) : UInt64 := (1 : UInt64) <<< (index a).toUInt64
+
+/-- All-variants mask; also the CHECK bound. -/
+def mask (α : Type) [ClosedEnum α] : UInt64 := enumSetMask (ClosedEnum.variants α).size
+
+def empty : EnumSet α := ⟨0⟩
+def full : EnumSet α := ⟨mask α⟩
+def contains (s : EnumSet α) (a : α) : Bool := (s.bits &&& bitOf a) != 0
+def insert (s : EnumSet α) (a : α) : EnumSet α := ⟨s.bits ||| bitOf a⟩
+def erase (s : EnumSet α) (a : α) : EnumSet α := ⟨s.bits &&& ~~~ bitOf a⟩
+def ofList (as : List α) : EnumSet α := as.foldl insert empty
+/-- The members, in declaration order. -/
+def toList (s : EnumSet α) : List α := (ClosedEnum.all (α := α)).toList.filter s.contains
+def size (s : EnumSet α) : Nat := s.toList.length
+/-- The members' names, in declaration order (row JSON, diagnostics). -/
+def names (s : EnumSet α) : List String := s.toList.map ClosedEnum.encodeName
+
+instance : BEq (EnumSet α) := ⟨fun a b => a.bits == b.bits⟩
+instance : Inhabited (EnumSet α) := ⟨empty⟩
+instance : EmptyCollection (EnumSet α) := ⟨empty⟩
+instance : Membership α (EnumSet α) := ⟨fun s a => s.contains a = true⟩
+instance (a : α) (s : EnumSet α) : Decidable (a ∈ s) :=
+  inferInstanceAs (Decidable (s.contains a = true))
+
+/-- Index of the lowest set bit (64 when none). -/
+def lowestBit (x : UInt64) : Nat := Id.run do
+  for k in [0:64] do
+    if (x >>> k.toUInt64) &&& 1 != 0 then return k
+  return 64
+
+end EnumSet
+
+/-- An `EnumSet` stores as an INTEGER bitmask. Decoding refuses a bit
+    outside the world by index, and a world of more than 62 variants
+    outright — the same refusal `validateSchema` makes before any file
+    is opened. -/
+instance [ClosedEnum α] : ColCodec (EnumSet α) where
+  sqlType := .integer
+  toCol s := .int (Int64.ofNat s.bits.toNat)
+  fromCol
+    | .int v =>
+        let n := (ClosedEnum.variants α).size
+        if n > EnumSet.maxVariants then
+          .error s!"closed world has {n} variants; EnumSet supports at most {EnumSet.maxVariants}"
+        else if v < 0 then .error s!"expected a bitmask of {n} bits, found {v}"
+        else
+          let bits := v.toNatClampNeg.toUInt64
+          let stray := bits &&& ~~~ EnumSet.mask α
+          if stray != 0 then
+            .error s!"bit {EnumSet.lowestBit stray} is not in the closed world ({n} variants)"
+          else .ok ⟨bits⟩
+    | c => expected "INTEGER" c
+
+/-- Bitmask-world metadata for a column type, in the `ColEnum` pattern:
+    the variant names of an `EnumSet` column, for the CHECK bound, row
+    JSON, the fingerprint and the drift scan. -/
+class ColEnumSet (α : Type) where
+  variants : Option (Array String) := none
+
+instance (priority := 50) : ColEnumSet α := ⟨none⟩
+instance [ColEnumSet α] : ColEnumSet (Option α) := ⟨ColEnumSet.variants α⟩
+instance (priority := 100) [ClosedEnum α] : ColEnumSet (EnumSet α) :=
+  ⟨some (ClosedEnum.variants α)⟩
+
 /-- Foreign-key metadata for a column type. The catch-all instance says
     "not a reference"; `LeanDb.Entity` provides the `Id β` instance. -/
 class RefTarget (α : Type) where
@@ -342,6 +435,11 @@ structure ColumnSpec where
   nullable : Bool
   fkTable : Option String
   enum : Option (Array String) := none
+  /-- The variant names of an `EnumSet` column (LEP-0003 A): the CHECK is
+      `(col & ~mask) = 0` with `mask` over their count, row JSON renders
+      the set as an array of these names, and the fingerprint hashes
+      them. A column carries `enum` or `enumSet`, never both. -/
+  enumSet : Option (Array String) := none
   /-- Declared default, as an evaluated column value — emitted as a SQL
       `DEFAULT`, used when incoming JSON omits the field, and what lets a
       migration add a NOT NULL column to existing rows. -/
@@ -355,12 +453,13 @@ structure ColumnSpec where
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
 def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
-    [ColCodec α] [RefTarget α] [ColEnum α] : ColumnSpec where
+    [ColCodec α] [RefTarget α] [ColEnum α] [ColEnumSet α] : ColumnSpec where
   name := name
   sqlType := ColCodec.sqlType α
   nullable := ColCodec.nullable α
   fkTable := RefTarget.target α
   enum := ColEnum.variants α
+  enumSet := ColEnumSet.variants α
   dflt := dflt
   shape := ColCodec.shape α
 

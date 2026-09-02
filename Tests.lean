@@ -1480,6 +1480,274 @@ def run : IO Unit := do
 
 end Lep3
 
+/-! ## LEP-0003 A: `EnumSet` — a set over a closed world as an INTEGER bitmask -/
+
+namespace EnumSetA
+
+inductive Tri where
+  | x | y | z
+  deriving Repr, DecidableEq, LeanDb.ClosedEnum
+
+structure Tagged where
+  name : String
+  kind : Tri
+  tags : EnumSet Tri
+  deriving Repr, LeanDb.Entity
+
+/-- A world of 63 names — one more than an `EnumSet` column admits. The
+    instance is deliberately incoherent (one constructor, 63 names): only
+    its `variants` count matters to the refusal. -/
+inductive Big where
+  | only
+  deriving Repr, DecidableEq
+
+instance : ClosedEnum Big where
+  variants := (Array.range 63).map fun k => s!"v{k}"
+  all := #[.only]
+  encodeName _ := "v0"
+  decodeName _ := some .only
+
+private def bitPlan : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) => t.val.tags.contains .y) := by
+  leandb_plan
+private def notBitPlan : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) => !(t.val.tags.contains .y)) := by
+  leandb_plan
+private def paramBitPlan (a : Tri) : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) => t.val.tags.contains a) := by
+  leandb_plan
+private def memPlan : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) => Tri.z ∈ t.val.tags) := by
+  leandb_plan
+/-- The member is a closed-enum *column*: the case split on `kind` leaves a
+    bit test per constructor. -/
+private def colBitPlan : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) => t.val.tags.contains t.val.kind) := by
+  leandb_plan
+private def mixedPlan : PlanFor (ts := [Tagged]) (fun (t : Stored Tagged) =>
+    t.val.tags.contains .x && t.val.name != "skip") := by leandb_plan
+
+private def pj (s : String) : IO Lean.Json :=
+  match Lean.Json.parse s with
+  | .ok j => pure j
+  | .error e => throw <| IO.userError s!"FAIL: bad test JSON: {e}"
+
+private def tagsSpec : ColumnSpec := (Entity.columns Tagged).getD 2 default
+
+private def testCodec : IO Unit := do
+  let s : EnumSet Tri := .ofList [.z, .x]
+  check (s.contains .x && !s.contains .y && s.contains .z) "contains"
+  check (s.toList == [.x, .z] && s.names == ["x", "z"] && s.size == 2) "toList in declaration order"
+  check ((s.insert .y).bits == 7 && s.erase .x == EnumSet.ofList [.z] && s.erase .y == s) "insert/erase"
+  check (EnumSet.mask Tri == 7 && (EnumSet.full : EnumSet Tri).toList == [.x, .y, .z]) "mask and full"
+  check (EnumSet.bitOf Tri.y == 2 && EnumSet.index Tri.z == 2) "the bit is the declaration index"
+  check (decide (Tri.x ∈ s) && !decide (Tri.y ∈ s)) "Membership"
+  check (enumSetMask 0 == 0 && enumSetMask 62 == 4611686018427387903) "enumSetMask"
+  check (roundtrip s && roundtrip (EnumSet.empty : EnumSet Tri) && roundtrip (EnumSet.full : EnumSet Tri))
+    "codec round trips: a set, the empty set, the full set"
+  check (toCol s == .int 5 && toCol (EnumSet.empty : EnumSet Tri) == .int 0) "stored as the bitmask"
+  match (fromCol (.int 8) : Except String (EnumSet Tri)) with
+  | .error m => check (m == "bit 3 is not in the closed world (3 variants)") s!"stray bit message, got {m}"
+  | .ok _ => throw <| IO.userError "FAIL: a stray bit decoded"
+  check ((fromCol (.int (-1)) : Except String (EnumSet Tri)).isOk == false) "a negative mask is refused"
+  check ((fromCol (.text "x") : Except String (EnumSet Tri)).isOk == false) "TEXT is refused"
+  -- a world of more than 62 variants: refused by the codec and by validateSchema
+  match (fromCol (.int 0) : Except String (EnumSet Big)) with
+  | .error m => check (m == "closed world has 63 variants; EnumSet supports at most 62") s!"63-variant message, got {m}"
+  | .ok _ => throw <| IO.userError "FAIL: a 63-variant world decoded"
+  expectErr (validateSchema [⟨"big", #[columnSpec "s" (EnumSet Big)]⟩]) "schema"
+    "a 63-variant EnumSet column is refused by validateSchema"
+  check ((validateSchema [Entity.spec Tagged]).isOk) "a 3-variant world is fine"
+  -- the column spec and its DDL
+  check (tagsSpec.enumSet == some #["x", "y", "z"] && tagsSpec.enum == none && tagsSpec.sqlType == .integer
+    && tagsSpec.shape == none) s!"tags spec carries enumSet and nothing else, got {repr tagsSpec}"
+  check ((Entity.spec Tagged).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"tagged\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL, \"kind\" TEXT NOT NULL CHECK (\"kind\" IN ('x', 'y', 'z')), \"tags\" INTEGER NOT NULL CHECK ((\"tags\" & ~7) = 0))")
+    s!"tagged DDL golden, got {(Entity.spec Tagged).ddl}"
+  -- the fingerprint hashes the names: a rename leaves the DDL alone but not the fingerprint
+  let renamed : TableSpec := ⟨"tagged", (Entity.columns Tagged).map fun c =>
+    if c.name == "tags" then { c with enumSet := some #["x", "y", "w"] } else c⟩
+  check (renamed.ddl == (Entity.spec Tagged).ddl) "a renamed variant has the same DDL"
+  check (fingerprint [renamed] != fingerprint [Entity.spec Tagged]) "…and a different fingerprint"
+  -- an Option (EnumSet _) column is nullable and keeps the world
+  let optSpec := columnSpec "o" (Option (EnumSet Tri))
+  check (optSpec.nullable && optSpec.enumSet == some #["x", "y", "z"]) "Option lifts enumSet"
+
+private def testJson : IO Unit := do
+  let row : Stored Tagged := ⟨⟨1⟩, ⟨"a", .x, .ofList [.x, .z]⟩⟩
+  check ((rowJson Tagged row).compress == "{\"id\":1,\"kind\":\"x\",\"name\":\"a\",\"tags\":[\"x\",\"z\"]}")
+    s!"row JSON renders the set as names, got {(rowJson Tagged row).compress}"
+  let r1 ← expectOk (rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":[\"z\",\"x\"]}")) "array of names"
+  check (r1.tags == EnumSet.ofList [.x, .z]) "names decode to bits"
+  let r2 ← expectOk (rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":5}")) "bare bitmask"
+  check (r2.tags.bits == 5) "the bare bitmask is accepted on input"
+  let r3 ← expectOk (rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":[]}")) "empty array"
+  check (r3.tags == .empty) "the empty array is the empty set"
+  match rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":[\"x\",\"w\"]}") with
+  | .error (.decode "tagged" "tags" m) =>
+      check (m == "tags: \"w\" is not in the closed world #[x, y, z]") s!"unknown name is refused by name, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: unknown name: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: an unknown variant name was accepted"
+  match rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":8}") with
+  | .error (.decode "tagged" "tags" _) => pure ()
+  | .error e => throw <| IO.userError s!"FAIL: stray bit via JSON: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a stray bit was accepted through JSON"
+  check ((rowOfJson Tagged (← pj "{\"name\":\"a\",\"kind\":\"y\",\"tags\":true}")).isOk == false)
+    "a boolean is not a set"
+  let r4 ← expectOk (rowMergeJson Tagged r1 (← pj "{\"tags\":[\"y\"]}")) "merge"
+  check (r4.tags == EnumSet.ofList [.y] && r4.name == "a") "rowMergeJson replaces the set"
+  -- schema JSON carries enumSet and round-trips it
+  let spec := Entity.spec Tagged
+  check (((tagsSpec.toJson.getObjVal? "enumSet").toOption.bind (·.getArr?.toOption)).map
+      (·.filterMap (·.getStr?.toOption)) == some #["x", "y", "z"])
+    "schema JSON carries enumSet"
+  match specsFromJson? (specsToJson [spec]) with
+  | .ok [s'] => check (s' == spec) "schema JSON round-trips the enumSet column"
+  | .ok _ => throw <| IO.userError "FAIL: schema JSON round trip lost a table"
+  | .error e => throw <| IO.userError s!"FAIL: schema JSON round trip: {e}"
+
+private def testPred : IO Unit := do
+  let p : Pred [Tagged] := .bit (.here Tagged.Field.tags) Tri.y true
+  check (p.renderT == ("((t0.\"tags\" & ?) != 0)", #[.int 2])) s!"bit render, got {repr p.renderT}"
+  check (p.neg.renderT == ("((t0.\"tags\" & ?) = 0)", #[.int 2])) s!"negated bit render, got {repr p.neg.renderT}"
+  check (p.neg.neg.renderT == p.renderT) "neg is an involution on bit"
+  let row : Stored Tagged := ⟨⟨1⟩, ⟨"a", .x, .ofList [.y]⟩⟩
+  let other : Stored Tagged := ⟨⟨2⟩, ⟨"b", .x, .ofList [.x]⟩⟩
+  check (p.denote .empty row && !(p.denote .empty other)) "bit denotes contains"
+  check (!(p.neg.denote .empty row) && p.neg.denote .empty other) "negated bit denotes the complement"
+  check (p.residuals == 0 && p.tables == [0] && !p.hasJoin && p.approx.renderT == p.renderT && p.size == 1)
+    "bit is a pushed leaf"
+  check (p.describe == "pushed: ((t0.\"tags\" & ?) != 0), residual conjuncts: 0") s!"describe, got {p.describe}"
+  -- the tactic
+  checkPlan bitPlan "((t0.\"tags\" & ?) != 0)" #[.int 2] 0 "contains pushes as a bit test"
+  checkPlan notBitPlan "((t0.\"tags\" & ?) = 0)" #[.int 2] 0 "negated contains flips the test"
+  checkPlan (paramBitPlan .z) "((t0.\"tags\" & ?) != 0)" #[.int 4] 0 "a captured parameter is the bit"
+  checkPlan memPlan "((t0.\"tags\" & ?) != 0)" #[.int 4] 0 "∈ goes through the Membership instance"
+  checkPlan mixedPlan "(((t0.\"tags\" & ?) != 0) AND t0.\"name\" IS NOT ?)" #[.int 1, .text "skip"] 0
+    "bit test inside a conjunction"
+  checkPlan colBitPlan
+    "(((t0.\"kind\" IS ? AND ((t0.\"tags\" & ?) != 0)) OR (t0.\"kind\" IS ? AND ((t0.\"tags\" & ?) != 0))) OR (t0.\"kind\" IS ? AND ((t0.\"tags\" & ?) != 0)))"
+    #[.text "x", .int 1, .text "y", .int 2, .text "z", .int 4] 0
+    "a closed-enum column as the member splits on its world"
+
+private def dbPath : System.FilePath := ".lake" / "leandb_test_enumset.sqlite"
+
+private def testEndToEnd : IO Unit := do
+  if ← dbPath.pathExists then IO.FS.removeFile dbPath
+  let r ← withDb dbPath [Entity.spec Tagged] do
+    discard <| insert Tagged ⟨"a", .x, .ofList [.x]⟩
+    discard <| insert Tagged ⟨"b", .y, .ofList [.x, .y]⟩
+    discard <| insert Tagged ⟨"c", .z, .ofList [.y, .z]⟩
+    discard <| insert Tagged ⟨"d", .z, .empty⟩
+    discard <| insert Tagged ⟨"e", .x, .full⟩
+    let byName : SortBy (Stored Tagged) := .key (·.val.name)
+    let names (rows : Array (Stored Tagged)) := rows.map (·.val.name)
+    let differential (label : String) (f : Stored Tagged → Bool) : DbM Unit := do
+      let planned ← select [Tagged] f byName
+      let reference ← selectUnplanned [Tagged] f byName
+      unless names planned == names reference do
+        throw (.sqlite s!"FAIL: {label}: planned {names planned} vs reference {names reference}")
+    for a in ClosedEnum.all (α := Tri) do
+      differential s!"contains {repr a}" fun t => t.val.tags.contains a
+      differential s!"not contains {repr a}" fun t => !(t.val.tags.contains a)
+      differential s!"{repr a} ∈" fun t => a ∈ t.val.tags
+    differential "contains own kind" fun t => t.val.tags.contains t.val.kind
+    differential "contains x and not y" fun t => t.val.tags.contains .x && !(t.val.tags.contains .y)
+    let ys ← select [Tagged] (fun t => t.val.tags.contains .y) byName
+    let own ← select [Tagged] (fun t => t.val.tags.contains t.val.kind) byName
+    let mem ← select [Tagged] (fun t => Tri.z ∈ t.val.tags) byName
+    let none' ← select [Tagged] (fun t => !(t.val.tags.contains .x) && !(t.val.tags.contains .z)) byName
+    let log ← readLog 1
+    return (names ys, names own, names mem, names none', log)
+  let (ys, own, mem, none', log) ← expectOk r "enum-set queries"
+  check (ys == #["b", "c", "e"]) s!"contains y, got {ys}"
+  check (own == #["a", "b", "c", "e"]) s!"contains own kind, got {own}"
+  check (mem == #["c", "e"]) s!"z ∈, got {mem}"
+  check (none' == #["d"]) s!"neither x nor z, got {none'}"
+  check ((log.getD 0 Lean.Json.null |>.getObjValAs? String "detail").toOption ==
+      some "tagged | pushed: (((t0.\"tags\" & ?) = 0) AND ((t0.\"tags\" & ?) = 0)), residual conjuncts: 0")
+    s!"logged plan, got {log}"
+  -- the file refuses a stray bit (CHECK), even via raw SQL
+  let db ← SQLite.open dbPath
+  let raw : IO Unit := db.exec "INSERT INTO tagged (name, kind, tags) VALUES ('rogue', 'x', 8)"
+  match ← raw.toBaseIO with
+  | .ok _ => throw <| IO.userError "FAIL: CHECK should reject a bit outside the world"
+  | .error e =>
+      match e with
+      | .otherError 19 details =>
+          check ((details.toLower.splitOn "check constraint").length == 2)
+            s!"raw insert rejected by CHECK, got: {details}"
+      | e => throw <| IO.userError s!"FAIL: expected constraint error 19, got: {e}"
+  -- planted behind the CHECK: the drift scan catches it at open, by column
+  db.exec "PRAGMA ignore_check_constraints = ON"
+  db.exec "UPDATE tagged SET tags = 9 WHERE name = 'd'"
+  db.exec "PRAGMA ignore_check_constraints = OFF"
+  match ← withDb dbPath [Entity.spec Tagged] (pure ()) with
+  | .error (.enumDrift "tagged" "tags" v) => check (v == "9") s!"drift names the offending mask, got {v}"
+  | .error e => throw <| IO.userError s!"FAIL: drift scan: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a stray bit passed the drift scan"
+  db.exec "UPDATE tagged SET tags = 0 WHERE name = 'd'"
+  let rows ← expectOk (← withDb dbPath [Entity.spec Tagged] (fetchAll Tagged)) "scan passes once the bit is gone"
+  check (((rows.find? (·.val.name == "e")).map fun r => (rowJson Tagged r).compress) ==
+      some "{\"id\":5,\"kind\":\"x\",\"name\":\"e\",\"tags\":[\"x\",\"y\",\"z\"]}")
+    "a fetched row renders its set as names"
+
+private def migPath : System.FilePath := ".lake" / "leandb_test_enumset_mig.sqlite"
+
+/-- `tagged(name, tags)` with `tags` an `EnumSet` over `vs`. -/
+private def world (vs : Array String) : TableSpec :=
+  ⟨"tagged", #[col "name" .text,
+    { name := "tags", sqlType := .integer, nullable := false, fkTable := none, enumSet := some vs }]⟩
+
+private def testMigration : IO Unit := do
+  if ← migPath.pathExists then IO.FS.removeFile migPath
+  let two := world #["x", "y"]
+  let three := world #["x", "y", "z"]
+  check (three.ddl.endsWith "\"tags\" INTEGER NOT NULL CHECK ((\"tags\" & ~7) = 0))") s!"three DDL, got {three.ddl}"
+  discard <| expectOk (← withDb migPath [two] (pure ())) "create at two variants"
+  let db ← SQLite.open migPath
+  db.exec "INSERT INTO tagged (name, tags) VALUES ('a', 3)"
+  -- grow: the CHECK changes, so it is a rebuild; old rows keep their bits
+  let (_, rep) ← expectOk (← migrate migPath [three] (apply := true)) "grow the world"
+  check (((rep.map (·.applied)).getD []).any (·.startsWith "rebuild")) "grow is a rebuild"
+  discard <| expectOk (← withDb migPath [three] (pure ())) "opens at three variants"
+  let db2 ← SQLite.open migPath
+  let st ← db2.prepare "SELECT tags FROM tagged WHERE name = 'a'"
+  discard <| st.step
+  check ((← st.columnInt64 0) == 3) "old rows keep their bits"
+  db2.exec "INSERT INTO tagged (name, tags) VALUES ('b', 4)"   -- the new CHECK admits bit 2
+  -- shrink with a row using the removed variant: the rebuild's CHECK fails → rollback
+  expectErr (← migrate migPath [two] (apply := true)) "migrate" "shrink refused by a live bit"
+  let cnt ← db2.prepare "SELECT count(*) FROM tagged"
+  discard <| cnt.step
+  check ((← cnt.columnInt64 0) == 2) "rollback kept the data"
+  discard <| expectOk (← withDb migPath [three] (pure ())) "still at three after the rollback"
+  -- shrink with conforming data succeeds
+  db2.exec "DELETE FROM tagged WHERE name = 'b'"
+  discard <| expectOk (← migrate migPath [two] (apply := true)) "shrink with conforming data"
+  discard <| expectOk (← withDb migPath [two] (pure ())) "opens at two variants"
+  expectErr (← withDb migPath [three] (pure ())) "schema_mismatch" "the grown code is refused at open"
+  -- a reorder or rename would re-label stored bits: refused by name
+  match ← migrate migPath [world #["y", "x"]] (apply := true) with
+  | .error (.migrate m) =>
+      check ((m.splitOn "\"tags\" changed its variant order").length == 2) s!"reorder refusal, got {m}"
+  | .error e => throw <| IO.userError s!"FAIL: reorder: wrong error {e}"
+  | .ok _ => throw <| IO.userError "FAIL: a variant reorder was migrated"
+  expectErr (← migrate migPath [world #["x", "w"]] (apply := true)) "migrate" "rename refused"
+  expectErr (← migrate migPath [world #["x", "z", "y"]] (apply := true)) "migrate" "insertion in the middle refused"
+  discard <| expectOk (← withDb migPath [two] (pure ())) "refusals left the instance at two variants"
+  -- the plan diff itself, pure
+  match planMigration [two] [three] with
+  | .ok plan =>
+      let first := (plan.steps.head?.map (·.describe)).getD ""
+      check (plan.steps.length == 1 && first.startsWith "rebuild") s!"planMigration: grow is one rebuild step, got {first}"
+  | .error e => throw <| IO.userError s!"FAIL: planMigration grow: {e}"
+  check ((planMigration [two] [two]).toOption.map (·.steps.isEmpty) == some true) "planMigration: same world, no steps"
+
+def run : IO Unit := do
+  testCodec
+  testJson
+  testPred
+  testEndToEnd
+  testMigration
+
+end EnumSetA
+
 def main : IO UInt32 := do
   testCodecs
   testDerivedSpec
@@ -1502,5 +1770,6 @@ def main : IO UInt32 := do
   testUniqueConstraint
   testImportNotCarried
   Lep3.run
+  EnumSetA.run
   IO.println "all engine tests passed"
   return 0

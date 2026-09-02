@@ -117,6 +117,11 @@ def ColumnSpec.ddlFragment (c : ColumnSpec) : String :=
         let names := String.intercalate ", " (vs.toList.map fun v => (Col.text v).sqlLit)
         base ++ s!" CHECK ({quoteIdent c.name} IN ({names}))"
     | none => base
+  -- an EnumSet column: no bit outside the world (`~mask` is the literal, so
+  -- growing the world changes the DDL and thus the fingerprint)
+  let base := match c.enumSet with
+    | some vs => base ++ s!" CHECK (({quoteIdent c.name} & ~{enumSetMask vs.size}) = 0)"
+    | none => base
   match c.fkTable with
   | some fk => base ++ s!" REFERENCES {quoteIdent fk}(id) ON DELETE RESTRICT ON UPDATE RESTRICT"
   | none => base
@@ -151,16 +156,23 @@ def validateSchema (specs : List TableSpec) : Except DbError Unit := do
       if let some target := col.fkTable then
         unless tableNames.contains target do
           throw (.schemaInvalid s!"{spec.name}.{col.name} references missing table {String.quote target}")
+      if let some vs := col.enumSet then
+        if vs.size > EnumSet.maxVariants then
+          throw (.schemaInvalid s!"{spec.name}.{col.name}: closed world has {vs.size} variants; \
+EnumSet supports at most {EnumSet.maxVariants}")
 
 /-- Schema fingerprint: a hash of the rendered DDL of every table, in
     declaration order, followed by the declared shape of every JSON
-    column (`table.column=shape`, one per line). A schema without shapes
-    hashes exactly its DDL, as it always has. Checked against
-    `_leandb_meta` at open. -/
+    column (`table.column=shape`, one per line) and the variant list of
+    every `EnumSet` column (`table.column=<a|b|c>` — the DDL sees only
+    the mask, and a renamed or reordered variant changes what a stored
+    bit *means*). A schema without either hashes exactly its DDL, as it
+    always has. Checked against `_leandb_meta` at open. -/
 def fingerprint (specs : List TableSpec) : String :=
   let ddl := String.intercalate ";\n" (specs.map (·.ddl))
   let shapes := specs.flatMap fun t => t.columns.toList.filterMap fun c =>
-    c.shape.map fun s => s!"{t.name}.{c.name}={s}"
+    (c.shape.map fun s => s!"{t.name}.{c.name}={s}") <|>
+      (c.enumSet.map fun vs => s!"{t.name}.{c.name}={JsonShape.closed vs}")
   toString <| hash <| if shapes.isEmpty then ddl else ddl ++ "\n" ++ String.intercalate "\n" shapes
 
 end LeanDb

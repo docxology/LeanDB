@@ -18,7 +18,22 @@ def Col.toJson : Col → Json
   | .real v => Lean.toJson v
   | .null => Json.null
 
-/-- Decode one JSON value as the column's SQL type. -/
+/-- A column value as row JSON: an `EnumSet` column's bitmask renders as
+    the array of its members' names (`["silu","gelu"]`, declaration
+    order); everything else as `Col.toJson`. -/
+def Col.toJsonFor (spec : ColumnSpec) : Col → Json
+  | .int v =>
+      match spec.enumSet with
+      | some vs =>
+          let bits := v.toNatClampNeg.toUInt64
+          Json.arr <| vs.zipIdx.filterMap fun (name, k) =>
+            if (bits >>> k.toUInt64) &&& 1 != 0 then some (Json.str name) else none
+      | none => Col.toJson (.int v)
+  | c => c.toJson
+
+/-- Decode one JSON value as the column's SQL type. An `EnumSet` column
+    takes an array of variant names (an unknown name is refused by name)
+    or, for round-tripping, the bare bitmask. -/
 def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
   match j with
   | Json.null =>
@@ -26,8 +41,19 @@ def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
       else .error s!"{spec.name}: null not allowed"
   | Json.bool b =>
       -- Bool columns store as INTEGER 0/1; accept JSON booleans for them
-      if spec.sqlType == .integer then .ok (.int (if b then 1 else 0))
+      if spec.sqlType == .integer && spec.enumSet.isNone then .ok (.int (if b then 1 else 0))
       else .error s!"{spec.name}: boolean not allowed for a {spec.sqlType.render} column"
+  | Json.arr items =>
+      match spec.enumSet with
+      | some vs => do
+          let mut bits : UInt64 := 0
+          for item in items do
+            let name ← item.getStr?
+            match vs.findIdx? (· == name) with
+            | some k => bits := bits ||| ((1 : UInt64) <<< k.toUInt64)
+            | none => throw s!"{spec.name}: {String.quote name} is not in the closed world {vs}"
+          return .int (Int64.ofNat bits.toNat)
+      | none => .error s!"{spec.name}: array not allowed for a {spec.sqlType.render} column"
   | _ =>
       match spec.sqlType with
       | .integer => do
@@ -80,6 +106,7 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
      ("nullable", Json.bool c.nullable)]
     ++ (c.fkTable.map fun fk => ("references", Json.str fk)).toList
     ++ (c.enum.map fun vs => ("enum", Json.arr (vs.map Json.str))).toList
+    ++ (c.enumSet.map fun vs => ("enumSet", Json.arr (vs.map Json.str))).toList
     ++ (c.dflt.map fun v => ("default", v.toJson)).toList
     ++ (c.shape.map fun s => ("shape", Json.str s)).toList
 
@@ -101,7 +128,9 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
   let fkTable := (j.getObjVal? "references").toOption.bind (·.getStr?.toOption)
   let enum := (j.getObjVal? "enum").toOption.bind fun a =>
     (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
-  let partial_ : ColumnSpec := { name, sqlType, nullable, fkTable, enum }
+  let enumSet := (j.getObjVal? "enumSet").toOption.bind fun a =>
+    (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
+  let partial_ : ColumnSpec := { name, sqlType, nullable, fkTable, enum, enumSet }
   -- default roundtrips through the column's own type (stored schema JSON
   -- must decode identically or migrations would see phantom diffs)
   let dflt := (j.getObjVal? "default").toOption.bind fun v =>
@@ -133,7 +162,7 @@ def schemaJson (name : String) (specs : List TableSpec) : Json :=
 def rowJson (α : Type) [Entity α] (s : Stored α) : Json :=
   let fields := (Entity.columns α).zip (Entity.encode s.val)
   Json.mkObj <| ("id", Lean.toJson s.id.toInt64.toInt) ::
-    (fields.toList.map fun (c, v) => (c.name, v.toJson))
+    (fields.toList.map fun (c, v) => (c.name, v.toJsonFor c))
 
 /-- The columns of `α` with whether each is derived, in declaration order. -/
 private def columnsWithDerived (α : Type) [Entity α] : Array (ColumnSpec × Bool) :=

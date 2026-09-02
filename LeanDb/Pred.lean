@@ -232,6 +232,11 @@ inductive Pred : List Type → Type 1 where
       Pred ts
   | isNotNull {ts : List Type} {τ : Type} {i : ColCodec (Option τ)}
       (c : Pred.Col ts (Option τ) i) : Pred ts
+  /-- Membership in an `EnumSet` column (LEP-0003 A): `a ∈ c` when `set`,
+      `a ∉ c` otherwise — one leaf, so `neg` flips the flag. Renders as a
+      bit test against the variant's mask. -/
+  | bit {ts : List Type} {α : Type} [ce : ClosedEnum α] {i : ColCodec (EnumSet α)}
+      (c : Pred.Col ts (EnumSet α) i) (a : α) (set : Bool) : Pred ts
   | and {ts : List Type} (a b : Pred ts) : Pred ts
   | or {ts : List Type} (a b : Pred ts) : Pred ts
   /-- The residual, as a leaf: runs in Lean, never in SQL. -/
@@ -317,6 +322,7 @@ def neg {ts : List Type} : Pred ts → Pred ts
   | .ord2 (so := so) a op b => .ord2 (so := so) a op.negate b
   | .isNull c => .isNotNull c
   | .isNotNull c => .isNull c
+  | .bit (ce := ce) c a set => .bit (ce := ce) c a (!set)
   | .and a b => .or a.neg b.neg
   | .or a b => .and a.neg b.neg
   | .opaque f => .opaque fun r => !f r
@@ -344,6 +350,7 @@ def denote {ts : List Type} (snap : Snapshot) : Pred ts → Rows ts → Bool
       op.eval (i.toCol (a.proj r)) (j.toCol (b.proj r))
   | .isNull (i := i) c => fun r => i.toCol (c.proj r) == .null
   | .isNotNull (i := i) c => fun r => !(i.toCol (c.proj r) == .null)
+  | .bit (ce := ce) c a set => fun r => (@EnumSet.contains _ ce (c.proj r) a) == set
   | .and a b =>
       let da := a.denote snap
       let db := b.denote snap
@@ -453,6 +460,7 @@ theorem approx_sound {ts : List Type} (snap : Snapshot) : ∀ (p : Pred ts) (r :
   | .ord2 (so := _) .., _, h => h
   | .isNull .., _, h => h
   | .isNotNull .., _, h => h
+  | .bit (ce := _) .., _, h => h
 
 /-! ### The plan surface -/
 
@@ -465,6 +473,7 @@ def tables {ts : List Type} : Pred ts → List Nat
   | .ord (so := _) c .. => [c.tableIdx]
   | .isNull c => [c.tableIdx]
   | .isNotNull c => [c.tableIdx]
+  | .bit (ce := _) c .. => [c.tableIdx]
   | .eq2 a _ b => [a.tableIdx, b.tableIdx]
   | .ord2 (so := _) a _ b => [a.tableIdx, b.tableIdx]
   | .and a b | .or a b => (a.tables ++ b.tables).eraseDups
@@ -525,6 +534,7 @@ theorem size_neg {ts : List Type} : ∀ p : Pred ts, p.neg.size = p.size
   | .tt | .ff | .opaque _ => rfl
   | .eq .. | .eq2 .. | .isNull .. | .isNotNull .. => rfl
   | .ord (so := _) .. | .ord2 (so := _) .. => rfl
+  | .bit (ce := _) .. => rfl
   | .and a b => by simp [neg, size, size_neg a, size_neg b]
   | .or a b => by simp [neg, size, size_neg a, size_neg b]
   | .«exists» (ent := _) _ _ b => by simp [neg, size, size_neg b]
@@ -550,6 +560,9 @@ def render {ts : List Type} (aliasOf : Nat → String) (depth : Nat := 0) : Pred
   | .ord2 (so := _) a op b => (s!"{col aliasOf a} {op.sql} {col aliasOf b}", #[])
   | .isNull c => (s!"{col aliasOf c} IS NULL", #[])
   | .isNotNull c => (s!"{col aliasOf c} IS NOT NULL", #[])
+  | .bit (ce := ce) c a set =>
+      let bind := LeanDb.Col.int (Int64.ofNat (@EnumSet.bitOf _ ce a).toNat)
+      (s!"(({col aliasOf c} & ?) {if set then "!=" else "="} 0)", #[bind])
   | .and a b =>
       let (sa, ba) := a.render aliasOf depth
       let (sb, bb) := b.render aliasOf depth

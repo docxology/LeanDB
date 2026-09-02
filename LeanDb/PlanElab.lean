@@ -27,6 +27,10 @@ type cannot be emitted at all:
 - `&&`, `||`, `!` (negation is exact — see `Pred.neg`), and
   `if c then t else e` on `Bool` as `(c ∧ t) ∨ (¬c ∧ e)`;
 - `Option` tests (`== none`, `.isNone`, `.isSome`) as null-safe SQL;
+- `EnumSet` membership (LEP-0003 A): `col.contains a` and `a ∈ col` with
+  `a` a closed value (a literal or a captured parameter) as `Pred.bit`,
+  a bit test `(col & ?) != 0`; negation flips it. With `a` a closed-enum
+  *column* the case split below applies;
 - bare `Bool` columns; `@[db]`-tagged defs unfolded;
 - `match` on a closed-enum column (directly or via an unfolded `@[db]`
   function like an SLA table) by *case-splitting on the closed world*:
@@ -368,6 +372,13 @@ private partial def strict (ctx : Ctx) (fuel : Nat) (e : Expr) :
     return ← caseSplit fuel e
   if e.isAppOfArity ``decide 2 then
     let p ← whnfCore (e.getArg! 0)
+    -- `a ∈ s` on an `EnumSet`: its `Membership` instance unfolds (at
+    -- instances transparency) to `s.contains a = true`
+    if p.isAppOfArity ``Membership.mem 5 then
+      let q ← withReducibleAndInstances (whnf p)
+      if q.isAppOfArity ``Eq 3 && (q.getArg! 1).isAppOfArity ``EnumSet.contains 4
+          && (q.getArg! 2).isConstOf ``Bool.true then
+        return ← strict ctx fuel (q.getArg! 1)
     if p.isAppOfArity ``LT.lt 4 then return ← try2 fuel e .lt (p.getArg! 2) (p.getArg! 3)
     if p.isAppOfArity ``LE.le 4 then return ← try2 fuel e .le (p.getArg! 2) (p.getArg! 3)
     if p.isAppOfArity ``GT.gt 4 then return ← try2 fuel e .gt (p.getArg! 2) (p.getArg! 3)
@@ -380,6 +391,15 @@ private partial def strict (ctx : Ctx) (fuel : Nat) (e : Expr) :
       let ctor := if e.isAppOfArity ``Option.isNone 2 then ``Pred.isNull else ``Pred.isNotNull
       return ← attempt (mkAppM ctor #[c])
     return none
+  -- `EnumSet.contains col a`: a bit test when `a` is a closed value; when
+  -- `a` is itself a closed-enum column, the case split below substitutes
+  -- each constructor and lands here again
+  if e.isAppOfArity ``EnumSet.contains 4 then
+    if let some (c, _) ← colOf? ctx (e.getArg! 2) then
+      if isValue ctx (e.getArg! 3) then
+        if let some p ← attempt (mkAppM ``Pred.bit #[c, ← instantiateMVars (e.getArg! 3), mkConst ``Bool.true]) then
+          return some p
+    return ← caseSplit fuel e
   -- bare Bool column
   if let some (c, _) ← colOf? ctx e then
     return ← attempt (mkCmp c .eq (mkConst ``Bool.true))
