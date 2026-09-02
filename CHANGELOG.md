@@ -125,6 +125,18 @@ encodes the rule the uncarried `big_orders` view held, and
 `legacy_tests` adopts the raw fixture, migrates it, rolls it back and
 re-applies.
 
+Footprints and impact. The plan tactic records, per declaration, the
+tables and columns every reified plan reads and whether a residual
+remains; `query%` unions them (following the def's own callees) into
+`QueryEntry.footprint`, statically. The log stores each select's plan as
+data (`plan`: tables, the `Pred` as JSON, its footprint) and the
+registered query it ran under (`query`). `migrate status` now reports
+`changed` (the columns the pending change touches), `impact` (each
+registered query whose footprint touches them, with the columns and the
+number of logged runs that did), and `unregistered_runs` (logged selects
+outside any registered query). This is the third report of the thesis:
+a vocabulary edit says which queries it reaches, before `apply`.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.

@@ -261,7 +261,72 @@ inductive Pred : List Type → Type 1 where
 
 instance : Inhabited (Pred ts) := ⟨.tt⟩
 
+/-- What a plan reads: the tables and `(table, column)` pairs its pushed
+    conjuncts mention, and whether a residual conjunct (whose reads the
+    footprint cannot see) remains. Recorded statically per declaration by
+    the plan tactic — there the table names are entity *type* names,
+    resolved against the base later — and computed at run time from a
+    `Pred` for the log. -/
+structure Footprint where
+  tables : List String := []
+  columns : List (String × String) := []
+  residual : Bool := false
+  deriving Repr, BEq, Inhabited
+
+namespace Footprint
+
+private def dedup [BEq α] (xs : List α) : List α :=
+  xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
+
+def union (a b : Footprint) : Footprint :=
+  { tables := dedup (a.tables ++ b.tables), columns := dedup (a.columns ++ b.columns),
+    residual := a.residual || b.residual }
+
+def isEmpty (f : Footprint) : Bool := f.tables.isEmpty && f.columns.isEmpty && !f.residual
+
+/-- The columns of `f` among `changed`. -/
+def touching (f : Footprint) (changed : List (String × String)) : List (String × String) :=
+  f.columns.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")
+
+end Footprint
+
 namespace Pred
+
+/-- The footprint of a plan at run time; `names i` is the table at row
+    position `i`. Quantifiers name the child table and shift the outer
+    rows up by one. -/
+private def colFootprint {ts : List Type} {τ : Type} {i : ColCodec τ} (names : Nat → String)
+    (c : Pred.Col ts τ i) : Footprint :=
+  let t := names c.tableIdx
+  { tables := [t], columns := [(t, c.name)] }
+
+partial def footprintWith {ts : List Type} (names : Nat → String) : Pred ts → Footprint
+  | .tt => {}
+  | .ff => {}
+  | .eq c _ _ => colFootprint names c
+  | .ord (so := _) c _ _ => colFootprint names c
+  | .isNull c => colFootprint names c
+  | .isNotNull c => colFootprint names c
+  | .bit (ce := _) c _ _ => colFootprint names c
+  | .eq2 a _ b => (colFootprint names a).union (colFootprint names b)
+  | .ord2 (so := _) a _ b => (colFootprint names a).union (colFootprint names b)
+  | .and a b => (a.footprintWith names).union (b.footprintWith names)
+  | .or a b => (a.footprintWith names).union (b.footprintWith names)
+  | .opaque _ => { residual := true }
+  | .exists (child := child) (ent := ent) parent fk body =>
+      let childName := @Entity.tableName child ent
+      let inner := fun i => if i == 0 then childName else names (i - 1)
+      ((colFootprint names parent).union (colFootprint inner fk)).union
+        ((body.footprintWith inner).union { tables := [childName] })
+  | .forall (child := child) (ent := ent) parent fk body =>
+      let childName := @Entity.tableName child ent
+      let inner := fun i => if i == 0 then childName else names (i - 1)
+      ((colFootprint names parent).union (colFootprint inner fk)).union
+        ((body.footprintWith inner).union { tables := [childName] })
+
+def footprint {ts : List Type} [RowsOf ts] (p : Pred ts) : Footprint :=
+  let specs := RowsOf.specs ts
+  p.footprintWith fun i => (specs[i]?.map (·.name)).getD s!"t{i}"
 
 /-! ### Smart constructors -/
 

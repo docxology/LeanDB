@@ -18,15 +18,6 @@ never compiled into the base.
 
 open Lean (Json)
 
-/-- The tables and columns a plan reads. Recorded by the plan tactic per
-    query (R5/S4); `{}` means "not recorded". -/
-structure Footprint where
-  tables : List String := []
-  columns : List (String × String) := []
-  /-- The plan has a residual conjunct the footprint cannot see. -/
-  residual : Bool := false
-  deriving Repr, BEq, Inhabited
-
 /-- A registered query: the name the CLI/API uses, its positional
     parameters `(binder, type)` as `query%` saw them, and the runner that
     parses argv and renders the result. -/
@@ -219,6 +210,25 @@ def Instance.resolve (b : Base) (args : List String) :
         | none, some p => if p.isEmpty then b.defaultInstance else p
         | none, none => b.defaultInstance
       return .ok (Instance.ofPath path, rest)
+
+/-- `"Tickets.UserProfile"` → `"user_profile"`: the derive's table naming,
+    for a type the base no longer lists (a dropped entity). -/
+private def snakeOfType (ty : String) : String :=
+  let last := (ty.splitOn ".").getLast?.getD ty
+  last.foldl (init := "") fun acc c =>
+    if c.isUpper then (if acc.isEmpty then acc else acc ++ "_") ++ c.toLower.toString
+    else acc ++ c.toString
+
+/-- A static footprint names entity *types*; the base knows their tables.
+    A type it does not list (dropped from the code) falls back to the
+    derive's naming. -/
+def Base.resolveFootprint (b : Base) (f : Footprint) : Footprint :=
+  let tableOf := fun (ty : String) =>
+    match b.tables.find? (·.typeName == ty) with
+    | some t => t.name
+    | none => snakeOfType ty
+  { tables := f.tables.map tableOf, columns := f.columns.map fun (t, c) => (tableOf t, c),
+    residual := f.residual }
 
 /-- The version a fresh instance of this base starts at: the chain's head,
     or 1 when unfrozen (the counter mode). -/

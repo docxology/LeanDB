@@ -14,6 +14,12 @@ Backed by `leansqlite` (bundled SQLite). SQL text appears only in this file
 
 structure Conn where
   raw : SQLite
+  /-- The registered query being run, if any: `query <name>` sets it so
+      the log can attribute the plans it records. -/
+  queryName : IO.Ref (Option String)
+
+def Conn.ofRaw (raw : SQLite) : IO Conn := do
+  return { raw, queryName := ← IO.mkRef none }
 
 /-- The database monad: a connection, typed errors, IO. -/
 abbrev DbM := ReaderT Conn (ExceptT DbError IO)
@@ -115,11 +121,12 @@ def DbM.ofExcept (r : Except DbError α) : DbM α :=
   fun _ => ExceptT.mk (pure r)
 
 /-- Append to `_leandb_log`. Best-effort: the log never fails an operation. -/
-private def logOp (verb detail : String) (ok : Bool) (error : Option String) (rows : Nat) :
-    DbM Unit := fun conn => ExceptT.mk do
+private def logOp (verb detail : String) (ok : Bool) (error : Option String) (rows : Nat)
+    (plan : Option String) : DbM Unit := fun conn => ExceptT.mk do
   try
+    let query ← conn.queryName.get
     let stmt ← conn.raw.prepare
-      "INSERT INTO _leandb_log (verb, detail, ok, error, rows) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO _leandb_log (verb, detail, ok, error, rows, plan, query) VALUES (?, ?, ?, ?, ?, ?, ?)"
     stmt.bindText 1 verb
     stmt.bindText 2 detail
     stmt.bindInt64 3 (if ok then 1 else 0)
@@ -127,20 +134,27 @@ private def logOp (verb detail : String) (ok : Bool) (error : Option String) (ro
     | some e => stmt.bindText 4 e
     | none => stmt.bindNull 4
     stmt.bindInt64 5 (Int64.ofNat rows)
+    match plan with
+    | some p => stmt.bindText 6 p
+    | none => stmt.bindNull 6
+    match query with
+    | some q => stmt.bindText 7 q
+    | none => stmt.bindNull 7
     stmt.exec
     return .ok ()
   catch _ => return .ok ()
 
-/-- Run an operation and log it: verb, detail, outcome, row count. The
-    query log is the audit trail and the agent's episodic memory
-    (plan.md §4.4) — on by default. -/
-private def withLog (verb detail : String) (count : α → Nat) (act : DbM α) : DbM α := do
+/-- Run an operation and log it: verb, detail, outcome, row count, and for
+    a select the plan as data. The query log is the audit trail and the
+    agent's episodic memory (plan.md §4.4) — on by default. -/
+private def withLog (verb detail : String) (count : α → Nat) (act : DbM α)
+    (plan : Option String := none) : DbM α := do
   match ← fun conn => ExceptT.mk (.ok <$> (act conn).run) with
   | .ok a =>
-      logOp verb detail true none (count a)
+      logOp verb detail true none (count a) plan
       return a
   | .error e =>
-      logOp verb detail false (some e.code) 0
+      logOp verb detail false (some e.code) 0 plan
       throw e
 
 private def liftExcept (r : Except DbError α) : DbM α := DbM.ofExcept r
@@ -423,6 +437,63 @@ private def runPlanned (ts : List Type) [RowsOf ts] (pushed : Pred ts)
 private def selectDetail (ts : List Type) [RowsOf ts] (p : Pred ts) : String :=
   s!"{String.intercalate "×" ((RowsOf.specs ts).map (·.name))} | {p.describe}"
 
+/-- A column reference as JSON: the table at its row position and its name. -/
+private def colJson (names : Nat → String) {ts : List Type} {τ : Type} {i : ColCodec τ}
+    (c : Pred.Col ts τ i) : Lean.Json :=
+  Lean.Json.mkObj [("table", Lean.Json.str (names c.tableIdx)), ("column", Lean.Json.str c.name)]
+
+/-- The plan as data (the log stores this next to `describe`'s text): one
+    object per node, values in their stored encoding, the residual as
+    `{"opaque":true}`. Quantifiers carry the child table and their body
+    over `child :: ts`. -/
+partial def Pred.toJsonWith {ts : List Type} (names : Nat → String) : Pred ts → Lean.Json
+  | .tt => Lean.Json.mkObj [("kind", Lean.Json.str "tt")]
+  | .ff => Lean.Json.mkObj [("kind", Lean.Json.str "ff")]
+  | .eq (i := i) c op v =>
+      Lean.Json.mkObj [("kind", Lean.Json.str "eq"), ("col", colJson names c),
+        ("op", Lean.Json.str op.sql), ("value", (@toCol _ i v).toJson)]
+  | .ord (i := i) (so := _) c op v =>
+      Lean.Json.mkObj [("kind", Lean.Json.str "ord"), ("col", colJson names c),
+        ("op", Lean.Json.str op.sql), ("value", (@toCol _ i v).toJson)]
+  | .eq2 a op b =>
+      Lean.Json.mkObj [("kind", Lean.Json.str "eq2"), ("left", colJson names a),
+        ("op", Lean.Json.str op.sql), ("right", colJson names b)]
+  | .ord2 (so := _) a op b =>
+      Lean.Json.mkObj [("kind", Lean.Json.str "ord2"), ("left", colJson names a),
+        ("op", Lean.Json.str op.sql), ("right", colJson names b)]
+  | .isNull c => Lean.Json.mkObj [("kind", Lean.Json.str "isNull"), ("col", colJson names c)]
+  | .isNotNull c => Lean.Json.mkObj [("kind", Lean.Json.str "isNotNull"), ("col", colJson names c)]
+  | .bit (ce := ce) c a set =>
+      Lean.Json.mkObj [("kind", Lean.Json.str "bit"), ("col", colJson names c),
+        ("variant", Lean.Json.str (@ClosedEnum.encodeName _ ce a)), ("set", Lean.Json.bool set)]
+  | .and a b => Lean.Json.mkObj [("kind", Lean.Json.str "and"),
+      ("a", a.toJsonWith names), ("b", b.toJsonWith names)]
+  | .or a b => Lean.Json.mkObj [("kind", Lean.Json.str "or"),
+      ("a", a.toJsonWith names), ("b", b.toJsonWith names)]
+  | .opaque _ => Lean.Json.mkObj [("opaque", Lean.Json.bool true)]
+  | .exists (child := child) (ent := ent) parent fk body =>
+      let childName := @Entity.tableName child ent
+      let inner := fun i => if i == 0 then childName else names (i - 1)
+      Lean.Json.mkObj [("kind", Lean.Json.str "exists"), ("child", Lean.Json.str childName),
+        ("parent", colJson names parent), ("fk", colJson inner fk), ("body", body.toJsonWith inner)]
+  | .forall (child := child) (ent := ent) parent fk body =>
+      let childName := @Entity.tableName child ent
+      let inner := fun i => if i == 0 then childName else names (i - 1)
+      Lean.Json.mkObj [("kind", Lean.Json.str "forall"), ("child", Lean.Json.str childName),
+        ("parent", colJson names parent), ("fk", colJson inner fk), ("body", body.toJsonWith inner)]
+
+def Footprint.toJson (f : Footprint) : Lean.Json :=
+  Lean.Json.mkObj [("tables", Lean.Json.arr (f.tables.map Lean.Json.str).toArray),
+    ("columns", Lean.Json.arr (f.columns.map fun (t, c) => Lean.Json.str s!"{t}.{c}").toArray),
+    ("residual", Lean.Json.bool f.residual)]
+
+/-- What the log stores for a select: the tables, the plan, its footprint. -/
+private def planJson (ts : List Type) [RowsOf ts] (p : Pred ts) : String :=
+  let specs := RowsOf.specs ts
+  let names := fun i => (specs[i]?.map (·.name)).getD s!"t{i}"
+  (Lean.Json.mkObj [("tables", Lean.Json.arr (specs.map (Lean.Json.str ·.name)).toArray),
+    ("plan", p.toJsonWith names), ("footprint", p.footprint.toJson)]).compress
+
 /-- The typed select. The trailing `plan` is reified from `where'` by the
     `leandb_plan` tactic at each call site as a `Pred ts`; what ships to
     SQL is its pushable projection `approx` (`Pred.approx_sound`: it never
@@ -434,7 +505,7 @@ private def selectDetail (ts : List Type) [RowsOf ts] (p : Pred ts) : String :=
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve)
     (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
-  withLog "select" (selectDetail ts plan.plan) (·.size) <|
+  withLog "select" (selectDetail ts plan.plan) (·.size) (plan := some (planJson ts plan.plan)) <|
     runPlanned ts plan.plan.approx where' sortBy
 
 /-- The snapshot a plan quantifies over (LEP-0004): every child table it
@@ -460,7 +531,7 @@ where
     `p.denote`, and pushdown (`p.approx`) can only narrow the fetch. -/
 def selectP (ts : List Type) [RowsOf ts] (p : Pred ts)
     (sortBy : SortBy (Rows ts) := .preserve) : DbM (Array (Rows ts)) :=
-  withLog "select" (selectDetail ts p) (·.size) do
+  withLog "select" (selectDetail ts p) (·.size) (plan := some (planJson ts p)) do
     let snap ← p.snapshot
     runPlanned ts p.approx (p.denote snap) sortBy
 
@@ -484,6 +555,10 @@ private def logDdl : String :=
   "CREATE TABLE IF NOT EXISTS _leandb_log (id INTEGER PRIMARY KEY AUTOINCREMENT, \
 at INTEGER NOT NULL DEFAULT (unixepoch()), verb TEXT NOT NULL, detail TEXT NOT NULL, \
 ok INTEGER NOT NULL, error TEXT, rows INTEGER NOT NULL)"
+
+/-- Columns the log gained after 0.2.0: the plan as data and the query
+    it ran under. -/
+def logColumns : List (String × String) := [("plan", "TEXT"), ("query", "TEXT")]
 
 def readMeta (db : SQLite) (key : String) : IO (Option String) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = ?"
@@ -574,7 +649,8 @@ def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
     db.exec logDdl
     db.exec migrationsDdl
     ensureColumns db "_leandb_migrations" journalColumns
-    return .ok ⟨db⟩
+    ensureColumns db "_leandb_log" logColumns
+    return .ok (← Conn.ofRaw db)
   catch e =>
     return .error (.sqlite (toString e))
 
@@ -635,13 +711,17 @@ def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbErro
 /-- Recent query-log entries, newest first, as JSON rows. -/
 def readLog (limit : Nat) : DbM (Array Lean.Json) := sqlite fun db => do
   let stmt ← db.prepare
-    "SELECT id, at, verb, detail, ok, error, rows FROM _leandb_log ORDER BY id DESC LIMIT ?"
+    "SELECT id, at, verb, detail, ok, error, rows, plan, query FROM _leandb_log ORDER BY id DESC LIMIT ?"
   stmt.bindInt64 1 (Int64.ofNat limit)
   let mut out := #[]
   repeat
     if ← stmt.step then
       let err ← (do if (← stmt.columnType 5) == .null then pure Lean.Json.null
                     else Lean.Json.str <$> stmt.columnText 5)
+      let plan ← (do if (← stmt.columnType 7) == .null then pure Lean.Json.null
+                     else pure ((Lean.Json.parse (← stmt.columnText 7)).toOption.getD Lean.Json.null))
+      let query ← (do if (← stmt.columnType 8) == .null then pure Lean.Json.null
+                      else Lean.Json.str <$> stmt.columnText 8)
       out := out.push <| Lean.Json.mkObj [
         ("id", Lean.toJson (← stmt.columnInt64 0).toInt),
         ("at", Lean.toJson (← stmt.columnInt64 1).toInt),
@@ -649,7 +729,29 @@ def readLog (limit : Nat) : DbM (Array Lean.Json) := sqlite fun db => do
         ("detail", Lean.Json.str (← stmt.columnText 3)),
         ("ok", Lean.Json.bool ((← stmt.columnInt64 4) == 1)),
         ("error", err),
-        ("rows", Lean.toJson (← stmt.columnInt64 6).toInt)]
+        ("rows", Lean.toJson (← stmt.columnInt64 6).toInt),
+        ("plan", plan),
+        ("query", query)]
+    else break
+  return out
+
+/-- Logged selects, newest first: `(query name, footprint columns)` — what
+    `migrate status` scans to say which recorded runs a change touches. -/
+def logFootprints (conn : Conn) (limit : Nat) : IO (Array (Option String × List (String × String))) := do
+  let stmt ← conn.raw.prepare
+    "SELECT query, plan FROM _leandb_log WHERE verb = 'select' AND plan IS NOT NULL ORDER BY id DESC LIMIT ?"
+  stmt.bindInt64 1 (Int64.ofNat limit)
+  let mut out := #[]
+  repeat
+    if ← stmt.step then
+      let q ← (do if (← stmt.columnType 0) == .null then pure none else some <$> stmt.columnText 0)
+      let plan := (Lean.Json.parse (← stmt.columnText 1)).toOption.getD Lean.Json.null
+      let cols := ((plan.getObjVal? "footprint" >>= (·.getObjValAs? (Array String) "columns")).toOption.getD #[]).toList
+      let pairs := cols.filterMap fun s =>
+        match s.splitOn "." with
+        | [t, c] => some (t, c)
+        | _ => none
+      out := out.push (q, pairs)
     else break
   return out
 

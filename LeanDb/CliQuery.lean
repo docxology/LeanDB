@@ -18,9 +18,39 @@ namespace LeanDb.Cli
 
 open Lean Elab Term Meta
 
+/-- The footprint of a query def: every plan reified while elaborating it,
+    plus those of the definitions it uses (a `pred%` plan bound to a name,
+    a helper query it calls), followed transitively through this package's
+    own declarations. -/
+private def queryFootprint (root : Name) : MetaM Footprint := do
+  let env ← getEnv
+  let mainRoot := (← getMainModule).getRoot
+  let ours := fun (n : Name) =>
+    match env.getModuleIdxFor? n with
+    | none => true
+    | some idx => (env.header.moduleNames[idx.toNat]?.map (·.getRoot == mainRoot)).getD false
+  let mut visited : List Name := []
+  let mut queue : List Name := [root]
+  let mut acc : Footprint := {}
+  let mut budget := 2000
+  while !queue.isEmpty && budget > 0 do
+    budget := budget - 1
+    let n := queue.head!
+    queue := queue.tail!
+    if visited.contains n then continue
+    visited := n :: visited
+    for e in PlanElab.footprintsOf env n do
+      acc := acc.union { tables := e.types, columns := e.columns, residual := e.residual }
+    if let some info := env.find? n then
+      if let some v := info.value? then
+        for c in v.getUsedConstants do
+          if ours c && !visited.contains c then queue := queue ++ [c]
+  return acc
+
 elab "query% " id:ident : term => do
   let name ← realizeGlobalConstNoOverloadWithInfo id
   let info ← getConstInfo name
+  let fp ← queryFootprint name
   -- Plain forallTelescope: the reducing variant would unfold the `DbM`
   -- abbrev and hide the return-type check behind ReaderT plumbing.
   let (binderNames, binderTys, tyStrs) ← forallTelescope info.type fun xs body => do
@@ -65,8 +95,9 @@ elab "query% " id:ident : term => do
         $(← inputOf i) >>= fun $(pIdent i) => $body)
   let nameLit : Term := quote name.getString!
   let params : Term := quote ((binderNames.zip tyStrs).toList)
+  let fpStx : Term ← `(LeanDb.Footprint.mk $(quote fp.tables) $(quote fp.columns) $(quote fp.residual))
   let stx ← `(LeanDb.QueryEntry.mk ($nameLit : String) ($params : List (String × String))
-      ({} : LeanDb.Footprint)
+      $fpStx
       (fun ($argsIdent : List String) => ($body : LeanDb.DbM Lean.Json)))
   elabTerm stx none
 

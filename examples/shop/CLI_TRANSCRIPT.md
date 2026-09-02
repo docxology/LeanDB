@@ -128,7 +128,7 @@ $ shop frobnicate
 
 ```console
 $ shop log 3
-{"count":3,"entries":[{"at":1787598709,"detail":"customer","error":"restricted","id":29,"ok":false,"rows":0,"verb":"delete"},{"at":1787598709,"detail":"product","error":null,"id":28,"ok":true,"rows":1,"verb":"update"},{"at":1787598709,"detail":"product","error":null,"id":27,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1788380250,"detail":"customer","error":"restricted","id":27,"ok":false,"plan":null,"query":null,"rows":0,"verb":"delete"},{"at":1788380250,"detail":"product | pushed: t0.\"stock\" < ?, residual conjuncts: 0","error":null,"id":26,"ok":true,"plan":{"footprint":{"columns":["product.stock"],"residual":false,"tables":["product"]},"plan":{"col":{"column":"stock","table":"product"},"kind":"ord","op":"<","value":5},"tables":["product"]},"query":"lowStock","rows":3,"verb":"select"},{"at":1788380250,"detail":"purchase | pushed: ((t0.\"status\" IS ? OR t0.\"status\" IS ?) OR t0.\"status\" IS ?), residual conjuncts: 0","error":null,"id":25,"ok":true,"plan":{"footprint":{"columns":["purchase.status"],"residual":false,"tables":["purchase"]},"plan":{"a":{"a":{"col":{"column":"status","table":"purchase"},"kind":"eq","op":"IS","value":"placed"},"b":{"col":{"column":"status","table":"purchase"},"kind":"eq","op":"IS","value":"paid"},"kind":"or"},"b":{"col":{"column":"status","table":"purchase"},"kind":"eq","op":"IS","value":"shipped"},"kind":"or"},"tables":["purchase"]},"query":"activeOrders","rows":2,"verb":"select"}],"ok":true}
 (exit 0)
 ```
 

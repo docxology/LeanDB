@@ -391,7 +391,7 @@ structure MigrateOpts where
   allowDestructive : Bool := false
   backup : Option System.FilePath := none
 
-private def readStoredSchema (db : SQLite) : IO (Except String (Option (List TableSpec))) := do
+private def readStoredSchemaRaw (db : SQLite) : IO (Except String (Option (List TableSpec))) := do
   let stmt ← db.prepare "SELECT value FROM _leandb_meta WHERE key = 'schema_json'"
   if ← stmt.step then
     let raw ← stmt.columnText 0
@@ -400,6 +400,12 @@ private def readStoredSchema (db : SQLite) : IO (Except String (Option (List Tab
     | .error e => return .error s!"stored schema metadata is invalid: {e}"
   else
     return .ok none
+
+/-- The schema the instance was last shaped to, if readable. -/
+def readStoredSchema (conn : Conn) : IO (Option (List TableSpec)) := do
+  match ← readStoredSchemaRaw conn.raw with
+  | .ok s => return s
+  | .error _ => return none
 
 private def writeStoredSchema (db : SQLite) (specs : List TableSpec) : IO Unit := do
   let stmt ← db.prepare "INSERT OR REPLACE INTO _leandb_meta (key, value) VALUES (?, ?)"
@@ -427,7 +433,7 @@ def migrateOn (conn : Conn) (specs : List TableSpec) (opts : MigrateOpts) :
     db.exec "CREATE TABLE IF NOT EXISTS _leandb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     db.exec migrationsDdl
     ensureColumns db "_leandb_migrations" journalColumns
-    let old? ← match ← readStoredSchema db with
+    let old? ← match ← readStoredSchemaRaw db with
       | .ok old? => pure old?
       | .error msg => return .error (.migrate msg)
     let old := old?.getD []
@@ -554,7 +560,7 @@ def instanceInfo (path : System.FilePath) : IO (Option (Option String × Option 
   if !(← path.pathExists) then return none
   try
     let db ← SQLite.open path
-    return some (← instanceInfoOn ⟨db⟩)
+    return some (← instanceInfoOn (← Conn.ofRaw db))
   catch _ =>
     return some (none, none)
 

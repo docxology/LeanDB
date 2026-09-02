@@ -84,6 +84,78 @@ register_option leandb.explain : Bool := {
   descr := "log the reified Pred (pushed vs residual conjuncts) at each select call site"
 }
 
+/-! ## Footprints, recorded per declaration
+
+Every plan the tactic reifies is walked for the columns it mentions —
+`Pred.Col.here` carries the entity type and the field symbol, `Pred.Col.id`
+the type — and whether an `opaque` leaf remains, and the result is stored
+in an environment extension under the declaration being elaborated. That
+is what `query%` reads to give a `QueryEntry` its footprint, statically,
+with no plan re-executed. -/
+
+structure PlanFootprint where
+  decl : Name
+  types : List String
+  columns : List (String × String)
+  residual : Bool
+  deriving Inhabited
+
+initialize planFootprintExt :
+    SimplePersistentEnvExtension PlanFootprint (NameMap (List PlanFootprint)) ←
+  registerSimplePersistentEnvExtension {
+    addEntryFn := fun m e => m.insert e.decl (e :: (m.find? e.decl).getD [])
+    addImportedFn := fun arrs => arrs.foldl (init := {}) fun m arr =>
+      arr.foldl (init := m) fun m e => m.insert e.decl (e :: (m.find? e.decl).getD [])
+  }
+
+/-- The recorded footprints of a declaration (this file and imports). -/
+def footprintsOf (env : Environment) (decl : Name) : List PlanFootprint :=
+  ((planFootprintExt.getState env).find? decl).getD []
+
+/-- Walk a reified plan for the columns it mentions. -/
+partial def footprintOfPlan (plan : Expr) : Footprint := Id.run do
+  let mut types : List String := []
+  let mut cols : List (String × String) := []
+  let mut residual := false
+  let mut stack := [plan]
+  let push := fun (xs : List String) (x : String) => if xs.contains x then xs else xs ++ [x]
+  let pushC := fun (xs : List (String × String)) (x : String × String) => if xs.contains x then xs else xs ++ [x]
+  while !stack.isEmpty do
+    let e := stack.head!
+    stack := stack.tail!
+    let fn := e.getAppFn
+    let args := e.getAppArgs
+    match fn.constName? with
+    | some ``Pred.Col.here =>
+        -- #[F, α, ts, ent, fo, f]
+        if let some ty := args[1]?.bind (·.constName?) then
+          let tyS := toString ty
+          types := push types tyS
+          if let some sym := args[5]?.bind (·.constName?) then
+            cols := pushC cols (tyS, sym.getString!)
+    | some ``Pred.Col.id =>
+        if let some ty := args[0]?.bind (·.constName?) then
+          let tyS := toString ty
+          types := push types tyS
+          cols := pushC cols (tyS, "id")
+    | some ``Pred.opaque => residual := true
+    | _ => pure ()
+    match e with
+    | .app f a => stack := f :: a :: stack
+    | .lam _ t b _ | .forallE _ t b _ => stack := t :: b :: stack
+    | .letE _ t v b _ => stack := t :: v :: b :: stack
+    | .mdata _ b | .proj _ _ b => stack := b :: stack
+    | _ => pure ()
+  return { tables := types, columns := cols, residual }
+
+/-- Record a plan's footprint under the enclosing declaration, if any. -/
+def recordFootprint (plan : Expr) : TermElabM Unit := do
+  let some decl ← Term.getDeclName? | return
+  let plan ← instantiateMVars plan
+  let f := footprintOfPlan plan
+  modifyEnv fun env => planFootprintExt.addEntry env
+    { decl, types := f.tables, columns := f.columns, residual := f.residual }
+
 /-- What the tactic knows about the `select` it is planning. -/
 private structure Ctx where
   /-- The table list, as the goal states it. -/
@@ -684,7 +756,9 @@ private def planFor (goalTy : Expr) : MetaM Expr := do
 elab "leandb_plan" : tactic => do
   let g ← getMainGoal
   let ty ← g.getType
-  g.assign (← mkExpectedTypeHint (← planFor ty) ty)
+  let plan ← planFor ty
+  recordFootprint plan
+  g.assign (← mkExpectedTypeHint plan ty)
 
 /-- `pred% [T1, T2] fun (a, b) => … : Pred [T1, T2]` — the plan
     `leandb_plan` would reify for that lambda, as a term. This is how a
@@ -704,6 +778,7 @@ elab "pred% " ts:term:max f:term:max : term => do
   let fE ← instantiateMVars fE
   let goalTy := mkApp2 (mkConst ``LeanDb.PlanFor) tsE fE
   let plan ← planFor goalTy
+  recordFootprint plan
   mkExpectedTypeHint plan (mkApp (mkConst ``LeanDb.Pred) tsE)
 
 end LeanDb.PlanElab

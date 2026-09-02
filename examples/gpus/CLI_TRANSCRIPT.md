@@ -128,7 +128,7 @@ $ gpus frobnicate
 
 ```console
 $ gpus log 3
-{"count":3,"entries":[{"at":1787598710,"detail":"provider","error":"restricted","id":21,"ok":false,"rows":0,"verb":"delete"},{"at":1787598710,"detail":"offering","error":null,"id":20,"ok":true,"rows":1,"verb":"update"},{"at":1787598710,"detail":"offering","error":null,"id":19,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1788380252,"detail":"provider","error":"restricted","id":19,"ok":false,"plan":null,"query":null,"rows":0,"verb":"delete"},{"at":1788380251,"detail":"offering | pushed: (t0.\"available\" IS ? AND t0.\"chip\" IS ?), residual conjuncts: 0","error":null,"id":18,"ok":true,"plan":{"footprint":{"columns":["offering.available","offering.chip"],"residual":false,"tables":["offering"]},"plan":{"a":{"col":{"column":"available","table":"offering"},"kind":"eq","op":"IS","value":1},"b":{"col":{"column":"chip","table":"offering"},"kind":"eq","op":"IS","value":"h100"},"kind":"and"},"tables":["offering"]},"query":"availableChip","rows":3,"verb":"select"},{"at":1788380251,"detail":"offering | pushed: (t0.\"chip\" IS ? OR t0.\"chip\" IS ?), residual conjuncts: 0","error":null,"id":17,"ok":true,"plan":{"footprint":{"columns":["offering.chip"],"residual":false,"tables":["offering"]},"plan":{"a":{"col":{"column":"chip","table":"offering"},"kind":"eq","op":"IS","value":"mi300x"},"b":{"col":{"column":"chip","table":"offering"},"kind":"eq","op":"IS","value":"mi325x"},"kind":"or"},"tables":["offering"]},"query":"amdOfferings","rows":3,"verb":"select"}],"ok":true}
 (exit 0)
 ```
 

@@ -17,7 +17,7 @@ has the query that needs it.
 | R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
 | R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | done 2026-09-01 |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
-| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S3 done 2026-09-02 |
+| R6 | Bases as packages, versioned typed migrations, hosting, importable bases (S0–S8) | S0–S4 done 2026-09-02 |
 
 ---
 
@@ -160,6 +160,7 @@ and D.
 ## R5 — The universe
 
 - Log stores the plan as data (needs R3); replay before `migrate apply`.
+  *Landed in R6/S4 as the footprint-based impact report.*
 - `Query : Type → Type` per study §5 in both bases; CLI derived from it.
 - LEP-0001 row symbols; `KnownDish` replaces slugs in `eats`.
 
@@ -194,10 +195,15 @@ logged plans byte-identical:
   adoption stamps an unstamped file at the version it matches.
   `examples/legacy` carries V0→V1 (`qty` → closed `size`); engine test
   `testChain`, base test `legacy_tests`.
-- **S4** — static query footprints from the plan tactic; `migrate status`
-  reports rows, destructive, transform required/provided, and which
-  queries a change touches; log stores the plan as data; `--replay`
-  (the R5 log item lands here).
+- **S4 — done 2026-09-02.** The tactic records each plan's footprint
+  under its declaration; `query%` unions them into
+  `QueryEntry.footprint`; the log stores the plan as data with its
+  footprint and the query name; `migrate status` reports `changed`,
+  `impact` (queries touched, with logged run counts) and
+  `unregistered_runs`. The R5 log-as-data item lands here; a plan
+  *re-execution* replay is not built — the impact scan reads footprints,
+  which is what a schema change can be checked against. Engine test
+  `testFootprints`.
 - **S5** — `<base> serve --http <port>` on `Std.Http.Server`, fingerprint
   handshake; **S6** — `leandb host` multi-base supervisor and
   `serve --mcp`; **S7** — `Base.withInstance`, `examples/dashboard`

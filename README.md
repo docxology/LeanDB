@@ -328,6 +328,14 @@ $ legacy migrate apply --allow-destructive
  "backup":"data/backups/legacy-v0-….sqlite"}],"instance_version":1,…}
 ```
 
+`migrate status` also says what the change *reaches*: `changed` lists the
+columns it touches, `impact` every registered query whose plan reads one
+of them (the tactic records each plan's footprint at compile time;
+`query%` carries it) with how many logged runs did, and
+`unregistered_runs` counts logged selects from outside the registered
+queries. The log itself now stores each select's plan as data with its
+footprint and the query it ran under.
+
 One transaction per version, a full backup before each, ids kept, the
 first row the transform rejects aborts the whole migration by id. An
 instance whose fingerprint is in no snapshot is `unknown_lineage` (exit
@@ -378,7 +386,7 @@ adds its `_leandb_*` bookkeeping tables on first open.
 | `seed` | the base's seed, when it declares one |
 | `migrate status` / `migrate apply [--allow-destructive] [--no-backup]` | see above; `apply` takes a full backup first |
 | `migrate rollback` · `migrate history` · `backup` · `restore <file>` | return to the pre-migration copy; the journal; copies on demand |
-| `log [n]` | the query log: verb, reified SQL plan, outcome, row count |
+| `log [n]` | the query log: verb, reified SQL plan (text and as data with its footprint), the query it ran under, outcome, row count |
 | `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
 
 Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:

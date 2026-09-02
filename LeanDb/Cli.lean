@@ -249,7 +249,7 @@ private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : Sys
   unless ← src.pathExists do
     return .error (.migrate s!"restore source does not exist: {src}")
   try
-    sess.conn.set ⟨← SQLite.open ":memory:"⟩
+    sess.conn.set (← Conn.ofRaw (← SQLite.open ":memory:"))
     let tmp : System.FilePath := inst.path.toString ++ ".restore"
     IO.FS.writeBinFile tmp (← IO.FS.readBinFile src)
     for suffix in ["-wal", "-shm", "-journal"] do
@@ -365,6 +365,48 @@ private def pendingJson (conn : Conn) (prev : List TableSpec) (m : Migration) (v
         ("transforms_missing", Json.arr (missing.map Json.str).toArray),
         ("steps", Json.arr steps)], destructive)
 
+/-- The `(table, column)` pairs a schema change touches: columns added,
+    dropped or changed in a surviving table, and every column (`*`) of a
+    dropped table. A new table touches nothing that exists. -/
+def changedColumns (old new : List TableSpec) : List (String × String) := Id.run do
+  let mut out : List (String × String) := []
+  for o in old do
+    match new.find? (·.name == o.name) with
+    | none => out := out ++ [(o.name, "*")]
+    | some n =>
+        for c in o.columns do
+          match n.columns.find? (·.name == c.name) with
+          | none => out := out ++ [(o.name, c.name)]
+          | some c' => if c' != c then out := out ++ [(o.name, c.name)]
+        for c in n.columns do
+          if (o.columns.find? (·.name == c.name)).isNone then out := out ++ [(o.name, c.name)]
+  return out
+
+/-- Which registered queries (by their static footprints) and which logged
+    runs (by the footprints the log recorded) a change touches. -/
+private def impactJson (b : Base) (conn : Conn) (changed : List (String × String)) : IO (Json × Json) := do
+  let logged ← logFootprints conn 100000
+  let runsOf := fun (name : String) =>
+    logged.foldl (init := 0) fun n (q, cols) =>
+      if q == some name && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
+  let mut items : Array Json := #[]
+  for q in b.queries do
+    let f := b.resolveFootprint q.footprint
+    let hit := f.touching changed
+    let runs := runsOf q.name
+    if !hit.isEmpty || runs > 0 || (f.residual && f.tables.any fun t => changed.any (·.1 == t)) then
+      items := items.push <| Json.mkObj [("query", Json.str q.name),
+        ("columns", Json.arr (hit.map fun (t, c) => Json.str s!"{t}.{c}").toArray),
+        ("residual", Json.bool f.residual),
+        ("logged_runs", Lean.toJson runs)]
+  -- logged selects outside any registered query (scripts, other programs)
+  let anonymous := logged.foldl (init := 0) fun n (q, cols) =>
+    if q.isNone && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
+  return (Json.arr items, Lean.toJson anonymous)
+
+private def changedJson (changed : List (String × String)) : Json :=
+  Json.arr (changed.map fun (t, c) => Json.str s!"{t}.{c}").toArray
+
 /-- `migrate status` / `apply` when the base carries a chain. -/
 private def chainMigrate (b : Base) (inst : Instance) (sess : Session) (c : Chain)
     (apply allowDestructive backup : Bool) : IO Json := do
@@ -408,10 +450,13 @@ private def chainMigrate (b : Base) (inst : Instance) (sess : Session) (c : Chai
               if let .ok d := st.getObjValAs? String "describe" then
                 describes := describes.push (Json.str s!"V{v}: {d}")
       prev := m.snapshot
+    let changed := changedColumns ((c.at? k).getD []) c.head
+    let (impact, anonymous) ← impactJson b conn changed
     return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
       ("instance_version", Lean.toJson k), ("head_version", Lean.toJson c.headVersion),
       ("steps", Json.arr describes), ("destructive", Json.bool destructive),
-      ("notes", Json.arr (notes.map Json.str)), ("pending", Json.arr items)]
+      ("notes", Json.arr (notes.map Json.str)), ("pending", Json.arr items),
+      ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
   -- apply, one migration per transaction, each after its own backup
   let mut applied : Array Json := #[]
   let mut prev := (c.at? k).getD []
@@ -519,10 +564,14 @@ where
         | some r => return r.toJson
         | none =>
             let plan := plan?.getD {}
+            let old ← readStoredSchema conn
+            let changed := changedColumns (old.getD []) b.specs
+            let (impact, anonymous) ← impactJson b conn changed
             return Json.mkObj [("ok", Json.bool true),
               ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
               ("destructive", Json.bool plan.isDestructive),
-              ("notes", Json.arr (plan.notes.map Json.str).toArray)]
+              ("notes", Json.arr (plan.notes.map Json.str).toArray),
+              ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
 
 /-- The one place argv meets an open instance: every transport (one-shot
     CLI, JSON-lines `serve`, and the servers built on it) sends argv here
@@ -542,7 +591,17 @@ def _root_.LeanDb.Base.handle (b : Base) (inst : Instance) (sess : Session) : Li
           match ← sess.gate.get with
           | some e => return e.toJson
           | none =>
-              match ← act.run (← sess.conn.get) with
+              let conn ← sess.conn.get
+              -- a registered query runs under its name, so the log can say
+              -- which query recorded which plan
+              let queryName? := match args with
+                | "query" :: name :: _ => some name
+                | ["seed"] => some "seed"
+                | _ => none
+              conn.queryName.set queryName?
+              let r ← act.run conn
+              conn.queryName.set none
+              match r with
               | .ok j => return j
               | .error e => return e.toJson
 

@@ -128,7 +128,7 @@ $ tickets frobnicate
 
 ```console
 $ tickets log 3
-{"count":3,"entries":[{"at":1787598707,"detail":"user","error":"restricted","id":19,"ok":false,"rows":0,"verb":"delete"},{"at":1787598707,"detail":"ticket","error":null,"id":18,"ok":true,"rows":1,"verb":"update"},{"at":1787598706,"detail":"ticket","error":null,"id":17,"ok":true,"rows":1,"verb":"insert"}],"ok":true}
+{"count":3,"entries":[{"at":1788380248,"detail":"user","error":"restricted","id":17,"ok":false,"plan":null,"query":null,"rows":0,"verb":"delete"},{"at":1788380247,"detail":"ticket×user | pushed: (t0.\"reporter\" IS t1.\"id\" AND t0.\"status\" IS NOT ?), residual conjuncts: 1","error":null,"id":16,"ok":true,"plan":{"footprint":{"columns":["ticket.reporter","user.id","ticket.status"],"residual":true,"tables":["ticket","user"]},"plan":{"a":{"a":{"kind":"eq2","left":{"column":"reporter","table":"ticket"},"op":"IS","right":{"column":"id","table":"user"}},"b":{"col":{"column":"status","table":"ticket"},"kind":"eq","op":"IS NOT","value":"done"},"kind":"and"},"b":{"opaque":true},"kind":"and"},"tables":["ticket","user"]},"query":"slaBreached","rows":4,"verb":"select"},{"at":1788380247,"detail":"ticket | pushed: t0.\"status\" IS NOT ?, residual conjuncts: 0","error":null,"id":15,"ok":true,"plan":{"footprint":{"columns":["ticket.status"],"residual":false,"tables":["ticket"]},"plan":{"col":{"column":"status","table":"ticket"},"kind":"eq","op":"IS NOT","value":"done"},"tables":["ticket"]},"query":"openTickets","rows":7,"verb":"select"}],"ok":true}
 (exit 0)
 ```
 

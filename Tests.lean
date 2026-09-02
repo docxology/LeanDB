@@ -2753,11 +2753,70 @@ where
     let st ← (← SQLite.open p).prepare "SELECT COUNT(*) FROM author"
     if ← st.step then return (← st.columnInt64 0).toNatClampNeg else return 0
 
+/-! ## Footprints: what a query reads, statically; the log as data; impact -/
+
+/-- A query over both fixtures: a join, a null test, and a residual. -/
+def unratedByAuthor (a : Ref Author) : DbM (Array (Stored Book × Stored Author)) :=
+  select [Book, Author]
+    (fun (b, au) => b.val.author == au.ref && au.ref == a && b.val.rating.isNone
+      && b.val.title.length > 3)
+    (.key fun (b, _) => b.val.title)
+
+private def fpDbPath : System.FilePath := ".lake" / "leandb_test_footprint.sqlite"
+
+private def testFootprints : IO Unit := do
+  let q : QueryEntry := query% unratedByAuthor
+  -- static: recorded by the tactic under the def, read by query%
+  check (q.params == [("a", "Ref Author")]) s!"params: {q.params}"
+  let f := q.footprint
+  check (f.columns.contains ("Book", "author") && f.columns.contains ("Book", "rating")
+    && f.columns.contains ("Author", "id")) s!"static footprint columns: {f.columns}"
+  check (f.residual) "the title-length conjunct is residual"
+  -- resolved against the base: type names become table names
+  let b : Base := { name := "fp", tables := [CliTable.of Author, CliTable.of Book], queries := [q] }
+  let r := b.resolveFootprint f
+  check (r.columns.contains ("book", "rating") && r.tables.contains "author") s!"resolved: {r.columns}"
+  -- run it under its name: the log stores the plan as data, attributed
+  if ← fpDbPath.pathExists then IO.FS.removeFile fpDbPath
+  let inst := Instance.ofPath fpDbPath
+  let sess ← expectOk (← Cli.Session.open b inst) "open"
+  let ada ← b.handle inst sess ["insert", "author", "{\"name\":\"Ada\",\"age\":36}"]
+  let adaId := ((ada.getObjVal? "row" >>= (·.getObjValAs? Nat "id")).toOption.getD 0)
+  discard <| b.handle inst sess ["insert", "book", s!"\{\"title\":\"Notes\",\"author\":{adaId}}"]
+  let res ← b.handle inst sess ["query", "unratedByAuthor", toString adaId]
+  check ((res.getObjValAs? Bool "ok").toOption == some true) s!"query ran: {res}"
+  let log ← b.handle inst sess ["log", "1"]
+  let entry := ((log.getObjValAs? (Array Lean.Json) "entries").toOption.getD #[])[0]!
+  check ((entry.getObjValAs? String "query").toOption == some "unratedByAuthor") s!"log names the query: {entry}"
+  let plan := (entry.getObjVal? "plan").toOption.getD Lean.Json.null
+  check ((plan.getObjVal? "footprint" >>= (·.getObjValAs? (Array String) "columns")).toOption.getD #[] |>.contains "book.rating")
+    s!"log footprint has book.rating: {plan}"
+  check ((plan.getObjVal? "plan" >>= (·.getObjValAs? String "kind")).toOption == some "and") s!"plan stored as data: {plan}"
+  -- the insert was not attributed to a query
+  let log ← b.handle inst sess ["log", "3"]
+  let entries := (log.getObjValAs? (Array Lean.Json) "entries").toOption.getD #[]
+  check (entries.any fun e => (e.getObjValAs? String "verb").toOption == some "insert"
+    && (e.getObjVal? "query").toOption == some Lean.Json.null) "inserts carry no query name"
+  -- changed columns: drop book.rating (a base without it)
+  let v2Book : TableSpec := { Entity.spec Book with columns := (Entity.spec Book).columns.filter (·.name != "rating") }
+  let changed := Cli.changedColumns b.specs [Entity.spec Author, v2Book]
+  check (changed == [("book", "rating")]) s!"changed columns: {changed}"
+  check ((Cli.changedColumns b.specs [Entity.spec Author]) == [("book", "*")]) "dropped table touches everything"
+  -- impact: a base whose Book lost its rating column sees the query and its logged run
+  let b2 : Base := { name := "fp", tables := [CliTable.of Author, CliTable.of Marker], queries := [q] }
+  let sess2 ← expectOk (← Cli.Session.open b2 inst) "open under the changed base"
+  let st ← b2.handle inst sess2 ["migrate", "status"]
+  let impact := (st.getObjValAs? (Array Lean.Json) "impact").toOption.getD #[]
+  check (impact.any fun i => (i.getObjValAs? String "query").toOption == some "unratedByAuthor"
+      && (i.getObjValAs? Nat "logged_runs").toOption == some 1) s!"impact names the query and its run: {st}"
+  check (((st.getObjValAs? (Array String) "changed").toOption.getD #[]).contains "book.*") s!"changed lists book.*: {st}"
+
 def main : IO UInt32 := do
   testCodecs
   testBaseSpecs
   testSession
   testChain
+  testFootprints
   testDerivedSpec
   testSortBy
   testPlans
