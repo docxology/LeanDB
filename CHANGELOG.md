@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-09-02
+
+LeanDB 0.3.0 separates the engine from the bases and makes a base a
+package: a `LeanDb.Base` value in its own library, the instance chosen
+at run time, versioned typed migrations with full backups and rollback,
+an impact report before every apply, and the same handler served over
+JSON lines, HTTP (with a bearer token), MCP, and a multi-base host.
+Bases are importable by other Lean projects, in-process or over the
+wire, scaffolded standalone by `leandb new`, and deployable from a
+Dockerfile. Engine changes in order of landing:
 
 Pushdown: comparisons through a validated newtype's projection push when
 the projection is the column's encoding (checked by definitional
