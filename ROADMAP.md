@@ -14,8 +14,8 @@ has the query that needs it.
 | R0 | Land the verified 0.2.x fixes and the design documents | done 2026-09-01 |
 | R1 | `examples/eats` — restaurant base, plus the captured-parameter case split | done 2026-09-01 |
 | R2 | `examples/kernels` — kernel base, evidence for nested values | done 2026-09-01 |
-| R3 | LEP-0002 — typed predicate IR | next |
-| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | to be written from R1/R2 evidence |
+| R3 | LEP-0002 — typed predicate IR | done 2026-09-01 |
+| R4 | LEP-0003 nested values · LEP-0004 child-table quantifiers | next — to be written from R1/R2 evidence |
 | R5 | Query universe as a type; log as data; LEP-0001 row symbols | after R3 |
 
 ---
@@ -84,10 +84,15 @@ Lean, `Bench.sku` from gpumarket's `Gpu` (first cross-base type reuse).
 
 ## R3 — LEP-0002, typed predicate IR
 
-As proposed, with one amendment before implementation: reserve the
-`exists` constructor (study §3.3) so the IR's shape is not closed before
-R4. Acceptance criteria are in the LEP; R1 and R2 are additional goldens —
-their `log` output must be byte-identical before and after.
+Landed in three commits: field symbols (`Ticket.Field`, `FieldOf`,
+`Entity.columns` computed), the IR (`Col` indexed by its storage codec,
+`Pred` with `opaque` leaves, `denote`, `approx_sound` proved), and the
+switch (tactic emits `Pred`; `PushPred`/`SelectPlan`/`Plan.lean` deleted;
+`rows --eq` decodes through the column's codec). Acceptance met: the
+LEP's `#check`/`#check_failure` block, coherence `denote (reify p) r = p r`
+over the goldens, and every base's logged plan byte-identical — 59 plans
+replayed from the eight transcripts, zero differences. `exists` stays
+reserved for R4.
 
 ## R4 — LEP-0003 and LEP-0004
 

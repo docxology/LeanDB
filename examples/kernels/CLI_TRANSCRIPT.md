@@ -141,11 +141,11 @@ $ kernels rows bench --eq binding=K=4096,M=4096,N=4096
 (exit 0)
 ```
 
-## …but --eq compares the raw string, not the codec's canonical form: the user-order spelling matches nothing (the typed query above canonicalizes it)
+## …and --eq goes through the column's codec like every other boundary, so the user-order spelling is canonicalized and matches the same rows
 
 ```console
 $ kernels rows bench --eq binding=M=4096,N=4096,K=4096
-{"count":0,"ok":true,"rows":[]}
+{"count":7,"ok":true,"rows":[{"binding":"K=4096,M=4096,N=4096","bwGBs":585,"driver":"550.90","host":"h100-node-01","id":1,"iters":100,"kernel":1,"latency":172,"measuredAt":1756000000,"occupancy":500,"precision":"bf16","sku":"h100Sxm","tflops":799000,"toolchain":"cuda-12.6","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":508,"driver":"560.35","host":"h100-node-01","id":2,"iters":100,"kernel":1,"latency":198,"measuredAt":1756500000,"occupancy":500,"precision":"bf16","sku":"h100Sxm","tflops":694000,"toolchain":"cuda-12.8","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":399,"driver":"550.90","host":"h100-node-01","id":5,"iters":100,"kernel":2,"latency":168,"measuredAt":1756000000,"occupancy":500,"precision":"bf16","sku":"h100Sxm","tflops":818000,"toolchain":"cuda-12.6","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":426,"driver":"550.90","host":"h100-node-01","id":7,"iters":100,"kernel":5,"latency":236,"measuredAt":1756000000,"occupancy":333,"precision":"bf16","sku":"h100Sxm","tflops":582000,"toolchain":"cuda-12.6","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":671,"driver":"6.2.0","host":"mi300x-node-01","id":14,"iters":100,"kernel":3,"latency":150,"measuredAt":1756000000,"occupancy":500,"precision":"bf16","sku":"mi300x","tflops":916000,"toolchain":"rocm-6.2","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":589,"driver":"6.3.0","host":"mi300x-node-01","id":15,"iters":100,"kernel":3,"latency":171,"measuredAt":1756500000,"occupancy":500,"precision":"bf16","sku":"mi300x","tflops":804000,"toolchain":"rocm-6.3","warmup":10},{"binding":"K=4096,M=4096,N=4096","bwGBs":430,"driver":"6.2.0","host":"mi300x-node-01","id":17,"iters":100,"kernel":4,"latency":156,"measuredAt":1756000000,"occupancy":500,"precision":"bf16","sku":"mi300x","tflops":881000,"toolchain":"rocm-6.2","warmup":10}]}
 (exit 0)
 ```
 

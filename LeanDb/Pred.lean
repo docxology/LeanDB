@@ -12,8 +12,10 @@ a value of the wrong type is *unrepresentable*. `denote` gives every plan
 a meaning over `Rows ts`; `approx` is the part that ships to SQL, and
 `approx_sound` proves it never excludes a row the plan would accept.
 
-This module is additive: `PushPred` (in `LeanDb.Plan`) still drives
-execution until stage 3 switches the tactic and the executor over.
+This is the plan `select` carries: `leandb_plan` (`LeanDb.PlanElab`)
+reifies the call-site lambda into a `Pred`, the executor sends `approx`
+to SQL and still applies the lambda to what comes back (`finishRows`), so
+pushdown narrows a fetch and never decides a result.
 
 Two names collide with the encoded-value layer on purpose and are kept
 apart by namespace: `LeanDb.Col` is a SQL value; `LeanDb.Pred.Col` is a
@@ -158,7 +160,7 @@ end Pred
 /-! ## The plan -/
 
 /-- A select predicate as data over `Rows ts`. Three things are
-    structural here that are tactic discipline in `PushPred`: an ordered
+    structural here that an untyped tree leaves to tactic discipline: an ordered
     comparison needs `SqlOrd τ` at the constructor (so no nullable or
     closed-enum column can appear in one, which is what makes `neg` exact);
     the comparison value is a `τ`, not a `LeanDb.Col`; and the residual is
@@ -318,7 +320,7 @@ theorem approx_sound : ∀ (p : Pred ts) (r : Rows ts),
   | .isNull .., _, h => h
   | .isNotNull .., _, h => h
 
-/-! ### The plan surface (ported from `PushPred`, same output) -/
+/-! ### The plan surface -/
 
 /-- Table indices a predicate touches. -/
 def tables : Pred ts → List Nat
@@ -379,19 +381,25 @@ where
   col {ts : List Type} {τ : Type} {i : ColCodec τ} (alias? : Bool) (c : Col ts τ i) : String :=
     if alias? then s!"t{c.tableIdx}.\"{c.name}\"" else s!"\"{c.name}\""
 
-/-- The human form logged per `select`: same format as `SelectPlan.describe`. -/
+/-- The human form logged per `select`: the SQL of the pushable projection
+    and the number of conjuncts left to the lambda. -/
 def describe (p : Pred ts) : String :=
   s!"pushed: {(p.approx.render true).1}, residual conjuncts: {p.residuals}"
 
-/-- Marker type carrying the predicate in its *type*, so the plan tactic
-    can reflect the call-site lambda from its goal. Runtime-wise this is
-    just `Pred ts`. Coexists with `LeanDb.PlanFor` until stage 3. -/
-def PlanFor {ts : List Type} (_where' : Rows ts → Bool) : Type 1 := Pred ts
-
-instance {w : Rows ts → Bool} : Inhabited (PlanFor w) := ⟨(.tt : Pred ts)⟩
-
-def PlanFor.plan {w : Rows ts → Bool} (p : PlanFor w) : Pred ts := p
+/-- Exactly `tt`: nothing to push, so a fetch needs no `WHERE` at all. -/
+def isTrivial : Pred ts → Bool
+  | .tt => true
+  | _ => false
 
 end Pred
+
+/-- Marker type carrying the predicate in its *type*, so the `leandb_plan`
+    default-argument tactic can reflect the actual call-site lambda from
+    its goal. Runtime-wise this is just `Pred ts`. -/
+def PlanFor {ts : List Type} (_where' : Rows ts → Bool) : Type 1 := Pred ts
+
+instance {ts : List Type} {w : Rows ts → Bool} : Inhabited (PlanFor w) := ⟨(.tt : Pred ts)⟩
+
+def PlanFor.plan {ts : List Type} {w : Rows ts → Bool} (p : PlanFor w) : Pred ts := p
 
 end LeanDb

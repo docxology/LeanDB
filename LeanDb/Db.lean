@@ -74,35 +74,38 @@ private def bindCols (stmt : SQLite.Stmt) (first : Nat) (cols : Array Col) : IO 
   for h : i in [0:cols.size] do
     bindCol stmt (Int32.ofNat (first + i)) cols[i]
 
-/-- A column we cannot represent is a decode failure like any other, so it
-    carries the table and field it came from rather than escaping untyped. -/
-private def readCol (table field : String) (stmt : SQLite.Stmt) (i : Int32) :
-    IO (Except DbError Col) := do
+/-- A column we cannot represent (`none`) is a decode failure like any
+    other; the caller names the table and field it came from. -/
+private def readCol (stmt : SQLite.Stmt) (i : Int32) : IO (Option Col) := do
   match ← stmt.columnType i with
-  | .integer => return .ok (.int (← stmt.columnInt64 i))
-  | .float => return .ok (.real (← stmt.columnDouble i))
-  | .text => return .ok (.text (← stmt.columnText i))
-  | .null => return .ok .null
-  | .blob => return .error (.decode table field "BLOB columns are not supported")
+  | .integer => return some (.int (← stmt.columnInt64 i))
+  | .float => return some (.real (← stmt.columnDouble i))
+  | .text => return some (.text (← stmt.columnText i))
+  | .null => return some .null
+  | .blob => return none
 
-/-- Read `labels.size` result columns starting at `first`, each labelled
-    with the `(table, field)` it was selected from. -/
-private def readRow (stmt : SQLite.Stmt) (first : Nat) (labels : Array (String × String)) :
+/-- Read `n` result columns starting at `first`. `label i` names the
+    `(table, field)` column `i` was selected from — consulted only when a
+    value cannot be represented, so a row decode allocates nothing for it. -/
+private def readRow (stmt : SQLite.Stmt) (first n : Nat) (label : Nat → String × String) :
     IO (Except DbError (Array Col)) := do
-  let mut cols : Array Col := #[]
-  for h : i in [0:labels.size] do
-    let (table, field) := labels[i]
-    match ← readCol table field stmt (Int32.ofNat (first + i)) with
-    | .ok c => cols := cols.push c
-    | .error e => return .error e
+  let mut cols : Array Col := Array.mkEmpty n
+  for i in [0:n] do
+    match ← readCol stmt (Int32.ofNat (first + i)) with
+    | some c => cols := cols.push c
+    | none =>
+        let (table, field) := label i
+        return .error (.decode table field "BLOB columns are not supported")
   return .ok cols
 
 /-- Read the current result row as `id` (column 0) plus the entity columns. -/
 private def readStored (α : Type) [Entity α] (stmt : SQLite.Stmt) :
     IO (Except DbError (Stored α)) := do
   let id ← stmt.columnInt64 0
-  let table := Entity.tableName α
-  match ← readRow stmt 1 ((Entity.columns α).map fun c => (table, c.name)) with
+  let fields := Entity.fields (α := α)
+  let label (i : Nat) : String × String :=
+    (Entity.tableName α, (fields[i]?.map Entity.fieldName).getD "?")
+  match ← readRow stmt 1 fields.size label with
   | .error e => return .error e
   | .ok cols => return (Entity.decode cols).map (⟨⟨id⟩, ·⟩)
 
@@ -227,10 +230,13 @@ def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.table
     db.changes
   if changed == 0 then throw (.notFound table id.toInt64)
 
-/-- Rows of `α`'s table matching a (single-table) pushed predicate, in
-    id order. -/
-def fetchFiltered (α : Type) [Entity α] (pred : PushPred) : DbM (Array (Stored α)) := do
-  if pred == .tt then return ← fetchAll α
+/-- Rows of `α`'s table matching a pushed predicate, in id order. The
+    predicate is rendered alias-free, so only conjuncts over `α`'s own
+    columns may reach here (`Pred.forTable`); callers pass an opaque-free
+    tree (`Pred.approx`). -/
+def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts) :
+    DbM (Array (Stored α)) := do
+  if pred.isTrivial then return ← fetchAll α
   let (whereSql, binds) := pred.render false
   let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} WHERE {whereSql} ORDER BY id"
   let rows ← sqlite fun db => do
@@ -245,22 +251,23 @@ def fetchFiltered (α : Type) [Entity α] (pred : PushPred) : DbM (Array (Stored
 /-- The live database as a row `Source`, ignoring plans. -/
 def dbSource : Source DbM := ⟨fun _ α _ => fetchAll α⟩
 
-/-- The live database narrowed by a plan's per-table pushed conjuncts. -/
-def plannedSource (plan : SelectPlan) : Source DbM :=
-  ⟨fun i α _ => fetchFiltered α (plan.pred.forTable i)⟩
+/-- The live database narrowed by a pushed plan's per-table conjuncts. -/
+def plannedSource {ts : List Type} (pushed : Pred ts) : Source DbM :=
+  ⟨fun i α _ => fetchFiltered α (pushed.forTable i)⟩
 
 /-- Joined execution: one SQL statement over all involved tables with the
     whole pushed predicate (join conditions included) as `WHERE`. Used
     when the plan relates tables — the pushed joins cut the product in
-    SQL instead of materializing it client-side. -/
-def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
+    SQL instead of materializing it client-side. `pushed` is opaque-free
+    (`Pred.approx`). -/
+def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
     (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : DbM (Array (Rows ts)) := do
   let specs := RowsOf.specs ts
   let froms := specs.zipIdx.map fun (spec, i) => s!"{quoteId spec.name} AS t{i}"
   let sel := specs.zipIdx.map fun (spec, i) =>
     String.intercalate ", " (s!"t{i}.id" :: spec.columns.toList.map fun c => s!"t{i}.{quoteId c.name}")
   let order := specs.zipIdx.map fun (_, i) => s!"t{i}.id"
-  let (whereSql, binds) := plan.pred.render true
+  let (whereSql, binds) := pushed.render true
   let sql := s!"SELECT {String.intercalate ", " sel} FROM {String.intercalate ", " froms} " ++
     s!"WHERE {whereSql} ORDER BY {String.intercalate ", " order}"
   -- One label per selected column, in the same order as `sel` above, so a
@@ -272,7 +279,9 @@ def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
     bindCols stmt 1 binds
     let mut out : Array (Except DbError (Array Col)) := #[]
     repeat
-      if ← stmt.step then out := out.push (← readRow stmt 0 labels) else break
+      if ← stmt.step then
+        out := out.push (← readRow stmt 0 labels.size (labels.getD · ("?", "?")))
+      else break
     return out
   let rows ← raw.mapM fun r => do
     let cols ← liftExcept r
@@ -280,20 +289,23 @@ def selectJoined (ts : List Type) [RowsOf ts] (plan : SelectPlan)
   return finishRows ts rows where' sortBy
 
 /-- The typed select. The trailing `plan` is reified from `where'` by the
-    `leandb_plan` tactic at each call site: join conditions route to the
-    joined executor, everything else narrows per-table fetches. The lambda
-    is still applied to what comes back, so the reference semantics
-    (`selectSpec` over an unfiltered source) define the result and
-    pushdown can only be an optimization. -/
+    `leandb_plan` tactic at each call site as a `Pred ts`; what ships to
+    SQL is its pushable projection `approx` (`Pred.approx_sound`: it never
+    excludes a row the plan accepts). Join conditions route to the joined
+    executor, everything else narrows per-table fetches. The lambda is
+    still applied to what comes back (`finishRows`), so the reference
+    semantics (`selectSpec` over an unfiltered source) define the result
+    and pushdown can only be an optimization. -/
 def select (ts : List Type) [RowsOf ts] (where' : Rows ts → Bool)
     (sortBy : SortBy (Rows ts) := .preserve)
     (plan : PlanFor where' := by leandb_plan) : DbM (Array (Rows ts)) :=
   let names := String.intercalate "×" ((RowsOf.specs ts).map (·.name))
+  let pushed := plan.plan.approx
   withLog "select" s!"{names} | {plan.plan.describe}" (·.size) <|
-    if plan.plan.pred.hasJoin then
-      selectJoined ts plan.plan where' sortBy
+    if pushed.hasJoin then
+      selectJoined ts pushed where' sortBy
     else
-      selectSpec ts (plannedSource plan.plan) where' sortBy
+      selectSpec ts (plannedSource pushed) where' sortBy
 
 /-- `select` with pushdown disabled — the executable reference, for
     differential testing against the planned path. -/

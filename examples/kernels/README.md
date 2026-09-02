@@ -115,19 +115,15 @@ enum-drift scan does not fire either: it scans enum *columns*, and
 guarantee the migration machinery gives to flat columns stops at the
 JSON boundary.
 
-**What `rows --eq` cannot do.** It filters the search columns and enums
-fine (`--eq inDtype0=fp8e4m3`), and — since `--eq` splits at the first
-`=` only — it accepts the canonical binding TEXT as a value. But `--eq`
-compares the *raw string*: `--eq binding=K=4096,M=4096,N=4096` (the
-stored, sorted spelling) matches seven benches and
-`--eq binding=M=4096,N=4096,K=4096` matches none, while the typed
-`fastest` query accepts either because its argument goes through
-`DimBinding.decode` (transcript). A canonical encoding only helps a
-boundary that runs the codec; `--eq` does not. And it cannot look
-*inside* `sig` or `launch` at all — only a byte-exact
+**What `rows --eq` can and cannot do.** It filters the search columns and
+enums fine (`--eq inDtype0=fp8e4m3`), it splits at the first `=` only, and
+— since LEP-0002 stage 3 — the value goes through the column's codec like
+every other boundary: `--eq binding=M=4096,N=4096,K=4096` is canonicalized
+by `DimBinding.make` and matches the same seven benches as the stored
+spelling `K=4096,M=4096,N=4096` (transcript). What it still cannot do is
+look *inside* `sig` or `launch` at all — only a byte-exact
 `--eq sig=<compressed JSON>` would match — so "first input is bf16" is
-askable only through the search column that duplicates it. The CLI's
-filter language ends exactly where SQL's does.
+answerable only because `inDtype0` exists as a column.
 
 **Inline-flattening `LaunchConfig`/`NumericProps`: yes, both.** The base
 did one of each on purpose. `NumericProps` is flattened by hand

@@ -112,13 +112,18 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
     return Json.mkObj [("ok", Json.bool true), ("deleted", Lean.toJson id.toInt)]
   rowsWhere eqs limit := do
     let spec := Entity.spec α
-    let mut pred : PushPred := .tt
+    -- (symbol, typed value) per filter; the plan is folded from these
+    -- below, outside the monad (`Pred` lives in `Type 1`, `DbM` carries `Type`)
+    let mut conds : Array ((f : Entity.Field α) × Entity.fieldTy f) := #[]
     for (col, v) in eqs do
-      match spec.columns.find? (·.name == col) with
+      -- the boundary parses the name into the symbol at once; from here
+      -- on the column is `f`, never the string
+      match Entity.fieldOfName? α col with
       | none =>
           throw (.decode spec.name col
             s!"no such column; columns: {spec.columns.toList.map (·.name)}")
-      | some c =>
+      | some f =>
+          let c := Entity.fieldSpec f
           -- a closed-world column refuses unknown variants loudly — a
           -- silent empty result is the exact failure mode LeanDB exists
           -- to kill
@@ -136,7 +141,14 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
                 | none => throw (.decode spec.name col s!"expected an integer, got {String.quote v}")
             | .text => pure (Col.text v)
             | .real => throw (.decode spec.name col "REAL columns cannot be filtered with --eq")
-          pred := pred.andS (.cmp 0 col .eq cv)
+          -- the validated value goes through the column's own codec, like
+          -- every other boundary: a validated newtype's canonical encoding
+          -- is what SQLite compares, not the spelling on the command line
+          let tv ← match (Entity.codec f).fromCol cv with
+            | .ok tv => pure tv
+            | .error e => throw (.decode spec.name col e)
+          conds := conds.push ⟨f, tv⟩
+    let pred : Pred [α] := conds.foldl (init := .tt) fun p c => p.andS (.eq (.here c.1) .eq c.2)
     let rows ← fetchFiltered α pred
     let rows := rows.toList.take limit
     return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.length),

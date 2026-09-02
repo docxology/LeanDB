@@ -60,7 +60,7 @@ class RowsOf (ts : List Type) where
 /-- Decode `id, cols…` of a single entity from a slice of a joined row. -/
 private def decodeStored (α : Type) [Entity α] (cols : Array Col) (start : Nat) :
     Except DbError (Stored α) := do
-  let n := (Entity.columns α).size
+  let n := (Entity.fields (α := α)).size
   let id ← match cols.getD start .null with
     | .int v => pure v
     | c => .error (.decode (Entity.tableName α) "id" s!"expected INTEGER id, found {c.describe}")
@@ -82,7 +82,7 @@ instance [Entity α] [RowsOf (β :: ts)] : RowsOf (α :: β :: ts) where
   specs := Entity.spec α :: RowsOf.specs (β :: ts)
   decodeFrom cols start := do
     let h ← decodeStored α cols start
-    let t ← RowsOf.decodeFrom (ts := β :: ts) cols (start + 1 + (Entity.columns α).size)
+    let t ← RowsOf.decodeFrom (ts := β :: ts) cols (start + 1 + (Entity.fields (α := α)).size)
     return (h, t)
 
 private def compareIds : List Int64 → List Int64 → Ordering

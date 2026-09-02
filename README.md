@@ -369,7 +369,7 @@ LeanDb/Core.lean     Id/Ref/Stored, Col, ColCodec, ClosedEnum, ColumnSpec, DbErr
 LeanDb/Entity.lean   Entity class, TableSpec, DDL generation, fingerprint
 LeanDb/Derive.lean   deriving LeanDb.Entity / LeanDb.ClosedEnum (incl. field defaults)
 LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (the reference semantics)
-LeanDb/Plan.lean     PushPred plan IR      LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
+LeanDb/Pred.lean     typed plan IR (Pred)  LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
 LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query log
 LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal
 LeanDb/Json.lean     schema/row/error JSON, merge decode   LeanDb/Cli.lean  the CLI driver

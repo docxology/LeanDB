@@ -53,6 +53,15 @@ class FieldOf (F : Type) (α : outParam Type) [Entity α] where
 
 attribute [reducible] FieldOf.sym
 
+/-- An abstract entity's own symbol type. A boundary that resolved a column
+    name through `fieldOfName?` holds an `Entity.Field α` for an `α` it
+    knows only through its instance, and can still name the column
+    (`Col.here f`). Low priority and keyed on `Entity.Field ?α`, so the
+    generated instances — keyed on the concrete symbol type — are found
+    first and this one never competes with them. -/
+@[reducible] instance (priority := low) instFieldOfEntityField [Entity α] :
+    FieldOf (Entity.Field α) α := ⟨id⟩
+
 /-- The column specs, in declaration order — computed from the symbols,
     so the string is derived from the symbol and never the other way. -/
 def Entity.columns (α : Type) [Entity α] : Array ColumnSpec :=

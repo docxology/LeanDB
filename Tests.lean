@@ -178,64 +178,66 @@ private def testClosedEnum : IO Unit := do
 
 /-! ## Plan reflection (M4: pushdown as fetch narrowing) -/
 
-private def agePlan : PlanFor (fun (a : Stored Author) => a.val.age ≥ 40) := by leandb_plan
+private def agePlan : PlanFor (ts := [Author]) (fun (a : Stored Author) => a.val.age ≥ 40) := by leandb_plan
 
-private def capturedPlan (n : Nat) : PlanFor (fun (a : Stored Author) => a.val.age ≥ n) := by
+private def capturedPlan (n : Nat) : PlanFor (ts := [Author]) (fun (a : Stored Author) => a.val.age ≥ n) := by
   leandb_plan
 
-private def joinPlan : PlanFor (fun (r : Stored Book × Stored Author) =>
+private def joinPlan : PlanFor (ts := [Book, Author]) (fun (r : Stored Book × Stored Author) =>
     r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating == none) := by leandb_plan
 
-private def somePlan : PlanFor (fun (b : Stored Book) => b.val.rating == some 4.5) := by
+private def somePlan : PlanFor (ts := [Book]) (fun (b : Stored Book) => b.val.rating == some 4.5) := by
   leandb_plan
 
-private def enumPlan : PlanFor (fun (t : Stored Todo) => t.val.status == Status.done) := by
+private def enumPlan : PlanFor (ts := [Todo]) (fun (t : Stored Todo) => t.val.status == Status.done) := by
   leandb_plan
 
-private structure Flag where on : Bool
-private def boolPlan : PlanFor (fun (f : Stored Flag) => f.val.on) := by leandb_plan
+private structure Flag where
+  on : Bool
+  deriving LeanDb.Entity
+private def boolPlan : PlanFor (ts := [Flag]) (fun (f : Stored Flag) => f.val.on) := by leandb_plan
 
 private def opaquePred (a : Stored Author) : Bool := a.val.age % 2 == 0
-private def residualPlan : PlanFor opaquePred := by leandb_plan
+private def residualPlan : PlanFor (ts := [Author]) opaquePred := by leandb_plan
 
 @[db] private def Author.isAdult (a : Author) : Bool := a.age ≥ 40
-private def dbFnPlan : PlanFor (fun (a : Stored Author) => a.val.isAdult) := by leandb_plan
+private def dbFnPlan : PlanFor (ts := [Author]) (fun (a : Stored Author) => a.val.isAdult) := by leandb_plan
 
-private def isNonePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isNone) := by leandb_plan
-private def isSomePlan : PlanFor (fun (b : Stored Book) => b.val.rating.isSome) := by leandb_plan
+private def isNonePlan : PlanFor (ts := [Book]) (fun (b : Stored Book) => b.val.rating.isNone) := by leandb_plan
+private def isSomePlan : PlanFor (ts := [Book]) (fun (b : Stored Book) => b.val.rating.isSome) := by leandb_plan
 
-private def orPlan : PlanFor (fun (a : Stored Author) =>
+private def orPlan : PlanFor (ts := [Author]) (fun (a : Stored Author) =>
     a.val.age < 30 || a.val.age > 50) := by leandb_plan
 
-private def notPlan : PlanFor (fun (a : Stored Author) => !(a.val.age ≥ 40)) := by leandb_plan
+private def notPlan : PlanFor (ts := [Author]) (fun (a : Stored Author) => !(a.val.age ≥ 40)) := by leandb_plan
 
 -- `if` on a column comparison: the shape a midnight-wrapping opening-hours
 -- predicate takes (`if closes < opens then … else …`)
-private def itePlan : PlanFor (fun (a : Stored Author) =>
+private def itePlan : PlanFor (ts := [Author]) (fun (a : Stored Author) =>
     if a.val.age < 30 then a.val.name == "x" else a.val.age > 50) := by leandb_plan
-private def iteResidualPlan : PlanFor (fun (a : Stored Author) =>
+private def iteResidualPlan : PlanFor (ts := [Author]) (fun (a : Stored Author) =>
     if opaquePred a then a.val.age < 30 else true) := by leandb_plan
 
-private def nullableOrderPlan : PlanFor (fun (r : Stored MaybeRank) =>
+private def nullableOrderPlan : PlanFor (ts := [MaybeRank]) (fun (r : Stored MaybeRank) =>
     decide (r.val.score < some 4)) := by
   leandb_plan
 
-private def enumOrderPlan : PlanFor (fun (t : Stored Todo) =>
+private def enumOrderPlan : PlanFor (ts := [Todo]) (fun (t : Stored Todo) =>
     decide (t.val.status < Status.done)) := by
   leandb_plan
 
-private def orResidualPlan : PlanFor (fun (a : Stored Author) =>
+private def orResidualPlan : PlanFor (ts := [Author]) (fun (a : Stored Author) =>
     a.val.age < 30 || opaquePred a) := by leandb_plan
 
-private def matchPlan : PlanFor (fun (t : Stored Todo) =>
+private def matchPlan : PlanFor (ts := [Todo]) (fun (t : Stored Todo) =>
     match t.val.status with | .done => false | _ => true) := by leandb_plan
 
 @[db] private def Status.weight : Status → Nat
   | .backlog => 0 | .inProgress => 1 | .done => 2
-private def weightPlan : PlanFor (fun (t : Stored Todo) => t.val.status.weight ≥ 1) := by
+private def weightPlan : PlanFor (ts := [Todo]) (fun (t : Stored Todo) => t.val.status.weight ≥ 1) := by
   leandb_plan
 
-private def weightCapturedPlan (n : Nat) : PlanFor (fun (t : Stored Todo) =>
+private def weightCapturedPlan (n : Nat) : PlanFor (ts := [Todo]) (fun (t : Stored Todo) =>
     t.val.status.weight ≥ n) := by leandb_plan
 
 /-! Validated newtypes: a column stored *through* a projection. The
@@ -262,26 +264,26 @@ private structure Priced where
   span : Span
   deriving LeanDb.Entity
 
-private def newtypeEqPlan : PlanFor (fun (r : Stored Priced) => r.val.price.v == 500) := by
+private def newtypeEqPlan : PlanFor (ts := [Priced]) (fun (r : Stored Priced) => r.val.price.v == 500) := by
   leandb_plan
 
-private def newtypeLePlan : PlanFor (fun (r : Stored Priced) =>
+private def newtypeLePlan : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.price.v ≤ 500) := by leandb_plan
 
-private def newtypeCapturedPlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+private def newtypeCapturedPlan (n : Nat) : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.price.v ≤ n) := by leandb_plan
 
-private def newtypeGePlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+private def newtypeGePlan (n : Nat) : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.price.v ≥ n) := by leandb_plan
 
-private def newtypeAndPlan (n : Nat) : PlanFor (fun (r : Stored Priced) =>
+private def newtypeAndPlan (n : Nat) : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.price.v ≤ n && r.val.price.v ≥ 10) := by leandb_plan
 
 /-- The guard doing its job: same syntactic shape, different codec. -/
-private def foreignProjPlan : PlanFor (fun (r : Stored Priced) =>
+private def foreignProjPlan : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.span.lo ≤ 5) := by leandb_plan
 
-private def foreignProjEqPlan : PlanFor (fun (r : Stored Priced) =>
+private def foreignProjEqPlan : PlanFor (ts := [Priced]) (fun (r : Stored Priced) =>
     r.val.span.hi == 5) := by leandb_plan
 
 /-! Case splits on a *captured parameter* of closed-enum type: after the
@@ -325,119 +327,120 @@ private def Diet.forbids : Diet → List Kind
   | .fish => d != .vegetarian
   | .meat => d == .omnivore
 
-private def allowsPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+private def allowsPlan (d : Diet) : PlanFor (ts := [Ingredient]) (fun (i : Stored Ingredient) =>
     d.allows i.val.kind) := by leandb_plan
 
-private def paramFirstPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+private def paramFirstPlan (d : Diet) : PlanFor (ts := [Ingredient]) (fun (i : Stored Ingredient) =>
     d.allowsParamFirst i.val.kind) := by leandb_plan
 
-private def columnFirstPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+private def columnFirstPlan (d : Diet) : PlanFor (ts := [Ingredient]) (fun (i : Stored Ingredient) =>
     d.allowsColumnFirst i.val.kind) := by leandb_plan
 
 /-- A captured `Nat` is not a closed world: after the column split the
     branch `kindBonus n .plant` is stuck on `n` and must stay residual. -/
 private def kindBonus (n : Nat) (k : Kind) : Bool :=
   match k with | .plant => n > 3 | _ => false
-private def natParamPlan (n : Nat) : PlanFor (fun (i : Stored Ingredient) =>
+private def natParamPlan (n : Nat) : PlanFor (ts := [Ingredient]) (fun (i : Stored Ingredient) =>
     kindBonus n i.val.kind) := by leandb_plan
 
 /-- An enum parameter inside a genuinely opaque function: the split fires
     but no branch can be evaluated, so the conjunct stays residual. -/
 @[irreducible] private def dietOpaque (d : Diet) (k : Kind) : Bool :=
   d == .omnivore || k == .plant
-private def opaqueParamPlan (d : Diet) : PlanFor (fun (i : Stored Ingredient) =>
+private def opaqueParamPlan (d : Diet) : PlanFor (ts := [Ingredient]) (fun (i : Stored Ingredient) =>
     dietOpaque d i.val.kind) := by leandb_plan
 
-private def checkPlan (p : PlanFor w) (pred : PushPred) (residual : Nat) (label : String) :
-    IO Unit :=
-  unless p.plan.pred == pred && p.plan.residual == residual do
-    throw <| IO.userError s!"FAIL: {label}: got {repr p.plan}"
+/-- A plan golden: the SQL of its pushable projection, the bind values in
+    placeholder order, and the residual count. -/
+private def checkPlan (p : PlanFor w) (sql : String) (binds : Array Col) (residual : Nat)
+    (label : String) : IO Unit :=
+  let got := (p.plan.approx.render true, p.plan.residuals)
+  unless got == ((sql, binds), residual) do
+    throw <| IO.userError s!"FAIL: {label}: got {repr got}"
 
 private def testPlans : IO Unit := do
-  checkPlan agePlan (.cmp 0 "age" .ge (.int 40)) 0 "age plan fully pushed"
-  checkPlan (capturedPlan 41) (.cmp 0 "age" .ge (.int 41)) 0 "captured variable as bound param"
+  checkPlan agePlan "t0.\"age\" >= ?" #[.int 40] 0 "age plan fully pushed"
+  checkPlan (capturedPlan 41) "t0.\"age\" >= ?" #[.int 41] 0 "captured variable as bound param"
   checkPlan joinPlan
-    (.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
-      (.cmp 0 "rating" .eq .null)) 0 "equi-join pushes as cmp2 + per-table conds"
-  check joinPlan.plan.pred.hasJoin "join plan routes to joined executor"
-  checkPlan somePlan (.cmp 0 "rating" .eq (.real 4.5)) 0 "some-literal via Option codec"
-  checkPlan enumPlan (.cmp 0 "status" .eq (.text "done")) 0 "closed enum pushes as its name"
-  checkPlan boolPlan (.cmp 0 "on" .eq (.int 1)) 0 "bare Bool column"
-  checkPlan residualPlan .tt 1 "opaque predicate is fully residual"
-  checkPlan dbFnPlan (.cmp 0 "age" .ge (.int 40)) 0 "@[db] def unfolds"
-  checkPlan isNonePlan (.isNull 0 "rating") 0 "isNone as IS NULL"
-  checkPlan isSomePlan (.isNotNull 0 "rating") 0 "isSome as IS NOT NULL"
-  checkPlan orPlan (.or (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "age" .gt (.int 50))) 0
+    "((t0.\"author\" IS t1.\"id\" AND t1.\"age\" >= ?) AND t0.\"rating\" IS ?)" #[.int 40, .null] 0
+    "equi-join pushes as eq2 + per-table conds"
+  check joinPlan.plan.approx.hasJoin "join plan routes to joined executor"
+  checkPlan somePlan "t0.\"rating\" IS ?" #[.real 4.5] 0 "some-literal via Option codec"
+  checkPlan enumPlan "t0.\"status\" IS ?" #[.text "done"] 0 "closed enum pushes as its name"
+  checkPlan boolPlan "t0.\"on\" IS ?" #[.int 1] 0 "bare Bool column"
+  checkPlan residualPlan "1" #[] 1 "opaque predicate is fully residual"
+  checkPlan dbFnPlan "t0.\"age\" >= ?" #[.int 40] 0 "@[db] def unfolds"
+  checkPlan isNonePlan "t0.\"rating\" IS NULL" #[] 0 "isNone as IS NULL"
+  checkPlan isSomePlan "t0.\"rating\" IS NOT NULL" #[] 0 "isSome as IS NOT NULL"
+  checkPlan orPlan "(t0.\"age\" < ? OR t0.\"age\" > ?)" #[.int 30, .int 50] 0
     "disjunction pushes whole"
-  checkPlan notPlan (.cmp 0 "age" .lt (.int 40)) 0 "negation is exact"
+  checkPlan notPlan "t0.\"age\" < ?" #[.int 40] 0 "negation is exact"
   checkPlan itePlan
-    (.or (.and (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "name" .eq (.text "x")))
-         (.and (.cmp 0 "age" .ge (.int 30)) (.cmp 0 "age" .gt (.int 50))))
-    0 "if-then-else on columns pushes as (c ∧ t) ∨ (¬c ∧ e)"
-  checkPlan iteResidualPlan .tt 1 "if with an opaque condition is fully residual"
-  checkPlan nullableOrderPlan .tt 1 "nullable ordering remains residual"
-  checkPlan enumOrderPlan
-    (.or (.cmp 0 "status" .eq (.text "backlog"))
-      (.cmp 0 "status" .eq (.text "inProgress"))) 0
+    "((t0.\"age\" < ? AND t0.\"name\" IS ?) OR (t0.\"age\" >= ? AND t0.\"age\" > ?))"
+    #[.int 30, .text "x", .int 30, .int 50] 0
+    "if-then-else on columns pushes as (c ∧ t) ∨ (¬c ∧ e)"
+  checkPlan iteResidualPlan "1" #[] 1 "if with an opaque condition is fully residual"
+  checkPlan nullableOrderPlan "1" #[] 1 "nullable ordering remains residual"
+  checkPlan enumOrderPlan "(t0.\"status\" IS ? OR t0.\"status\" IS ?)"
+    #[.text "backlog", .text "inProgress"] 0
     "closed-enum ordering case-splits instead of using SQL text order"
-  checkPlan orResidualPlan .tt 1 "or with unpushable side is fully residual"
-  checkPlan matchPlan
-    (.or (.cmp 0 "status" .eq (.text "backlog")) (.cmp 0 "status" .eq (.text "inProgress")))
-    0 "match on closed enum case-splits to a disjunction"
-  checkPlan weightPlan
-    (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
-    0 "enum-table function case-splits, false branches drop"
+  checkPlan orResidualPlan "1" #[] 1 "or with unpushable side is fully residual"
+  checkPlan matchPlan "(t0.\"status\" IS ? OR t0.\"status\" IS ?)"
+    #[.text "backlog", .text "inProgress"] 0
+    "match on closed enum case-splits to a disjunction"
+  checkPlan weightPlan "(t0.\"status\" IS ? OR t0.\"status\" IS ?)"
+    #[.text "inProgress", .text "done"] 0
+    "enum-table function case-splits, false branches drop"
   -- the value/value guards a case split leaves behind compare two values
-  -- that are both known when the plan is built (`cmpVVS`), so `0 ≥ 1`
+  -- that are both known when the plan is built (`Pred.vvOrd`), so `0 ≥ 1`
   -- folds to `ff` and drops its branch: only the surviving columns reach SQL
-  checkPlan (weightCapturedPlan 1)
-    (.or (.cmp 0 "status" .eq (.text "inProgress")) (.cmp 0 "status" .eq (.text "done")))
-    0 "case split against a captured threshold folds the value tests"
-  checkPlan newtypeEqPlan (.cmp 0 "price" .eq (.int 500)) 0
+  checkPlan (weightCapturedPlan 1) "(t0.\"status\" IS ? OR t0.\"status\" IS ?)"
+    #[.text "inProgress", .text "done"] 0
+    "case split against a captured threshold folds the value tests"
+  checkPlan newtypeEqPlan "t0.\"price\" IS ?" #[.int 500] 0
     "newtype projection that is the codec's encoding pushes (eq, literal)"
-  checkPlan newtypeLePlan (.cmp 0 "price" .le (.int 500)) 0
+  checkPlan newtypeLePlan "t0.\"price\" <= ?" #[.int 500] 0
     "ordering through the encoding projection pushes (literal)"
-  checkPlan (newtypeCapturedPlan 700) (.cmp 0 "price" .le (.int 700)) 0
+  checkPlan (newtypeCapturedPlan 700) "t0.\"price\" <= ?" #[.int 700] 0
     "ordering through the encoding projection pushes (captured variable)"
-  checkPlan (newtypeGePlan 700) (.cmp 0 "price" .ge (.int 700)) 0
+  checkPlan (newtypeGePlan 700) "t0.\"price\" >= ?" #[.int 700] 0
     "reverse ordering through the encoding projection pushes"
-  checkPlan (newtypeAndPlan 700)
-    (.and (.cmp 0 "price" .le (.int 700)) (.cmp 0 "price" .ge (.int 10))) 0
+  checkPlan (newtypeAndPlan 700) "(t0.\"price\" <= ? AND t0.\"price\" >= ?)" #[.int 700, .int 10] 0
     "both bounds through the projection push"
-  checkPlan foreignProjPlan .tt 1
+  checkPlan foreignProjPlan "1" #[] 1
     "projection that is not the codec's encoding stays residual (order)"
-  checkPlan foreignProjEqPlan .tt 1
+  checkPlan foreignProjEqPlan "1" #[] 1
     "projection that is not the codec's encoding stays residual (equality)"
   -- captured closed-enum parameter: the world of `d` is split too, guarded
   -- by `d IS 'c'` — known at plan build, so every guard but one folds away
   -- and both match orders leave the same column condition
-  checkPlan (paramFirstPlan .vegetarian) (.cmp 0 "kind" .eq (.text "plant")) 0
+  checkPlan (paramFirstPlan .vegetarian) "t0.\"kind\" IS ?" #[.text "plant"] 0
     "@[db] function matching on the parameter first splits on its world"
-  checkPlan (columnFirstPlan .vegetarian) (.cmp 0 "kind" .eq (.text "plant")) 0
+  checkPlan (columnFirstPlan .vegetarian) "t0.\"kind\" IS ?" #[.text "plant"] 0
     "@[db] function matching on the column first reaches the same plan"
   for d in ClosedEnum.all (α := Diet) do
-    check ((allowsPlan d).plan.residual == 0)
+    check ((allowsPlan d).plan.residuals == 0)
       s!"derived allows ({repr d}) pushes with residual 0"
-    check ((paramFirstPlan d).plan.residual == 0)
+    check ((paramFirstPlan d).plan.residuals == 0)
       s!"param-first allows ({repr d}) pushes with residual 0"
-    check ((columnFirstPlan d).plan.residual == 0)
+    check ((columnFirstPlan d).plan.residuals == 0)
       s!"column-first allows ({repr d}) pushes with residual 0"
-  check ((allowsPlan .vegetarian).plan.pred.describe ==
-      "(t0.\"kind\" IS NOT ? AND t0.\"kind\" IS NOT ?)")
-    s!"derived allows folds to the forbidden kinds, got {(allowsPlan .vegetarian).plan.pred.describe}"
+  checkPlan (allowsPlan .vegetarian) "(t0.\"kind\" IS NOT ? AND t0.\"kind\" IS NOT ?)"
+    #[.text "meat", .text "fish"] 0 "derived allows folds to the forbidden kinds"
   -- omnivore forbids nothing: the whole conjunct folds to `true` — no
   -- narrowing, no residual
-  checkPlan (paramFirstPlan .omnivore) .tt 0 "a diet that allows everything folds to tt"
-  checkPlan (natParamPlan 5) .tt 1 "captured Nat inside a non-@[db] function stays residual"
-  checkPlan (opaqueParamPlan .omnivore) .tt 1
+  checkPlan (paramFirstPlan .omnivore) "1" #[] 0 "a diet that allows everything folds to tt"
+  checkPlan (natParamPlan 5) "1" #[] 1 "captured Nat inside a non-@[db] function stays residual"
+  checkPlan (opaqueParamPlan .omnivore) "1" #[] 1
     "enum parameter inside an opaque function stays residual"
 
 /-! ## Typed predicate IR (LEP-0002)
 
-Built by hand over the fixtures — the tactic does not emit `Pred` yet
-(stage 3). What is checked: the ill-typed plans are unrepresentable,
-`denote` agrees with the lambda, `approx`/`residuals` split the residual
-out, and `render` reproduces the `PushPred` renderer byte for byte. -/
+Plans built by hand over the fixtures, then the tactic's own: the
+ill-typed plans are unrepresentable, `denote` agrees with the lambda,
+`approx`/`residuals` split the residual out, `render` is pinned, and
+every plan `leandb_plan` emitted above is *coherent* — its denotation is
+the lambda it was reified from, opaque leaves included. -/
 
 -- the right type, from the symbol alone
 #check (Pred.Col.here Author.Field.age : Pred.Col [Author] Nat _)
@@ -464,6 +467,8 @@ private def alan : Stored Author := ⟨⟨2⟩, ⟨"Alan", 41⟩⟩
 private def computable : Stored Book := ⟨⟨7⟩, ⟨"On Computable Numbers", alan.ref, some 4.5⟩⟩
 private def notes : Stored Book := ⟨⟨8⟩, ⟨"Notes on the Analytical Engine", ada.ref, none⟩⟩
 private def unrated : Stored Book := ⟨⟨9⟩, ⟨"Unrated", alan.ref, none⟩⟩
+private def cheap : Stored Priced := ⟨⟨1⟩, ⟨⟨400⟩, ⟨1, 2⟩⟩⟩
+private def dear : Stored Priced := ⟨⟨2⟩, ⟨⟨900⟩, ⟨1, 2⟩⟩⟩
 
 /-- `agePlan`, by hand. -/
 private def ageP : Pred [Author] := .ord (.here Author.Field.age) .ge 40
@@ -504,32 +509,30 @@ private def testTypedPred : IO Unit := do
   check (((Pred.or ageP oddP).approx.render true).1 == "1") "or with an opaque side widens to true"
   for a in [ada, alan] do
     check (!(mixed.denote a) || mixed.approx.denote a) s!"approx_sound, observed on {a.val.name}"
-  -- render reproduces the PushPred renderer byte for byte (three goldens)
-  check (ageP.render true == (PushPred.cmp 0 "age" .ge (.int 40)).render true)
+  -- render, pinned: these strings are what the untyped renderer produced
+  check (ageP.render true == ("t0.\"age\" >= ?", #[.int 40]))
     s!"age render, got {repr (ageP.render true)}"
   check (joinP.render true ==
-      (PushPred.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
-        (.cmp 0 "rating" .eq .null)).render true)
+      ("((t0.\"author\" IS t1.\"id\" AND t1.\"age\" >= ?) AND t0.\"rating\" IS ?)", #[.int 40, .null]))
     s!"join render, got {repr (joinP.render true)}"
   check (iteP.render true ==
-      (PushPred.or (.and (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "name" .eq (.text "x")))
-        (.and (.cmp 0 "age" .ge (.int 30)) (.cmp 0 "age" .gt (.int 50)))).render true)
+      ("((t0.\"age\" < ? AND t0.\"name\" IS ?) OR (t0.\"age\" >= ? AND t0.\"age\" > ?))",
+        #[.int 30, .text "x", .int 30, .int 50]))
     s!"ite render, got {repr (iteP.render true)}"
-  check (joinP.render false == (PushPred.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
-        (.cmp 0 "rating" .eq .null)).render false)
-    "alias-free render matches too"
+  check (joinP.render false ==
+      ("((\"author\" IS \"id\" AND \"age\" >= ?) AND \"rating\" IS ?)", #[.int 40, .null]))
+    s!"alias-free render, got {repr (joinP.render false)}"
   check ((ageP.render true).1 == "t0.\"age\" >= ?" && (ageP.render false).1 == "\"age\" >= ?")
     "render text, pinned"
-  check (mixed.describe == "pushed: t0.\"age\" >= ?, residual conjuncts: 1" &&
-      mixed.describe == (SelectPlan.describe ⟨.cmp 0 "age" .ge (.int 40), 1⟩))
-    s!"describe format matches SelectPlan.describe, got {mixed.describe}"
+  check (mixed.describe == "pushed: t0.\"age\" >= ?, residual conjuncts: 1")
+    s!"describe format, got {mixed.describe}"
   -- plan surface
   check (joinP.hasJoin && !ageP.hasJoin) "hasJoin"
   check (joinP.tables == [0, 1] && ageP.tables == [0]) "tables"
   check (joinP.conjuncts.length == 3) "conjuncts"
-  check ((joinP.forTable 1).render false == (PushPred.cmp 1 "age" .ge (.int 40)).render false)
+  check ((joinP.forTable 1).render false == ("\"age\" >= ?", #[.int 40]))
     "forTable keeps only the conjuncts touching that table"
-  check ((joinP.forTable 0).render false == (PushPred.cmp 0 "rating" .eq .null).render false)
+  check ((joinP.forTable 0).render false == ("\"rating\" IS ?", #[.null]))
     "forTable 0 keeps the rating test"
   -- value/value folds at plan build
   check ((Pred.vvOrd (ts := [Author]) (0 : Nat) .ge 1).render true == ("0", #[]))
@@ -540,11 +543,75 @@ private def testTypedPred : IO Unit := do
     "vvEq is null-safe (none IS none)"
   -- through a newtype projection: same column, compared on the representation
   let priceP : Pred [Priced] := .ord (.via (.here Priced.Field.price) (·.v) (fun _ => rfl)) .le 500
-  check (priceP.render true == (PushPred.cmp 0 "price" .le (.int 500)).render true)
+  check (priceP.render true == ("t0.\"price\" <= ?", #[.int 500]))
     s!"via renders the underlying column, got {repr (priceP.render true)}"
-  let cheap : Stored Priced := ⟨⟨1⟩, ⟨⟨400⟩, ⟨1, 2⟩⟩⟩
-  let dear : Stored Priced := ⟨⟨2⟩, ⟨⟨900⟩, ⟨1, 2⟩⟩⟩
   check (priceP.denote cheap == true && priceP.denote dear == false) "via denotes through the projection"
+
+/-! ### Coherence of the tactic's plans
+
+`(reify where').denote r = where' r`: the plan `leandb_plan` emitted is
+the lambda, row for row — pushed leaves through their encodings, opaque
+leaves through the conjunct they carry. Together with `approx_sound` this
+is the whole safety argument: what ships to SQL accepts everything the
+lambda accepts. -/
+
+private def checkCoherent {ts : List Type} {w : Rows ts → Bool} (p : PlanFor w)
+    (rows : Array (Rows ts)) (label : String) : IO Unit := do
+  for r in rows do
+    check (p.plan.denote r == w r) s!"coherence: {label}"
+
+private def authors : Array (Stored Author) :=
+  #[ada, alan, ⟨⟨3⟩, ⟨"x", 40⟩⟩, ⟨⟨4⟩, ⟨"Grace", 29⟩⟩, ⟨⟨5⟩, ⟨"x", 51⟩⟩, ⟨⟨6⟩, ⟨"Ed", 30⟩⟩]
+private def books : Array (Stored Book) := #[computable, notes, unrated]
+private def bookAuthors : Array (Stored Book × Stored Author) :=
+  books.flatMap fun b => authors.map fun a => (b, a)
+private def todos : Array (Stored Todo) :=
+  #[⟨⟨1⟩, ⟨"write plan", .done⟩⟩, ⟨⟨2⟩, ⟨"build engine", .inProgress⟩⟩, ⟨⟨3⟩, ⟨"ship", .backlog⟩⟩]
+private def flags : Array (Stored Flag) := #[⟨⟨1⟩, ⟨true⟩⟩, ⟨⟨2⟩, ⟨false⟩⟩]
+private def ranks : Array (Stored MaybeRank) :=
+  #[⟨⟨1⟩, ⟨none⟩⟩, ⟨⟨2⟩, ⟨some 3⟩⟩, ⟨⟨3⟩, ⟨some 4⟩⟩, ⟨⟨4⟩, ⟨some 9⟩⟩]
+private def priced : Array (Stored Priced) :=
+  #[cheap, dear, ⟨⟨3⟩, ⟨⟨500⟩, ⟨5, 7⟩⟩⟩, ⟨⟨4⟩, ⟨⟨700⟩, ⟨0, 5⟩⟩⟩, ⟨⟨5⟩, ⟨⟨10⟩, ⟨9, 5⟩⟩⟩]
+private def ingredients : Array (Stored Ingredient) :=
+  #[⟨⟨1⟩, ⟨"pork", .meat⟩⟩, ⟨⟨2⟩, ⟨"salmon", .fish⟩⟩, ⟨⟨3⟩, ⟨"tofu", .plant⟩⟩]
+
+private def testCoherence : IO Unit := do
+  checkCoherent agePlan authors "agePlan"
+  checkCoherent (capturedPlan 41) authors "capturedPlan 41"
+  checkCoherent joinPlan bookAuthors "joinPlan"
+  checkCoherent somePlan books "somePlan"
+  checkCoherent enumPlan todos "enumPlan"
+  checkCoherent boolPlan flags "boolPlan"
+  checkCoherent residualPlan authors "residualPlan (the opaque leaf is the conjunct)"
+  checkCoherent dbFnPlan authors "dbFnPlan"
+  checkCoherent isNonePlan books "isNonePlan"
+  checkCoherent isSomePlan books "isSomePlan"
+  checkCoherent orPlan authors "orPlan"
+  checkCoherent notPlan authors "notPlan"
+  checkCoherent itePlan authors "itePlan"
+  checkCoherent iteResidualPlan authors "iteResidualPlan"
+  checkCoherent nullableOrderPlan ranks "nullableOrderPlan"
+  checkCoherent enumOrderPlan todos "enumOrderPlan"
+  checkCoherent orResidualPlan authors "orResidualPlan (the opaque leaf is the whole disjunction)"
+  checkCoherent matchPlan todos "matchPlan"
+  checkCoherent weightPlan todos "weightPlan"
+  checkCoherent (weightCapturedPlan 1) todos "weightCapturedPlan 1"
+  checkCoherent (weightCapturedPlan 0) todos "weightCapturedPlan 0"
+  checkCoherent (weightCapturedPlan 3) todos "weightCapturedPlan 3"
+  checkCoherent newtypeEqPlan priced "newtypeEqPlan"
+  checkCoherent newtypeLePlan priced "newtypeLePlan"
+  checkCoherent (newtypeCapturedPlan 700) priced "newtypeCapturedPlan 700"
+  checkCoherent (newtypeGePlan 700) priced "newtypeGePlan 700"
+  checkCoherent (newtypeAndPlan 700) priced "newtypeAndPlan 700"
+  checkCoherent foreignProjPlan priced "foreignProjPlan"
+  checkCoherent foreignProjEqPlan priced "foreignProjEqPlan"
+  for d in ClosedEnum.all (α := Diet) do
+    checkCoherent (allowsPlan d) ingredients s!"allowsPlan {repr d}"
+    checkCoherent (paramFirstPlan d) ingredients s!"paramFirstPlan {repr d}"
+    checkCoherent (columnFirstPlan d) ingredients s!"columnFirstPlan {repr d}"
+    checkCoherent (opaqueParamPlan d) ingredients s!"opaqueParamPlan {repr d}"
+  checkCoherent (natParamPlan 5) ingredients "natParamPlan 5"
+  checkCoherent (natParamPlan 2) ingredients "natParamPlan 2"
 
 /-! ## JSON, derived from the schema (M5) -/
 
@@ -962,6 +1029,7 @@ def main : IO UInt32 := do
   testSortBy
   testPlans
   testTypedPred
+  testCoherence
   testClosedEnum
   testDefaults
   testJson
