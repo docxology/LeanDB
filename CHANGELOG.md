@@ -15,8 +15,16 @@ splits at the first `=`.
 Two new bases: `examples/eats` (restaurants; dietary suitability computed
 from ingredients, never stored) and `examples/kernels` (GPU kernels with
 typed signatures and composition, benches keyed by gpumarket's `Gpu`).
-Design: LEP-0002 (typed predicate IR), the kernels/restaurants stress
-study, `ROADMAP.md`.
+
+LEP-0002 landed: `deriving LeanDb.Entity` generates field symbols
+(`Ticket.Field`) and `select` carries an intrinsically typed plan
+`Pred ts` — column references are Lean values indexed by the storage
+codec, ordered comparisons require `SqlOrd` at the constructor, the
+residual is an `opaque` leaf, `denote` gives every plan a meaning, and
+`approx_sound` proves the pushed fragment never excludes a row the lambda
+accepts. `PushPred` is gone; every base's logged plan is byte-identical.
+`rows --eq` decodes its value through the column's codec.
+Design docs: LEP-0002, the kernels/restaurants stress study, `ROADMAP.md`.
 
 ## 0.2.0 - 2026-08-25
 
