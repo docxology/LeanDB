@@ -11,3 +11,10 @@ Before tagging a release:
 5. Commit the release, then create an annotated tag matching the Lake version, for example `v0.2.0`.
 
 The release check builds the engine and importer, runs the engine suite, builds and runs every example suite, builds the generated legacy example, and exercises fresh SQLite import generation plus overwrite refusal.
+
+Bases pulled out of this repository require the engine by git tag
+(`leandb new … --leandb-git <url> --rev v0.3.0`); a tag therefore fixes
+the engine's `Base`/`Cli`/`Client` surface and the wire (JSON-lines argv,
+row JSON, error codes, `X-LeanDb-Fingerprint`). Bump the version in
+`lakefile.toml`, in `LeanDb/Mcp.lean`'s `serverInfo`, and in the README's
+`--rev` example together.

@@ -18,3 +18,4 @@ import LeanDb.Client
 import LeanDb.Mcp
 import LeanDb.Host
 import LeanDb.Import
+import LeanDb.Scaffold

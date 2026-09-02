@@ -38,6 +38,23 @@ done
   .lake/build/bin/dashboard
 )
 
+# scaffold round trip: leandb new against this checkout builds and passes its tests
+(
+  new_dir=$(mktemp -d /tmp/leandb-new.XXXXXX)
+  rm -rf "$new_dir"
+  .lake/build/bin/leandb new scaffold_check --out "$new_dir" --leandb-path "$repo_root"
+  if ! cmp -s lean-toolchain "$new_dir/lean-toolchain"; then
+    echo "release check failed: scaffolded lean-toolchain differs from root" >&2
+    exit 1
+  fi
+  (cd "$new_dir" && lake build && .lake/build/bin/scaffold_check_tests)
+  if .lake/build/bin/leandb new scaffold_check --out "$new_dir" --leandb-path "$repo_root" >/dev/null 2>&1; then
+    echo "release check failed: second scaffold into the same directory should fail" >&2
+    exit 1
+  fi
+  rm -rf "$new_dir"
+)
+
 # HTTP smoke: tickets over serve --http answers the typed routes and /rpc
 (
   cd examples/tickets

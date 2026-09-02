@@ -123,7 +123,10 @@ Maintainers can run the full engine, example, and importer release pass with
 
 A LeanDB database ("base") is an ordinary Lake package depending on
 `leandb`: types, queries, and one `LeanDb.Base` value that ties them
-together; the instance (the SQLite file) is chosen at run time. Three files. Make a directory anywhere and add:
+together; the instance (the SQLite file) is chosen at run time.
+`leandb new notes --leandb-git https://github.com/theoriclabs/LeanDB.git --rev v0.3.0`
+(or `--leandb-path /path/to/leandb`) scaffolds one laid out like the
+examples, tests included. By hand it is three files. Make a directory anywhere and add:
 
 **`lean-toolchain`** — must match the engine's (copy it):
 
@@ -485,6 +488,7 @@ LeanDb/Http.lean     serve --http: routes as sugar over Base.handle (Std.Http.Se
 LeanDb/Client.lean   Client (stdio wire, fingerprint handshake), client%, CliRender, QueryIn
 LeanDb/Mcp.lean      serve --mcp: tools derived from the base, JSON-RPC over stdio
 LeanDb/Host.lean     leandb host: many base processes under /bases/<name>/…
+LeanDb/Scaffold.lean leandb new: a standalone base package (path or git require)
 LeanDb/Json.lean     schema/row/error JSON, merge decode
 LeanDb/Base.lean     Base (tables → derived schema, queries, seed), Instance, QueryEntry
 LeanDb/Cli.lean      the CLI driver (CliArg, QueryOut, verbs, serve)

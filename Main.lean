@@ -1,5 +1,6 @@
 import LeanDb
 import LeanDb.Import
+import LeanDb.Scaffold
 
 /-! # The `leandb` engine CLI
 
@@ -19,6 +20,7 @@ def usageJson : Json :=
     ("usage", Json.arr #[
       Json.str "import-sqlite <file.db> --name <base-name> --out <dir> [--require-path <path-to-leandb>] [--db-path <path>]",
       Json.str "host --port <port> [--bind <host>] <name>=<exe>[,<arg>,…]…  (serve many bases under /bases/<name>/…)",
+      Json.str "new <name> [--out <dir>] (--leandb-path <path> | --leandb-git <url> [--rev <tag>])  (scaffold a standalone base package)",
       Json.str "--help"]),
     ("defaults", Json.mkObj [
       ("require-path", Json.str "../.."),
@@ -117,6 +119,53 @@ def runImport (a : ImportArgs) : IO UInt32 := do
   catch e =>
     opErr "sqlite" (toString e)
 
+structure NewArgs where
+  name : Option String := none
+  out : Option String := none
+  path : Option String := none
+  git : Option String := none
+  rev : Option String := none
+
+def parseNewArgs : List String → NewArgs → Except String NewArgs
+  | [], acc => .ok acc
+  | "--out" :: v :: rest, acc => parseNewArgs rest { acc with out := some v }
+  | "--leandb-path" :: v :: rest, acc => parseNewArgs rest { acc with path := some v }
+  | "--leandb-git" :: v :: rest, acc => parseNewArgs rest { acc with git := some v }
+  | "--rev" :: v :: rest, acc => parseNewArgs rest { acc with rev := some v }
+  | flag :: _, _ => if flag.startsWith "--" then .error s!"unrecognized flag {flag}" else
+      .error s!"unexpected argument {String.quote flag}"
+
+/-- `leandb new`: a standalone base package, requiring the engine from a
+    sibling checkout or from git (the pull-out form). Refuses to touch an
+    existing file. -/
+def runNew (a : NewArgs) : IO UInt32 := do
+  let some name := a.name | usageErr "new: a base name is required"
+  unless LeanDb.Scaffold.validName name do
+    return ← usageErr s!"new: base name must be lowercase snake_case, got {String.quote name}"
+  let source ← match a.path, a.git with
+    | some p, none => pure (LeanDb.Scaffold.Source.path p)
+    | none, some url => pure (LeanDb.Scaffold.Source.git url (a.rev.getD "main"))
+    | some _, some _ => return ← usageErr "new: give either --leandb-path or --leandb-git, not both"
+    | none, none => return ← usageErr "new: where is the engine? --leandb-path <path> (a checkout) or --leandb-git <url> [--rev <tag>]"
+  let target : LeanDb.Scaffold.Target :=
+    { name, module := LeanDb.Scaffold.moduleOf name, source, toolchain }
+  let out := System.FilePath.mk (a.out.getD name)
+  let files := LeanDb.Scaffold.files target
+  let mut conflicts : Array String := #[]
+  for (rel, _) in files do
+    if ← (out / rel).pathExists then conflicts := conflicts.push rel.toString
+  unless conflicts.isEmpty do
+    return ← opErr "exists" s!"refusing to overwrite existing files in {out}: {conflicts.toList}"
+  for (rel, contents) in files do
+    let p := out / rel
+    if let some parent := p.parent then IO.FS.createDirAll parent
+    IO.FS.writeFile p contents
+  IO.println (Json.mkObj [("ok", Json.bool true), ("base", Json.str name),
+    ("module", Json.str target.module), ("out", Json.str out.toString),
+    ("files", Json.arr (files.map fun (rel, _) => Json.str rel.toString).toArray),
+    ("next", Json.str s!"cd {out} && lake build && ./.lake/build/bin/{name}_tests")]).compress
+  return 0
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | [] | ["help"] | ["--help"] =>
@@ -127,5 +176,11 @@ def main (args : List String) : IO UInt32 := do
       | .error msg => usageErr s!"import-sqlite: {msg}"
       | .ok a => runImport a
   | "host" :: rest => LeanDb.Host.run rest
+  | "new" :: name :: rest =>
+      if name.startsWith "--" then usageErr "new: the base name comes first" else
+      match parseNewArgs rest { name := some name } with
+      | .error msg => usageErr s!"new: {msg}"
+      | .ok a => runNew a
+  | ["new"] => usageErr "new <name> [--out <dir>] (--leandb-path <path> | --leandb-git <url> [--rev <tag>])"
   | cmd :: _ =>
       usageErr s!"unrecognized command {String.quote cmd}"

@@ -175,6 +175,15 @@ schema, plus `schema`, `version`, `log`, `migrate_status`, `seed` — every
 call one argv through `Base.handle`, so an agent picks from the list and
 cannot invent a query.
 
+`leandb new <name> (--leandb-path <path> | --leandb-git <url> [--rev
+<tag>])` scaffolds a standalone base package — the README's notes base
+laid out like the examples (Scalars, Enums, Entities, Queries, Seed,
+Base, tests with `leandb_check_head` ready to uncomment) — requiring the
+engine from a checkout or from git, which is how a base is pulled out
+of this repository: it builds anywhere and other projects `require` it
+in turn. Refuses to overwrite existing files. The release check
+scaffolds one against the checkout, builds it and runs its tests.
+
 ## 0.2.0 - 2026-08-25
 
 LeanDB 0.2.0 replaces the earlier decision-query prototype with a typed SQLite engine. Entity structures now derive their table schema, codecs, DDL, JSON representation, CLI operations, migration plan, and schema fingerprint from one Lean definition.
