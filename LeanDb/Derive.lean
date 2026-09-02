@@ -3,10 +3,18 @@ import LeanDb.Entity
 
 /-! # `deriving LeanDb.Entity`
 
-Generates the `Entity` instance for a flat structure: table name, column
-specs, row encode/decode. The generated instance references only
-`columnSpec`/`ColCodec` through the field *types*, so the schema cannot
-drift from the structure — there is nothing else it could be derived from.
+Generates, for a flat structure `Ticket`:
+
+- `inductive Ticket.Field` — one constructor per declared field, in order,
+  spelled as the structure spells it (`«at»`), `deriving DecidableEq, Repr`;
+- the `Entity Ticket` instance: `fieldTy`/`get`/`codec`/`fieldSpec` as a
+  `match` over the symbols, `fields`, table name, row encode/decode;
+- the `FieldOf Ticket.Field Ticket` instance (symbol type → entity).
+
+The generated code references only `columnSpec`/`ColCodec` through the
+field *types*, so the schema cannot drift from the structure — there is
+nothing else it could be derived from. A structure that already declares
+`Field` in its namespace is refused.
 
 Not supported (typed error, not a runtime surprise): parameterized
 structures, and fields whose types depend on earlier fields (proof fields —
@@ -65,10 +73,31 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
     throwError "deriving LeanDb.Entity: table name '{tblName}' uses the reserved _leandb_ prefix"
   if fields.any (·.getString! == "id") then
     throwError "deriving LeanDb.Entity: field 'id' is reserved for LeanDB row identity"
-  let cmd ← liftTermElabM <| forallTelescopeReducing ctorInfo.type fun xs _ => do
+  let fieldTyName := declName ++ `Field
+  if env.contains fieldTyName then
+    throwError "deriving LeanDb.Entity: {declName} already declares '{fieldTyName}'; LeanDB generates the field symbols under that name"
+  -- 1. The field symbols. Declared under `_root_` so the current namespace
+  --    is not prepended; a private structure gets a private symbol type
+  --    (re-mangled to exactly `declName ++ Field` — same module).
+  let symId := mkIdent (`_root_ ++ (privateToUserName? declName).getD declName ++ `Field)
+  let ctors ← fields.mapM fun f => `(Lean.Parser.Command.ctor| | $(mkIdent f):ident)
+  let symCmd ←
+    if isPrivateName declName then
+      `(private inductive $symId:ident where $ctors* deriving DecidableEq, Repr)
+    else
+      `(inductive $symId:ident where $ctors* deriving DecidableEq, Repr)
+  elabCommand symCmd
+  unless (← getEnv).contains fieldTyName do
+    throwError "deriving LeanDb.Entity: failed to declare '{fieldTyName}'"
+  -- 2. The instances.
+  let cmds ← liftTermElabM <| forallTelescopeReducing ctorInfo.type fun xs _ => do
     unless xs.size == fields.size do
       throwError "deriving LeanDb.Entity: unexpected constructor arity for {declName}"
-    let mut colSpecs : Array Term := #[]
+    let mut tyAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+    let mut getAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+    let mut codecAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+    let mut specAlts : Array (TSyntax ``Lean.Parser.Term.matchAlt) := #[]
+    let mut syms : Array Term := #[]
     let mut encs : Array Term := #[]
     let mut fieldTys : Array Term := #[]
     for i in [0:fields.size] do
@@ -97,10 +126,29 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
                 logWarning m!"deriving LeanDb.Entity: default of '{declName}.{fname}' could not be evaluated ({ex.toMessageData}) — JSON inserts must supply it"
                 `((none : Option LeanDb.Col))
         | none => `((none : Option LeanDb.Col))
-      colSpecs := colSpecs.push
-        (← `(LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx))
+      let sym : Ident := mkCIdent (fieldTyName ++ fname)
+      syms := syms.push sym
+      tyAlts := tyAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $tyStx))
+      getAlts := getAlts.push
+        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => $(mkCIdent (declName ++ fname)) r))
+      codecAlts := codecAlts.push
+        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident => (inferInstance : LeanDb.ColCodec $tyStx)))
+      specAlts := specAlts.push
+        (← `(Lean.Parser.Term.matchAltExpr| | $sym:ident =>
+              LeanDb.columnSpec $(quote fname.toString) $tyStx $dfltStx))
       encs := encs.push
         (← `(LeanDb.ColCodec.toCol ($(mkCIdent (declName ++ fname)) r)))
+    -- A zero-field structure has an empty symbol type: every function
+    -- over it is `nomatch`.
+    let bySym (alts : Array (TSyntax ``Lean.Parser.Term.matchAlt)) : TermElabM Term :=
+      if fields.isEmpty then `(fun f => nomatch f)
+      else `(fun f => match f with $alts:matchAlt*)
+    let fieldTyFn ← bySym tyAlts
+    let codecFn ← bySym codecAlts
+    let specFn ← bySym specAlts
+    let getFn ←
+      if fields.isEmpty then `(fun f _ => nomatch f)
+      else `(fun f r => match f with $getAlts:matchAlt*)
     -- decode: right fold of decodeField binds ending in the constructor.
     let ctorArgs := (Array.range fields.size).map fun i => (fieldBinder i : Term)
     let mut body : Term ← `(Except.ok ($(mkCIdent ctorName) $ctorArgs*))
@@ -109,15 +157,27 @@ def deriveEntity (declName : Name) : CommandElabM Bool := do
       body ← `(LeanDb.decodeField $(quote tblName) $(quote fname.toString)
                  $(fieldTys[i]!) (row.getD $(quote i) .null) >>= fun $(fieldBinder i) => $body)
     let n := quote fields.size
-    `(instance : LeanDb.Entity $(mkCIdent declName) where
+    -- `@[reducible]`: instance lookup only sees through `Entity.fieldTy f`
+    -- to the field's type if the instance unfolds at reducible transparency
+    -- (see `LeanDb.Entity`).
+    let entityCmd : TSyntax `command ← `(@[reducible] instance : LeanDb.Entity $(mkCIdent declName) where
+        Field := $(mkCIdent fieldTyName)
+        fieldTy := $fieldTyFn
+        get := $getFn
+        codec := $codecFn
+        fieldSpec := $specFn
+        fields := #[$syms,*]
         tableName := $(quote tblName)
-        columns := #[$colSpecs,*]
         encode := fun r => #[$encs,*]
         decode := fun row =>
           if row.size == $n then $body
           else Except.error (LeanDb.DbError.decode $(quote tblName) "*"
                  s!"expected {$n} columns, found {row.size}"))
-  elabCommand cmd
+    let fieldOfCmd : TSyntax `command ← `(@[reducible] instance :
+        LeanDb.FieldOf $(mkCIdent fieldTyName) $(mkCIdent declName) := ⟨fun f => f⟩)
+    return (entityCmd, fieldOfCmd)
+  elabCommand cmds.1
+  elabCommand cmds.2
   return true
 
 def entityHandler : DerivingHandler := fun declNames => do

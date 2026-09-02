@@ -3,6 +3,7 @@ import LeanDb.Entity
 import LeanDb.Derive
 import LeanDb.Select
 import LeanDb.Plan
+import LeanDb.Pred
 import LeanDb.PlanElab
 import LeanDb.Db
 import LeanDb.Json

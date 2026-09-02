@@ -70,6 +70,29 @@ private def testDerivedSpec : IO Unit := do
   check (duplicate.isOk == false) "schema rejects duplicate table names"
   let reserved : TableSpec := ⟨"_leandb_user", #[]⟩
   check ((validateSchema [reserved]).isOk == false) "schema rejects the internal table prefix"
+  -- LEP-0002 stage 1: field symbols
+  check (Entity.fields (α := Author) == #[.name, .age]) "one symbol per field, in order"
+  check ((Entity.fields (α := Book)).map Entity.fieldName == #["title", "author", "rating"])
+    "fieldName follows declaration order"
+  check ((Entity.fields (α := Book)).all fun f => Entity.fieldOfName? Book (Entity.fieldName f) == some f)
+    "fieldName round-trips through fieldOfName?"
+  check ((Entity.fieldOfName? Author "nope").isNone) "unknown column has no symbol"
+  check ((Entity.fields (α := Marker)).isEmpty) "zero-field entity has no symbols"
+  check (Entity.get (α := Author) Author.Field.age a == 36) "get reads a field through its symbol"
+  -- `columns` is now computed from `fieldSpec`; the DDL it yields is what
+  -- the stored `columns` array produced before (goldens captured then)
+  check ((Entity.spec Author).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"author\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL, \"age\" INTEGER NOT NULL)")
+    s!"author DDL golden, got {(Entity.spec Author).ddl}"
+  check ((Entity.spec Book).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"book\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"title\" TEXT NOT NULL, \"author\" INTEGER NOT NULL REFERENCES \"author\"(id) ON DELETE RESTRICT ON UPDATE RESTRICT, \"rating\" REAL)")
+    s!"book DDL golden, got {(Entity.spec Book).ddl}"
+  check ((Entity.spec Marker).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"marker\" (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    s!"marker DDL golden, got {(Entity.spec Marker).ddl}"
+
+-- `get` through the symbol is typed by the field's declared type
+example : (Entity.get (α := Author) Author.Field.age ⟨"Ada", 36⟩ : Nat) = 36 := rfl
 
 private def testSortBy : IO Unit := do
   let xs := #[(3, "c"), (1, "b"), (1, "a"), (2, "z")]
@@ -126,6 +149,9 @@ private def testDefaults : IO Unit := do
   let ddl := (Entity.spec Draft).ddl
   check (((ddl.splitOn "DEFAULT 'backlog'").length == 2) && ((ddl.splitOn "DEFAULT 10").length == 2))
     s!"DDL carries DEFAULT clauses, got {ddl}"
+  check (ddl ==
+      "CREATE TABLE IF NOT EXISTS \"draft\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"title\" TEXT NOT NULL, \"status\" TEXT NOT NULL DEFAULT 'backlog' CHECK (\"status\" IN ('backlog', 'inProgress', 'done')), \"score\" INTEGER NOT NULL DEFAULT 10, \"note\" INTEGER DEFAULT 5)")
+    s!"draft DDL golden (defaults reified through fieldSpec), got {ddl}"
   let d1 := (Lean.Json.parse "{\"title\":\"t\"}").toOption.bind
     fun j => (rowOfJson Draft j).toOption
   check (d1.map (fun d => d.status == .backlog && d.score == 10 && d.note == some 5) == some true)
@@ -146,6 +172,9 @@ private def testClosedEnum : IO Unit := do
   check ((cols.getD 1 default).enum == some #["backlog", "inProgress", "done"])
     "status column carries its closed world"
   check (((Entity.spec Todo).ddl.splitOn "CHECK").length == 2) "DDL contains CHECK"
+  check ((Entity.spec Todo).ddl ==
+      "CREATE TABLE IF NOT EXISTS \"todo\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"title\" TEXT NOT NULL, \"status\" TEXT NOT NULL CHECK (\"status\" IN ('backlog', 'inProgress', 'done')))")
+    s!"todo DDL golden, got {(Entity.spec Todo).ddl}"
 
 /-! ## Plan reflection (M4: pushdown as fetch narrowing) -/
 
@@ -231,6 +260,7 @@ private instance : ColCodec Span :=
 private structure Priced where
   price : Milli
   span : Span
+  deriving LeanDb.Entity
 
 private def newtypeEqPlan : PlanFor (fun (r : Stored Priced) => r.val.price.v == 500) := by
   leandb_plan
@@ -401,6 +431,120 @@ private def testPlans : IO Unit := do
   checkPlan (natParamPlan 5) .tt 1 "captured Nat inside a non-@[db] function stays residual"
   checkPlan (opaqueParamPlan .omnivore) .tt 1
     "enum parameter inside an opaque function stays residual"
+
+/-! ## Typed predicate IR (LEP-0002)
+
+Built by hand over the fixtures — the tactic does not emit `Pred` yet
+(stage 3). What is checked: the ill-typed plans are unrepresentable,
+`denote` agrees with the lambda, `approx`/`residuals` split the residual
+out, and `render` reproduces the `PushPred` renderer byte for byte. -/
+
+-- the right type, from the symbol alone
+#check (Pred.Col.here Author.Field.age : Pred.Col [Author] Nat _)
+-- wrong type is unrepresentable
+#check_failure (Pred.Col.here Author.Field.age : Pred.Col [Author] String _)
+-- wrong table is unrepresentable
+#check_failure (Pred.Col.here Book.Field.title : Pred.Col [Author] _ _)
+-- no `SqlOrd (Option Float)`: ordering a nullable column is unrepresentable
+#check_failure (Pred.ord (Pred.Col.here Book.Field.rating) .lt (some 3.0) : Pred [Book])
+-- a value of the wrong type for its column is unrepresentable
+#check_failure (Pred.eq (Pred.Col.here Todo.Field.status) .eq (3 : Nat) : Pred [Todo])
+-- `via`: the projection that IS the codec's encoding, proof by `rfl`…
+#check (Pred.Col.via (Pred.Col.here Priced.Field.price) (·.v) (fun _ => rfl) : Pred.Col [Priced] Nat _)
+-- …and the one that is not (`Span`'s codec mixes both fields): `rfl` does not close
+#check_failure (Pred.Col.via (Pred.Col.here Priced.Field.span) (·.lo) (fun _ => rfl) : Pred.Col [Priced] Nat _)
+-- `some` lifts a column to its `Option`, for col-vs-col through `some`
+#check (Pred.Col.via (Pred.Col.here Author.Field.age) some (fun _ => rfl) : Pred.Col [Author] (Option Nat) _)
+-- the theorem, elaborated
+example (p : Pred ts) (r : Rows ts) (h : p.denote r = true) : p.approx.denote r = true :=
+  Pred.approx_sound p r h
+
+private def ada : Stored Author := ⟨⟨1⟩, ⟨"Ada", 36⟩⟩
+private def alan : Stored Author := ⟨⟨2⟩, ⟨"Alan", 41⟩⟩
+private def computable : Stored Book := ⟨⟨7⟩, ⟨"On Computable Numbers", alan.ref, some 4.5⟩⟩
+private def notes : Stored Book := ⟨⟨8⟩, ⟨"Notes on the Analytical Engine", ada.ref, none⟩⟩
+private def unrated : Stored Book := ⟨⟨9⟩, ⟨"Unrated", alan.ref, none⟩⟩
+
+/-- `agePlan`, by hand. -/
+private def ageP : Pred [Author] := .ord (.here Author.Field.age) .ge 40
+/-- `joinPlan`, by hand: `r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating == none`. -/
+private def joinP : Pred [Book, Author] :=
+  .and (.and (.eq2 (.here Book.Field.author) .eq (.there .id))
+             (.ord (.there (.here Author.Field.age)) .ge 40))
+       (.eq (.here Book.Field.rating) .eq none)
+/-- `itePlan`, by hand: `if age < 30 then name == "x" else age > 50`. -/
+private def iteP : Pred [Author] :=
+  .or (.and (.ord (.here Author.Field.age) .lt 30) (.eq (.here Author.Field.name) .eq "x"))
+      (.and (.ord (.here Author.Field.age) .ge 30) (.ord (.here Author.Field.age) .gt 50))
+private def oddP : Pred [Author] := .opaque fun a => a.val.age % 2 == 0
+
+private def testTypedPred : IO Unit := do
+  -- denote agrees with the lambda
+  let ageL := fun (a : Stored Author) => a.val.age ≥ 40
+  for a in [ada, alan] do
+    check (ageP.denote a == ageL a) s!"ord denotes like the lambda on {a.val.name}"
+  let joinL := fun (r : Stored Book × Stored Author) =>
+    r.1.val.author == r.2.ref && r.2.val.age ≥ 40 && r.1.val.rating == none
+  for b in [computable, notes, unrated] do
+    for a in [ada, alan] do
+      check (joinP.denote (b, a) == joinL (b, a))
+        s!"join denotes like the lambda on ({b.val.title}, {a.val.name})"
+  check ((joinP.denote (unrated, alan), joinP.denote (computable, alan)) == (true, false))
+    "join denotation is not vacuous"
+  let nullP : Pred [Book] := .isNull (.here Book.Field.rating)
+  check (nullP.denote notes == true && nullP.denote computable == false) "isNull denotes NULL"
+  check (nullP.neg.denote notes == false && nullP.neg.denote computable == true) "neg of isNull"
+  check (oddP.denote ada == true && oddP.denote alan == false) "opaque denotes its function"
+  check (ageP.neg.denote ada == true && ageP.neg.denote alan == false) "neg of ord is exact"
+  -- approx drops opaques; residuals counts them
+  let mixed : Pred [Author] := .and ageP oddP
+  check (mixed.residuals == 1 && mixed.hasOpaque) "one residual conjunct"
+  check (mixed.approx.residuals == 0 && !mixed.approx.hasOpaque) "approx has no residual"
+  check ((mixed.approx.render true) == (ageP.render true)) "approx of (pushed ∧ opaque) is the pushed side"
+  check (((Pred.or ageP oddP).approx.render true).1 == "1") "or with an opaque side widens to true"
+  for a in [ada, alan] do
+    check (!(mixed.denote a) || mixed.approx.denote a) s!"approx_sound, observed on {a.val.name}"
+  -- render reproduces the PushPred renderer byte for byte (three goldens)
+  check (ageP.render true == (PushPred.cmp 0 "age" .ge (.int 40)).render true)
+    s!"age render, got {repr (ageP.render true)}"
+  check (joinP.render true ==
+      (PushPred.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
+        (.cmp 0 "rating" .eq .null)).render true)
+    s!"join render, got {repr (joinP.render true)}"
+  check (iteP.render true ==
+      (PushPred.or (.and (.cmp 0 "age" .lt (.int 30)) (.cmp 0 "name" .eq (.text "x")))
+        (.and (.cmp 0 "age" .ge (.int 30)) (.cmp 0 "age" .gt (.int 50)))).render true)
+    s!"ite render, got {repr (iteP.render true)}"
+  check (joinP.render false == (PushPred.and (.and (.cmp2 0 "author" .eq 1 "id") (.cmp 1 "age" .ge (.int 40)))
+        (.cmp 0 "rating" .eq .null)).render false)
+    "alias-free render matches too"
+  check ((ageP.render true).1 == "t0.\"age\" >= ?" && (ageP.render false).1 == "\"age\" >= ?")
+    "render text, pinned"
+  check (mixed.describe == "pushed: t0.\"age\" >= ?, residual conjuncts: 1" &&
+      mixed.describe == (SelectPlan.describe ⟨.cmp 0 "age" .ge (.int 40), 1⟩))
+    s!"describe format matches SelectPlan.describe, got {mixed.describe}"
+  -- plan surface
+  check (joinP.hasJoin && !ageP.hasJoin) "hasJoin"
+  check (joinP.tables == [0, 1] && ageP.tables == [0]) "tables"
+  check (joinP.conjuncts.length == 3) "conjuncts"
+  check ((joinP.forTable 1).render false == (PushPred.cmp 1 "age" .ge (.int 40)).render false)
+    "forTable keeps only the conjuncts touching that table"
+  check ((joinP.forTable 0).render false == (PushPred.cmp 0 "rating" .eq .null).render false)
+    "forTable 0 keeps the rating test"
+  -- value/value folds at plan build
+  check ((Pred.vvOrd (ts := [Author]) (0 : Nat) .ge 1).render true == ("0", #[]))
+    "vvOrd folds 0 ≥ 1 to ff"
+  check ((Pred.vvEq (ts := [Author]) Status.done .eq Status.done).render true == ("1", #[]))
+    "vvEq folds on the encoded name"
+  check ((Pred.vvEq (ts := [Author]) (none : Option Nat) .eq none).render true == ("1", #[]))
+    "vvEq is null-safe (none IS none)"
+  -- through a newtype projection: same column, compared on the representation
+  let priceP : Pred [Priced] := .ord (.via (.here Priced.Field.price) (·.v) (fun _ => rfl)) .le 500
+  check (priceP.render true == (PushPred.cmp 0 "price" .le (.int 500)).render true)
+    s!"via renders the underlying column, got {repr (priceP.render true)}"
+  let cheap : Stored Priced := ⟨⟨1⟩, ⟨⟨400⟩, ⟨1, 2⟩⟩⟩
+  let dear : Stored Priced := ⟨⟨2⟩, ⟨⟨900⟩, ⟨1, 2⟩⟩⟩
+  check (priceP.denote cheap == true && priceP.denote dear == false) "via denotes through the projection"
 
 /-! ## JSON, derived from the schema (M5) -/
 
@@ -817,6 +961,7 @@ def main : IO UInt32 := do
   testDerivedSpec
   testSortBy
   testPlans
+  testTypedPred
   testClosedEnum
   testDefaults
   testJson
