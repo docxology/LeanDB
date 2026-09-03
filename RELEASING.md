@@ -13,7 +13,8 @@ Before tagging a release:
 The release check builds the engine and importer, runs the engine suite,
 builds and runs every example suite (including `legacy`'s frozen V0→V1
 migration drill), builds and runs `examples/dashboard` (importing two
-bases in-process and over the stdio wire), scaffolds a base with
+bases and querying in-process, over stdio, and over the standalone
+`leandb-http`/`leanhttp` path dependencies), scaffolds a base with
 `leandb new` against the checkout and runs its tests (twice, to check
 the overwrite refusal), smokes `serve --http` (typed routes, `/rpc`,
 the bearer-token gate, a stale `X-LeanDb-Fingerprint`), `serve --mcp`
@@ -27,3 +28,9 @@ the engine's `Base`/`Cli`/`Client` surface and the wire (JSON-lines argv,
 row JSON, error codes, `X-LeanDb-Fingerprint`). Bump the version in
 `lakefile.toml`, in `LeanDb/Mcp.lean`'s `serverInfo`, and in the README's
 `--rev` example together.
+
+`leanhttp` and `leandb-http` are independent sibling repositories, not
+LeanDB subdirectories. Before a LeanDB release, test the adapter against
+the intended LeanDB tag, then replace local path requirements with the
+published revisions (or clone the three repositories side by side for a
+local release check).

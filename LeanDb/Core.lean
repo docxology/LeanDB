@@ -61,6 +61,8 @@ inductive DbError where
   | unknownLineage (instanceFp : String) (known : List String)
   /-- Raw SQLite error that no typed constructor claims. -/
   | sqlite (message : String)
+  /-- A remote client transport failed before a typed server response arrived. -/
+  | transport (message : String)
   deriving Repr
 
 def DbError.code : DbError → String
@@ -76,6 +78,7 @@ def DbError.code : DbError → String
   | .migrate .. => "migrate"
   | .unknownLineage .. => "unknown_lineage"
   | .sqlite .. => "sqlite"
+  | .transport .. => "transport"
 
 def DbError.message : DbError → String
   | .decode table field msg => s!"{table}.{field}: {msg}"
@@ -94,6 +97,7 @@ def DbError.message : DbError → String
       s!"the instance is at schema {fp}, which is not in this base's migration chain {known}: \
 it was not created by this base's history (restore a known version, or migrate by hand)"
   | .sqlite msg => msg
+  | .transport msg => msg
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
 

@@ -31,7 +31,7 @@ for base in tickets crm shop gpus gpumarket pricewatch eats kernels; do
   )
 done
 
-# dashboard: a non-base project importing tickets and eats, in-process and over the wire
+# dashboard: the same typed query in-process, over stdio, and over leanhttp
 (
   cd examples/dashboard
   lake build

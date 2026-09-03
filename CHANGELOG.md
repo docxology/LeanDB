@@ -11,6 +11,12 @@ Bases are importable by other Lean projects, in-process or over the
 wire, scaffolded standalone by `leandb new`, and deployable from a
 Dockerfile. Engine changes in order of landing:
 
+`LeanDb.Client` is transport-neutral: the existing spawned stdio client
+is one implementation, and the standalone sibling `leandb-http` package
+adds HTTP through the standalone libcurl-FFI `leanhttp` package. The
+dashboard runs the same typed `client%` query locally, over stdio, and
+over authenticated HTTP, including fingerprint refusal.
+
 Pushdown: comparisons through a validated newtype's projection push when
 the projection is the column's encoding (checked by definitional
 equality); case splits on captured closed-enum parameters; value/value

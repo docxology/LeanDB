@@ -10,6 +10,10 @@ name = "leandb"
 path = "../.."
 
 [[require]]
+name = "leandb_http"
+path = "../../../leandb-http"
+
+[[require]]
 name = "tickets"
 path = "../tickets"
 

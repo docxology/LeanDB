@@ -240,14 +240,14 @@ Aggregates as a verb; pushed `SortBy`/`LIMIT`; cross-instance queries
 refused — NaN); `Query : Type → Type` universe and LEP-0001 row symbols
 (R5, above); plan re-execution replay (S4 gives `migrate status` a
 footprint-based impact report instead — a schema change is checked
-against what a query *reads*, not by re-running its plan); an HTTP
-client transport for `LeanDb.Client` (`Std` has no HTTP client; planned
-separately as [`leancurl`](proposals/leancurl-http-client-plan.md), a
-libcurl binding, plus a small `leandb-curl` adapter — its own project);
-TLS termination for `serve --http`/`leandb host` (a reverse proxy's
+against what a query *reads*, not by re-running its plan); TLS
+termination for `serve --http`/`leandb host` (a reverse proxy's
 job); sharing one leansqlite build across examples via `packagesDir`
 (S8); `--output-lean`; `--infer-enums` on import; column-arithmetic
 pushdown.
 
 Landed since the previous version of this list: MCP/HTTP serve (S5, S6);
-migration source synthesis (S3, `migrate freeze`).
+migration source synthesis (S3, `migrate freeze`); the transport-neutral
+`LeanDb.Client` seam and standalone sibling
+[`leanhttp`](proposals/leanhttp-http-client-plan.md) / `leandb-http`
+libcurl client packages.

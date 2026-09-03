@@ -6,8 +6,10 @@ namespace LeanDb
 
 A project that imports a base package has its types and its query defs;
 against a *local* instance it runs them in-process (`Base.withInstance`).
-Against a *served* base it needs the wire: `Client` speaks the JSON-lines
-protocol to a base process (`<base> serve`), and `client% f` turns a query
+Against a *served* base it needs the wire: `Client` is a small transport
+record. Its built-in constructor speaks JSON-lines to a base process
+(`<base> serve`), and optional packages can supply HTTP or another transport.
+`client% f` turns a query
 def's signature into a stub — arguments rendered through `CliRender`,
 the result decoded through `QueryIn` — so the call site is typed exactly
 as the local one. The handshake compares fingerprints: a client compiled
@@ -75,33 +77,46 @@ def DbError.ofJson (j : Json) : DbError :=
   | some "enum_drift" => .enumDrift "remote" "" msg
   | some "migrate" => .migrate msg
   | some "unknown_lineage" => .unknownLineage msg []
+  | some "transport" => .transport msg
   | _ => .sqlite msg
 
-/-- A connection to a served base: the process, and the fingerprint the
-    client was compiled against. -/
+/-- A connection to a served base. Transports implement one JSON argv request
+    and cleanup; typed stubs and result decoding are transport-independent. -/
 structure Client where
-  child : IO.Process.Child { stdin := .piped, stdout := .piped, stderr := .inherit }
+  rpc : List String → IO (Except DbError Json)
   fingerprint : String
+  close : IO Unit
 
 abbrev ClientM := ReaderT Client (ExceptT DbError IO)
 
 def ClientM.run (c : Client) (act : ClientM α) : IO (Except DbError α) := (act c).run
 
-/-- One request over JSON lines. -/
-def Client.rpc (c : Client) (argv : List String) : IO Json := do
-  let line := (Json.arr (argv.map Json.str).toArray).compress
-  c.child.stdin.putStrLn line
-  c.child.stdin.flush
-  let out ← c.child.stdout.getLine
-  if out.isEmpty then throw <| IO.userError "the served base closed the connection"
-  match Json.parse out.trimAscii.toString with
-  | .ok j => return j
-  | .error m => throw <| IO.userError s!"unparseable response from the served base: {m}"
+private def processRpc
+    (child : IO.Process.Child { stdin := .piped, stdout := .piped, stderr := .inherit })
+    (argv : List String) : IO (Except DbError Json) := do
+  try
+    let line := (Json.arr (argv.map Json.str).toArray).compress
+    child.stdin.putStrLn line
+    child.stdin.flush
+    let out ← child.stdout.getLine
+    if out.isEmpty then
+      return .error (.transport "the served base closed the connection")
+    match Json.parse out.trimAscii.toString with
+    | .ok j => return .ok j
+    | .error m => return .error (.transport s!"unparseable response from the served base: {m}")
+  catch e =>
+    return .error (.transport (toString e))
 
-/-- End the served session: the client owns the process it spawned. -/
-def Client.close (c : Client) : IO Unit := do
-  try c.child.kill catch _ => pure ()
-  discard <| c.child.wait
+/-- Wrap an already-spawned `<base> serve` process. Most callers should use
+    `Client.connect`; the host uses this before learning the child's fingerprint. -/
+def Client.ofProcess
+    (child : IO.Process.Child { stdin := .piped, stdout := .piped, stderr := .inherit })
+    (fingerprint : String := "") : Client := {
+  rpc := processRpc child
+  fingerprint
+  close := do
+    try child.kill catch _ => pure ()
+    try discard <| child.wait catch _ => pure () }
 
 /-- Spawn `<exe> serve` (plus `args`, e.g. `--db path`) and shake hands:
     the served schema must be the one this client was compiled against. -/
@@ -113,29 +128,33 @@ def Client.connect (exe : System.FilePath) (fingerprint : String) (args : List S
     stdin := .piped
     stdout := .piped
     stderr := .inherit }
-  let child ← IO.Process.spawn cfg
-  let c : Client := { child, fingerprint }
-  let v ← c.rpc ["version"]
-  match (v.getObjValAs? String "code_fingerprint").toOption with
-  | some fp =>
-      if fp != fingerprint then
-        c.close
-        return .error (.schemaMismatch fingerprint fp)
-      return .ok c
-  | none =>
-      c.close
-      return .error (.sqlite s!"the served base did not answer version: {v.compress}")
+  try
+    let child ← IO.Process.spawn cfg
+    let c := Client.ofProcess child fingerprint
+    match ← c.rpc ["version"] with
+    | .error e => c.close; return .error e
+    | .ok v =>
+        match (v.getObjValAs? String "code_fingerprint").toOption with
+        | some fp =>
+            if fp != fingerprint then
+              c.close
+              return .error (.schemaMismatch fingerprint fp)
+            return .ok c
+        | none =>
+            c.close
+            return .error (.transport s!"the served base did not answer version: {v.compress}")
+  catch e =>
+    return .error (.transport (toString e))
 
 /-- Call a registered query by name; the result is the query's JSON. -/
 def Client.call (name : String) (args : List String) : ClientM Json := fun c => ExceptT.mk do
-  try
-    let j ← c.rpc (["query", name] ++ args)
-    if (j.getObjValAs? Bool "ok").toOption == some true then
-      return .ok ((j.getObjVal? "result").toOption.getD Json.null)
-    else
-      return .error (DbError.ofJson j)
-  catch e =>
-    return .error (.sqlite (toString e))
+  match ← c.rpc (["query", name] ++ args) with
+  | .error e => return .error e
+  | .ok j =>
+      if (j.getObjValAs? Bool "ok").toOption == some true then
+        return .ok ((j.getObjVal? "result").toOption.getD Json.null)
+      else
+        return .error (DbError.ofJson j)
 
 /-- Decode a typed result. -/
 def ClientM.decode (α : Type) [QueryIn α] (j : Json) : ClientM α := fun _ => ExceptT.mk <|
@@ -143,12 +162,11 @@ def ClientM.decode (α : Type) [QueryIn α] (j : Json) : ClientM α := fun _ => 
 
 /-- Any argv through the client (rows, insert, migrate status, …). -/
 def Client.argv (argv : List String) : ClientM Json := fun c => ExceptT.mk do
-  try
-    let j ← c.rpc argv
-    if (j.getObjValAs? Bool "ok").toOption == some true then return .ok j
-    else return .error (DbError.ofJson j)
-  catch e =>
-    return .error (.sqlite (toString e))
+  match ← c.rpc argv with
+  | .error e => return .error e
+  | .ok j =>
+      if (j.getObjValAs? Bool "ok").toOption == some true then return .ok j
+      else return .error (DbError.ofJson j)
 
 end LeanDb
 

@@ -37,17 +37,22 @@ def spawn (spec : String) : IO (Except String Child) := do
             stderr := .inherit }
           try
             let child ← IO.Process.spawn cfg
-            let client : Client := { child, fingerprint := "" }
-            let v ← client.rpc ["version"]
-            let fp := (v.getObjValAs? String "code_fingerprint").toOption.getD ""
-            return .ok { name, client := { client with fingerprint := fp }, lock := ← Std.Mutex.new (), fingerprint := fp }
+            let client := Client.ofProcess child
+            match ← client.rpc ["version"] with
+            | .error e => client.close; return .error s!"{name}: could not query {exe}: {e}"
+            | .ok v =>
+                let fp := (v.getObjValAs? String "code_fingerprint").toOption.getD ""
+                return .ok { name, client := { client with fingerprint := fp }, lock := ← Std.Mutex.new (), fingerprint := fp }
           catch e =>
             return .error s!"{name}: could not start {exe}: {e}"
       | [] => return .error s!"expected name=exe[,args], got {spec}"
   | [] => return .error s!"expected name=exe[,args], got {spec}"
 
 def Child.call (c : Child) (argv : List String) : IO Json :=
-  c.lock.atomically fun _ => c.client.rpc argv
+  c.lock.atomically fun _ => do
+    match ← c.client.rpc argv with
+    | .ok json => return json
+    | .error e => return e.toJson
 
 /-- `leandb host --port P [--bind H] name=exe[,args]…` -/
 def run (args : List String) : IO UInt32 := do

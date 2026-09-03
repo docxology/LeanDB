@@ -1,9 +1,10 @@
-# leancurl — an HTTP client for Lean 4 over libcurl (plan)
+# leanhttp — an HTTP client for Lean 4 over libcurl
 
-**Status:** plan only, 2026-09-02, revised after reading leansqlite's
-binding in full. A separate project (its own repository and Lake
-package), consumed by LeanDB through a second small package. Nothing in
-this document is built.
+**Status:** M0–M3 implemented 2026-09-02 as two sibling repositories:
+`leanhttp` and `leandb-http`. The LeanDB transport seam and dashboard
+integration are implemented in this repository. The macOS suites and
+the complete LeanDB release check pass. Linux CI, public TLS CI, tags,
+and published dependency revisions remain M4 release work.
 
 ## Why
 
@@ -16,15 +17,15 @@ headers plus `libcurl.4.dylib`; 8.7.1 on this machine) and on practically
 every Linux, with TLS, redirects, proxies, HTTP/2 and timeouts already
 right.
 
-Exit path: if `Std.Http` grows a client, `leandb-curl` (below) becomes a
-one-file adapter over it and leancurl retires. The typed surface is
+Exit path: if `Std.Http` grows a client, `leandb-http` (below) becomes a
+one-file adapter over it and leanhttp retires. The typed surface is
 built on `Std.Http`'s data types from day one so that day costs nothing.
 
 ## The pattern, taken from leansqlite
 
 leansqlite (`leanprover/leansqlite`, Lean FRO, Apache 2.0) is the
 reference for how a C library is bound in this ecosystem. What it does,
-and what leancurl copies:
+and what leanhttp copies:
 
 1. **Three layers, decreasing privacy.** `SQLite/FFI.lean` holds only
    `@[extern]` `opaque` declarations, most of them `private`; `LowLevel.lean`
@@ -64,7 +65,7 @@ and what leancurl copies:
    test-only dependencies. The toolchain is pinned and moved in lockstep.
 
 Two leansqlite gaps LeanDB had to work around are avoided by design
-here: leancurl exposes an explicit `close`, and it enables the
+here: leanhttp exposes an explicit `close`, and it enables the
 library's extended diagnostics (`CURLOPT_ERRORBUFFER`) from the start.
 
 ## Decision record
@@ -155,10 +156,11 @@ make us revisit it. Later sections reference these by number.
   inductive `Opt : Type → Type` makes a wrong pairing untypeable. (a)
   is the stringly/numberly API this plan exists to avoid; (b) is a C
   function per option with the same drift risk and no extra safety.
-- **Cost.** The option codes are transcribed once into Lean; a
-  `_Static_assert` table in `bindings/curl_options.h` checks each
-  against the real header at build time, and the Lean table is generated
-  from that header by a script rather than typed twice.
+- **Cost.** The option codes are transcribed into Lean and mirrored by a
+  `_Static_assert` table in `bindings/curl_options.h` that checks each
+  against the real header at build time. Generating both tables from one
+  source is useful M4 hardening; the initial implementation keeps the
+  small duplication visible and covered by compilation and tests.
 - **Revisit when.** never for the shape; the table grows as options are
   added.
 
@@ -173,7 +175,7 @@ make us revisit it. Later sections reference these by number.
   vocabulary), and they are what a future `Std` client would use — the
   exit path costs nothing. (a) duplicates them; (b) is the thing to
   avoid.
-- **Cost.** These types are new in 4.33 and may churn; leancurl pins
+- **Cost.** These types are new in 4.33 and may churn; leanhttp pins
   the toolchain with LeanDB and tracks it.
 - **Revisit when.** `Std.Http` types move in a way that breaks the
   server/client symmetry (unlikely: they are shared by construction).
@@ -198,7 +200,7 @@ make us revisit it. Later sections reference these by number.
 ### D9. `Request.uri` is a parsed `URI`; string conveniences return `Except`
 
 - **Alternatives.** (a) `url : String` handed to libcurl; (b) `URI`
-  parsed at construction, with `Curl.get "…"` returning
+  parsed at construction, with `LeanHttp.get "…"` returning
   `Except Error Response` after parsing.
 - **Why (b).** A malformed URL is refused before a socket opens, with
   `Kind.urlMalformed`, instead of surfacing mid-request from libcurl
@@ -257,9 +259,9 @@ make us revisit it. Later sections reference these by number.
   init failure.
 - **Cost.** A documented reserved range; the table notes it.
 
-### D14. A separate `leandb-curl` package; a small transport seam in the engine
+### D14. A separate `leandb-http` package; a small transport seam in the engine
 
-- **Alternatives.** (a) `leandb` requires `leancurl` and gains the
+- **Alternatives.** (a) `leandb` requires `leanhttp` and gains the
   transport; (b) the transport lives in a third package requiring
   both, and the engine only gains a transport record and a
   `DbError.transport` constructor.
@@ -268,10 +270,10 @@ make us revisit it. Later sections reference these by number.
   engine is small and honest: `Client` was already "something that
   answers argv with JSON", and naming the transport failure as its own
   `DbError` is one line.
-- **Cost.** Three repositories to version together (leancurl,
-  leandb-curl, leandb); RELEASING's lockstep note grows by two lines.
-- **Revisit when.** `Std.Http` grows a client: `leandb-curl` becomes an
-  adapter over it and leancurl retires (the exit path).
+- **Cost.** Three repositories to version together (leanhttp,
+  leandb-http, leandb); RELEASING's lockstep note grows by two lines.
+- **Revisit when.** `Std.Http` grows a client: `leandb-http` becomes an
+  adapter over it and leanhttp retires (the exit path).
 
 ### D15. Tests against Lean's own `Std.Http.Server`, in-process
 
@@ -297,61 +299,64 @@ make us revisit it. Later sections reference these by number.
 ## The package
 
 ```
-leancurl/                       (separate repository)
-  lakefile.lean                 extern_lib leancurl (bindings/leancurl.c); lean_lib Curl, precompileModules
+leanhttp/                       (separate repository)
+  lakefile.lean                 extern_lib leanhttp (bindings/leanhttp.c); lean_lib LeanHttp, precompileModules
   lean-toolchain                pinned to LeanDB's (v4.33.0), moved in lockstep
-  bindings/leancurl.c           dlopen loader, handle class, three setters, perform, callbacks
-  bindings/curl_options.h       the CURLOPT_* codes leancurl uses, as a static_assert table
-  Curl.lean                     re-exports
-  Curl/FFI.lean                 private externs (handle-level)
-  Curl/Option.lean              the typed option family (internal)
-  Curl/Types.lean               Method/URI/Headers/Status from Std.Http; Body, Redirects, Tls, Auth, Proxy, Timeouts
-  Curl/Error.lean               CURLcode newtype, Error.Kind, Error
-  Curl/Session.lean             Session: a handle plus defaults; request/perform
-  Curl/Codec.lean               ToBody / FromBody typeclasses; JSON instances
-  Curl/Headers.lean             header-block parsing into Std.Http.Headers
+  bindings/leanhttp.c           dlopen loader, handle class, three setters, perform, callbacks
+  bindings/curl_options.h       the CURLOPT_* codes leanhttp uses, as a static_assert table
+  LeanHttp.lean                 re-exports
+  LeanHttp/FFI.lean             private externs (handle-level)
+  LeanHttp/Option.lean          the typed option family (internal)
+  LeanHttp/Types.lean           Method/URI/Headers/Status from Std.Http; Body, Redirects, Tls, Auth, Timeouts
+  LeanHttp/Error.lean           CURLcode newtype, Error.Kind, Error
+  LeanHttp/Session.lean         Session: a handle plus defaults; request/perform
+  LeanHttp/Codec.lean           ToBody / FromBody typeclasses; JSON instances
+  LeanHttp/Headers.lean         header-block parsing into Std.Http.Headers
   tests/                        its own Lake project (as leansqlite does)
 ```
 
-### Layer 1 — `Curl/FFI.lean` (private)
+### Layer 1 — `LeanHttp/FFI.lean` (private)
 
 ```lean
 module
-namespace Curl.FFI
+namespace LeanHttp.FFI
 
-@[extern "leancurl_initialize"] private opaque init : IO Unit
+@[extern "leanhttp_initialize"] private opaque init : IO Unit
 builtin_initialize init                    -- registers the handle class, curl_global_init, dlopen
 
 opaque T : NonemptyType.{0}
 def Handle : Type := T.type deriving Nonempty      -- CURL *; finalizer = curl_easy_cleanup
 
-@[extern "leancurl_available"]     opaque available : IO Bool
-@[extern "leancurl_version"]       opaque version : IO String          -- curl_version()
-@[extern "leancurl_easy_init"]     private opaque easyInit : IO Handle
-@[extern "leancurl_easy_reset"]    private opaque reset : @&Handle → IO Unit
-@[extern "leancurl_setopt_long"]   private opaque setLong  : @&Handle → UInt32 → Int64 → IO Unit
-@[extern "leancurl_setopt_string"] private opaque setString : @&Handle → UInt32 → String → IO Unit
-@[extern "leancurl_setopt_bytes"]  private opaque setBytes : @&Handle → UInt32 → @&ByteArray → IO Unit
-@[extern "leancurl_set_headers"]   private opaque setHeaders : @&Handle → @&Array String → IO Unit
-/-- Perform; (status, raw header block, body). A CURLcode ≠ 0 is `IO.Error.otherError code detail`. -/
-@[extern "leancurl_perform"]       private opaque perform : @&Handle → IO (UInt32 × ByteArray × ByteArray)
-@[extern "leancurl_close"]         private opaque close : @&Handle → IO Unit   -- cleanup now, finalizer becomes a no-op
-@[extern "leancurl_escape"]        opaque escape : String → IO String         -- curl_easy_escape, for query encoding
-end Curl.FFI
+@[extern "leanhttp_available"]     opaque available : IO Bool
+@[extern "leanhttp_version"]       opaque version : IO String          -- curl_version()
+@[extern "leanhttp_easy_init"]     private opaque easyInit : IO Handle
+@[extern "leanhttp_easy_reset"]    private opaque reset : @&Handle → IO Unit
+@[extern "leanhttp_setopt_long"]   private opaque setLong  : @&Handle → UInt32 → Int64 → IO Unit
+@[extern "leanhttp_setopt_string"] private opaque setString : @&Handle → UInt32 → String → IO Unit
+@[extern "leanhttp_setopt_bytes"]  private opaque setBytes : @&Handle → UInt32 → @&ByteArray → IO Unit
+@[extern "leanhttp_set_headers"]   private opaque setHeaders : @&Handle → @&Array String → IO Unit
+/-- Perform. A CURLcode ≠ 0 is `IO.Error.otherError code detail`. -/
+@[extern "leanhttp_perform"]       private opaque perform : @&Handle → IO UInt32
+@[extern "leanhttp_response_headers"] private opaque responseHeaders : @&Handle → IO ByteArray
+@[extern "leanhttp_response_body"] private opaque responseBody : @&Handle → IO ByteArray
+@[extern "leanhttp_effective_url"] private opaque effectiveUrl : @&Handle → IO String
+@[extern "leanhttp_close"]         private opaque close : @&Handle → IO Unit   -- cleanup now, finalizer becomes a no-op
+@[extern "leanhttp_escape"]        opaque escape : String → IO String         -- curl_easy_escape, for query encoding
+end LeanHttp.FFI
 ```
 
 Exactly three setters cross the boundary (D6). Every option the library
 ever sets is one of `long`, `char *`, or `(ptr, size)`; the *choice* of
 code and the *typing* of the value live in Lean.
 
-### Layer 2 — `Curl/Option.lean` (internal): the option family
+### Layer 2 — `LeanHttp/Option.lean` (internal): the option family
 
 An indexed inductive (D6): each constructor names one `CURLOPT_*` and
 fixes the Lean type of its value. Setting an option is total and cannot
 pair a code with the wrong kind of value.
 
 ```lean
-namespace Curl
+namespace LeanHttp
 
 /-- One libcurl option, indexed by the type of value it takes. -/
 inductive Opt : Type → Type where
@@ -387,16 +392,16 @@ private def Opt.set (h : FFI.Handle) : Opt α → α → IO Unit
   | .timeout, ms => FFI.setLong h Opt.timeout.code ms.val …
   | .postFields, b => do FFI.setBytes h Opt.postFields.code b; FFI.setLong h POSTFIELDSIZE_LARGE b.size
   | …
-end Curl
+end LeanHttp
 ```
 
 `bindings/curl_options.h` lists the same codes with
-`_Static_assert(LEANCURL_OPT_URL == CURLOPT_URL, …)` against the real
+`_Static_assert(LEANHTTP_OPT_URL == CURLOPT_URL, …)` against the real
 header at build time, so a libcurl header change cannot silently
-renumber an option; the Lean table is regenerated from that header by a
-script, not typed twice by hand.
+renumber an option. The initial Lean table is deliberately adjacent and
+small; a generator is M4 hardening.
 
-### Layer 3 — `Curl/Types.lean`: the public vocabulary
+### Layer 3 — `LeanHttp/Types.lean`: the public vocabulary
 
 Reused from `Std.Http` (D7: already validated types, and the server
 speaks them): `Std.Http.Method`, `Std.Http.URI` (parsed, `URI.parse?`),
@@ -406,7 +411,7 @@ existence), `Std.Http.Status` (with `Status.toCode`/`ofCode`). Own
 types where libcurl has a notion `Std.Http` does not:
 
 ```lean
-namespace Curl
+namespace LeanHttp
 
 /-- What is sent. The content type is part of the value, never a loose header. -/
 inductive Body where
@@ -454,18 +459,18 @@ structure Response where
   body    : ByteArray
   /-- The URL after redirects (CURLINFO_EFFECTIVE_URL). -/
   effectiveUri : Std.Http.URI
-end Curl
+end LeanHttp
 ```
 
 `Request.uri` is a `URI` (D9), so a malformed URL is refused at
 construction (`URI.parse?`), not by libcurl mid-request. Convenience
-constructors that take a `String` return `Except Curl.Error Request` and
+constructors that take a `String` return `Except LeanHttp.Error Request` and
 never panic. `Body`, `Redirects`, `Tls` and `Auth` are inductives by D8.
 
-### Layer 3 — `Curl/Error.lean`
+### Layer 3 — `LeanHttp/Error.lean`
 
 ```lean
-namespace Curl
+namespace LeanHttp
 /-- libcurl's own code, kept verbatim; the identity of a failure. -/
 structure CURLcode where
   toUInt32 : UInt32
@@ -492,7 +497,7 @@ structure Error where
   deriving Repr
 
 def Error.ofIO : IO.Error → Option Error       -- `otherError code detail` → Error, none for foreign errors
-end Curl
+end LeanHttp
 ```
 
 The C side raises `lean_mk_io_error_other_error(curlcode, detail)`;
@@ -500,10 +505,10 @@ The C side raises `lean_mk_io_error_other_error(curlcode, detail)`;
 by D13). `Session.request` returns `IO (Except Error Response)`, so
 callers never match on `IO.Error` text.
 
-### Layer 3 — `Curl/Session.lean` (D10, D2)
+### Layer 3 — `LeanHttp/Session.lean` (D10, D2)
 
 ```lean
-namespace Curl
+namespace LeanHttp
 /-- One libcurl easy handle plus defaults applied to every request made
     through it. Keep-alive is automatic across requests on one session.
     Not thread-safe; one session per task. -/
@@ -512,7 +517,7 @@ structure Session where
   baseUri  : Option Std.Http.URI := none         -- relative `Request.uri`s resolve against it
   headers  : Std.Http.Headers := .empty          -- sent with every request, request headers win
   tls      : Tls := .system
-  userAgent : String := "leancurl/0.1"
+  userAgent : String := "leanhttp/0.1"
   encoding : Encoding := .any
   httpVersion : HttpVersion := .default
   proxy    : Option Std.Http.URI := none
@@ -528,13 +533,13 @@ def get     (uri : Std.Http.URI) (headers := .empty) : IO (Except Error Response
 def post    (uri : Std.Http.URI) (body : Body) (headers := .empty) : IO (Except Error Response)
 def request (r : Request) : IO (Except Error Response)
 def requestTask (r : Request) : IO (Task (Except Error Response))          -- own session inside the task
-end Curl
+end LeanHttp
 ```
 
-### Layer 4 — `Curl/Codec.lean`: typed bodies both ways (D11)
+### Layer 4 — `LeanHttp/Codec.lean`: typed bodies both ways (D11)
 
 ```lean
-namespace Curl
+namespace LeanHttp
 /-- Values that become a request body with a content type. -/
 class ToBody (α : Type) where
   toBody : α → Body
@@ -561,7 +566,7 @@ inductive Outcome (α : Type) where
 def Session.exchange [ToBody β] [FromBody α] (s : Session) (method : Std.Http.Method)
     (uri : Std.Http.URI) (payload : β) (headers := .empty) : IO (Outcome α)
 def Session.getAs [FromBody α] (s : Session) (uri : Std.Http.URI) : IO (Outcome α)
-end Curl
+end LeanHttp
 ```
 
 This is the leansqlite `QueryParam`/`ResultColumn` idea applied to HTTP:
@@ -569,13 +574,13 @@ the boundary is typed in both directions, `Json` is one instance, and a
 deriving handler for `FromBody` over `Lean.FromJson` types is the
 `Row`-style convenience.
 
-### The C side (`bindings/leancurl.c`, ~350 lines; D1, D3, D12, D13)
+### The C side (`bindings/leanhttp.c`, ~350 lines; D1, D3, D12, D13)
 
 - **Loader:** `static void *lib; static struct { … } fn;` filled by
   `dlsym` under `pthread_once`; every extern checks and raises
   `libraryNotFound` (a reserved code above libcurl's range, `9000`, with
   the searched names in the detail) otherwise.
-- **Handle class:** registered in `leancurl_initialize`; the external
+- **Handle class:** registered in `leanhttp_initialize`; the external
   data is `struct { CURL *h; struct curl_slist *hdrs; uint8_t *post; size_t post_len; char err[CURL_ERROR_SIZE]; buf headers, body; int closed; }`
   so the header list, the request body, the error buffer and the
   accumulators die with the handle; `close` runs the cleanup early and
@@ -597,30 +602,23 @@ deriving handler for `FromBody` over `Lean.FromJson` types is the
 ## Testing (D15, D16)
 
 `tests/` is its own Lake project. The server is Lean's own
-`Std.Http.Server`, started in-process on port 0 with an echo handler that
-returns method, path, query, headers and body as JSON, plus routes for
-`/status/:n`, `/redirect/:n`, `/slow/:ms`, `/large/:bytes`. Cases:
-every `Std.Http.Method`; each `Body` constructor round-trips (form fields
-escaped, JSON content type set); binary bodies byte-for-byte; 8 MB body;
-`maxBody` exceeded is `Error.Kind.tooLarge`; duplicate headers preserved
-in order; 404/500 are `Response`s; connection refused is
-`couldntConnect`; `/slow` beyond `Timeouts.total` is `timeout`;
-`Redirects.never` returns the 302, `.upTo 1` on a 3-hop chain is
-`tooManyRedirects`; `LEANCURL_LIB=/nonexistent` makes `Session.new`
-return `libraryNotFound` with the searched names; 200 concurrent
-`requestTask`s; a `Session` reused for 1 000 sequential requests keeps
-one connection (server counts accepts). TLS: an opt-in job against a
-public HTTPS endpoint, plus `Tls.insecureNoVerify` against a self-signed
-local server when `Std.Http` grows TLS.
+`Std.Http.Server`, started in-process on port 0. The current suite covers
+binary bodies including NUL bytes, custom methods, JSON and form content
+types, form escaping, default/request header precedence, basic and bearer
+auth, generic `FromJson` decoding, duplicate response headers, HEAD, 404
+as response data, redirect follow/disable/limit behavior, total timeout,
+response size limits, connection refusal, concurrent `requestTask`s, and
+the forced-library loader failure. M4 adds Linux and public/self-signed
+TLS jobs; those are not claimed by the local suite.
 
-## LeanDB integration: `leandb-curl` (D14)
+## LeanDB integration: `leandb-http` (D14)
 
 A second small package, so the engine keeps no HTTP-client dependency
 and bases that never need it link nothing extra:
 
 ```
-leandb-curl/                    requires leandb (git, tag) and leancurl (git, tag)
-  LeanDbCurl.lean               the HTTP transport for LeanDb.Client
+leandb-http/                    requires leandb (git, tag) and leanhttp (git, tag)
+  LeanDbHttp.lean               the HTTP transport for LeanDb.Client
 ```
 
 - **Engine seam (in LeanDB, no libcurl there):** `LeanDb.Client` becomes
@@ -629,13 +627,13 @@ leandb-curl/                    requires leandb (git, tag) and leancurl (git, ta
   `client%`, `Client.call`, `Client.argv`, `CliRender`, `QueryIn` are
   unchanged. A `DbError.transport (message : String)` constructor names
   wire failures instead of borrowing `.sqlite`.
-- **`LeanDbCurl.connect (base : Std.Http.URI) (fingerprint : String) (session : Curl.Session.Config := {}) : IO (Except DbError Client)`**
+- **`LeanDb.HttpClient.connect (base : Std.Http.URI) (fingerprint : String) (config : LeanHttp.Session.Config := {}) : IO (Except DbError Client)`**
   performs `GET <base>/version` for the handshake and implements `rpc`
   as `POST <base>/rpc` with `Body.json (argv)` and the
   `X-LeanDb-Fingerprint` header (a `Header.Name` constant, not a string
   at call sites). Under `leandb host`, `base` is `http://host:port/bases/<name>`.
   Response JSON is mapped exactly as the stdio transport does;
-  `Curl.Error` becomes `DbError.transport` with its `Kind` in the text.
+  `LeanHttp.Error` becomes `DbError.transport` with its `Kind` in the text.
 - **`examples/dashboard`** gets a third leg: the same `slaBreached` stub
   over HTTP against `tickets serve --http`, asserted equal to the local
   and stdio results; the release check runs it with the server it already
@@ -645,11 +643,11 @@ leandb-curl/                    requires leandb (git, tag) and leancurl (git, ta
 
 | M | Deliverable | Done when |
 |---|---|---|
-| M0 | Spike: loader, handle class, one `long`/`string`/`bytes` setter each, `perform`, GET against an in-process `Std.Http.Server` | echoed body printed on macOS **and** Linux; D1 confirmed or reverted |
-| M1 | `Opt`, `Types`, `Error`, `Session`, header parsing, tests | test suite green on both platforms |
-| M2 | `Codec` (`ToBody`/`FromBody`/`exchange`), `Tls`, `Auth`, proxy, encodings, `requestTask` | opt-in TLS job passes; 200 concurrent requests pass |
-| M3 | `leandb-curl` + LeanDB transport seam + dashboard third leg | `client% Tickets.slaBreached` over HTTP equals local; release check green |
-| M4 | CI (macOS + Linux), README, `leancurl v0.1.0`, `leandb-curl v0.1.0` pinned to LeanDB `v0.3.0` | tags exist; LeanDB's README points at them |
+| M0 | Spike: loader, handle class, one `long`/`string`/`bytes` setter each, `perform`, GET against an in-process `Std.Http.Server` | implemented and verified on macOS; Linux moves to M4 |
+| M1 | `Opt`, `Types`, `Error`, `Session`, header parsing, tests | implemented; macOS suite green |
+| M2 | `Codec` (`ToBody`/`FromBody`/`exchange`), `Tls`, `Auth`, proxy, encodings, `requestTask` | implemented; local suite green, TLS CI pending |
+| M3 | `leandb-http` + LeanDB transport seam + dashboard third leg | complete; HTTP equals local and full release check is green |
+| M4 | CI (macOS + Linux), README, `leanhttp v0.1.0`, `leandb-http v0.1.0` pinned to LeanDB `v0.3.0` | pending publication and CI |
 
 ## Risks, by name
 
@@ -660,16 +658,16 @@ leandb-curl/                    requires leandb (git, tag) and leancurl (git, ta
 - **Variadic `curl_easy_setopt` through `dlsym`.** Undefined on arm64
   through a non-variadic pointer; the pointer type is declared variadic
   and M0 exercises a `long`, a `char *` and a function-pointer option.
-- **Option-code drift.** Mitigated by the `_Static_assert` table and the
-  generated Lean table (D6).
-- **TLS backends differ.** macOS system curl is SecureTransport (ignores
-  `CURLOPT_CAINFO`); Homebrew's is OpenSSL/LibreSSL. `Tls.bundle` is
-  honoured where the backend can and reported (`curl_version_info`) where
-  it cannot, as a typed `Error.Kind.ssl .caCert`, never silently.
+- **Option-code drift.** Mitigated by the `_Static_assert` table (D6);
+  generating the mirrored Lean table is M4 hardening.
+- **TLS backends differ.** macOS system curl and Linux distributions may
+  use different TLS backends. Backend-specific validation belongs in the
+  pending M4 TLS matrix; libcurl failures still surface through the typed
+  SSL categories.
 - **Two copies of large bodies** (C buffer → `ByteArray`). Fine for
   LeanDB's JSON; a streaming callback into a Lean closure is post-v1.
 - **`Std.Http` type churn.** `Headers`/`URI`/`Status` are new in 4.33;
-  leancurl pins the toolchain with LeanDB and tracks it.
+  leanhttp pins the toolchain with LeanDB and tracks it.
 - **Windows.** Out of scope for v1 (`LoadLibrary` loader, different
   toolchain); stated in the README.
 
