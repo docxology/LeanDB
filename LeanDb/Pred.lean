@@ -656,11 +656,14 @@ decreasing_by all_goals (simp [size, size_neg]; try omega)
 where
   col {ts : List Type} {τ : Type} {i : ColCodec τ} (aliasOf : Nat → String) (c : Col ts τ i) :
       String :=
-    s!"{aliasOf c.tableIdx}.\"{c.name}\""
+    /- `quoteIdent`, not a bare `\"…\"`: an escaped Lean field name
+       (`«a"b»`) is a legal column name, and its embedded quotes must stay
+       inside the quoted identifier, exactly as the DDL quotes them. -/
+    s!"{aliasOf c.tableIdx}.{quoteIdent c.name}"
   /-- The correlated subquery: `child`'s rows, as `s`, whose `fk` is the
       outer `parent`, narrowed by the rendered `body`. -/
   subquery (table s fk parent body : String) : String :=
-    s!"SELECT 1 FROM {quoteIdent table} AS {s} WHERE {s}.\"{fk}\" IS {parent} AND {body}"
+    s!"SELECT 1 FROM {quoteIdent table} AS {s} WHERE {s}.{quoteIdent fk} IS {parent} AND {body}"
 
 /-- The executors' aliases: table `n` is `tn`. -/
 def tAlias (n : Nat) : String := s!"t{n}"
