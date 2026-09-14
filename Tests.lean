@@ -2753,6 +2753,39 @@ where
     let st ← (← SQLite.open p).prepare "SELECT COUNT(*) FROM author"
     if ← st.step then return (← st.columnInt64 0).toNatClampNeg else return 0
 
+
+private def adoptDbPath : System.FilePath := ".lake" / "leandb_test_adopt.sqlite"
+
+/-- An adopted file keeps whatever declared types it was created with:
+    BIGINT, VARCHAR — affinity synonyms of INTEGER and TEXT. The snapshot
+    records the canonical spelling, so `matchesSnapshot` must normalize by
+    SQLite's affinity rules; a raw string comparison matches no version,
+    the file is stamped at the head, and the migrations in between
+    silently never run. -/
+private def testAdoptAffinity : IO Unit := do
+  if ← adoptDbPath.pathExists then IO.FS.removeFile adoptDbPath
+  let colX : ColumnSpec := { name := "x", sqlType := .integer, nullable := false, fkTable := none }
+  let colT : ColumnSpec := { name := "t", sqlType := .text, nullable := false, fkTable := none }
+  let v0 : List TableSpec := [⟨"t", #[colX, colT]⟩]
+  -- V1: one more column, nullable — a mechanical, non-destructive step
+  let colZ : ColumnSpec := { name := "z", sqlType := .text, nullable := true, fkTable := none }
+  let v1 : List TableSpec := [⟨"t", #[colX, colT, colZ]⟩]
+  let mig : Migration :=
+    { fromFingerprint := (fingerprint v0), toFingerprint := (fingerprint v1), snapshot := v1 }
+  let chain : Chain := { origin := v0, migrations := [mig] }
+  -- the imported file, with affinity-synonym declared types
+  let db ← SQLite.open adoptDbPath
+  db.exec "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, x BIGINT NOT NULL, t VARCHAR(20) NOT NULL)"
+  db.exec "INSERT INTO t (x, t) VALUES (1, 'a')"
+  let conn ← expectOk (← openDbRaw adoptDbPath) "open the adopted file raw"
+  let adopted ← chain.adopt conn
+  check (adopted == some 0) s!"the BIGINT/VARCHAR file is adopted at V0, got {repr adopted}"
+  -- the pending V0→V1 step is now visible and applies mechanically
+  let r ← expectOk (← migrateOn conn v1 { apply := true }) "apply the pending step"
+  check (r.2.map (·.fingerprint) == some (fingerprint v1)) "instance moved to V1"
+  let st ← (← SQLite.open adoptDbPath).prepare "SELECT z FROM t WHERE id = 1"
+  discard <| st.step
+  check ((← st.columnType 0) == .null) "the added column is NULL for the old row"
 /-! ## Footprints: what a query reads, statically; the log as data; impact -/
 
 /-- A query over both fixtures: a join, a null test, and a residual. -/
@@ -2836,6 +2869,7 @@ def main : IO UInt32 := do
   testBlobColumn
   testUniqueConstraint
   testImportNotCarried
+  testAdoptAffinity
   Lep3.run
   EnumSetA.run
   testOptionalParamPlans

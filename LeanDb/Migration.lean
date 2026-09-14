@@ -175,10 +175,22 @@ private def matchesSnapshot (conn : Conn) (specs : List TableSpec) : IO Bool := 
     let live ← liveColumns conn t.name
     if live.isEmpty then return false
     let want := t.columns.toList.map fun c => (c.name, declaredType c.sqlType, !c.nullable)
-    -- SQLite reports a legacy `INT` as INT, `INTEGER` as INTEGER; both are INTEGER affinity
+    -- SQLite reports the DECLARED type, which can be any of the affinity
+    -- synonyms: BIGINT, SMALLINT and TINYINT are INTEGER affinity;
+    -- VARCHAR, CHARACTER and CLOB are TEXT affinity. The snapshots record
+    -- the canonical spelling, so the match must normalize the same way
+    -- SQLite computes affinity (https://sqlite.org/datatype3.html §3.1) —
+    -- otherwise a file whose columns are declared BIGINT or VARCHAR
+    -- matches no version, `adopt` returns none, and `verify` stamps it at
+    -- the head, silently skipping the migrations in between.
     let norm := fun (x : String × String × Bool) =>
       let (n, ty, nn) := x
-      (n, (if ty.startsWith "INT" then "INTEGER" else if ty == "REAL" || ty == "DOUBLE" || ty == "FLOAT" then "REAL" else ty), nn)
+      let aff := if ty.contains "INT" then "INTEGER"
+        else if ty.contains "CHAR" || ty.contains "CLOB" || ty.contains "TEXT" then "TEXT"
+        else if ty.isEmpty || ty.contains "BLOB" then "BLOB"
+        else if ty.contains "REAL" || ty.contains "FLOA" || ty.contains "DOUB" then "REAL"
+        else "NUMERIC"
+      (n, aff, nn)
     if live.map norm != want then return false
   return true
 
