@@ -386,6 +386,13 @@ private def mapColumn (eligibleNames : Array (String × String))
   -- FK lookup: only single-column FK groups are Ref candidates.
   let fk? := t.fks.find? (·.fromCol == c.name)
   let isComposite := fk?.elim false fun fk => (t.fks.filter (·.groupId == fk.groupId)).size > 1
+  -- a name the generated symbol inductive cannot declare (`rec` collides
+  -- with its recursor, the modifier keywords cannot start a constructor):
+  -- importing it would produce a package that fails to compile with an
+  -- unattributed kernel or parser error
+  if LeanDb.Derive.unusableSymNames.contains c.name then
+    .error (c.name, s!"column name {String.quote c.name} cannot be declared as a Lean field \
+symbol (an inductive constructor with that name is refused by Lean); column skipped")
   if hasSub declU "BLOB" then
     let extra := if c.notnull && c.defaultSql.isNone then
       " (NOT NULL without default: inserts through LeanDB will be rejected by SQLite)" else ""
