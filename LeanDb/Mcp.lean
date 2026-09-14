@@ -162,7 +162,7 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
               | "initialize" => pure <| some <| result id <| Json.mkObj [
                   ("protocolVersion", str ((params.getObjValAs? String "protocolVersion").toOption.getD "2025-06-18")),
                   ("capabilities", Json.mkObj [("tools", Json.mkObj [("listChanged", Json.bool false)])]),
-                  ("serverInfo", Json.mkObj [("name", str s!"leandb-{b.name}"), ("version", str "0.3.0")]),
+                  ("serverInfo", Json.mkObj [("name", str s!"leandb-{b.name}"), ("version", str "0.3.1")]),
                   ("instructions", str s!"The {b.name} base: typed tables and registered queries. Every tool is one command of the base's CLI; errors carry a typed code.")]
               | "ping" => pure <| some <| result id (Json.mkObj [])
               | "tools/list" => pure <| some <| result id (Json.mkObj [("tools", Json.arr toolList)])

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-for base in tickets crm shop gpus gpumarket pricewatch eats kernels legacy dashboard; do
+for base in tickets crm shop gpumarket eats legacy dashboard; do
   if ! cmp -s lean-toolchain "examples/$base/lean-toolchain"; then
     echo "release check failed: examples/$base/lean-toolchain differs from root" >&2
     exit 1
@@ -14,7 +14,7 @@ done
 lake build leandb leandb_tests
 .lake/build/bin/leandb_tests
 
-for base in tickets crm shop gpus gpumarket pricewatch eats kernels; do
+for base in tickets crm shop gpumarket eats; do
   (
     cd "examples/$base"
     lake build "$base" "${base}_tests"

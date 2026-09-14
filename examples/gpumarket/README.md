@@ -1,8 +1,7 @@
 # GPU market
 
 A larger market example with hardware facts and model-serving estimates.
-Use [gpus](../gpus/README.md) for the smaller introduction. This package also
-provides the GPU vocabulary used by [kernels](../kernels/README.md).
+The hardware vocabulary and model estimates are defined in this package.
 Requires the root project's Lean toolchain and the local LeanDB checkout.
 
 From the repository root:

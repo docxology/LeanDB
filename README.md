@@ -190,4 +190,10 @@ lake build leandb_tests
 ./.lake/build/bin/leandb_tests
 ```
 
-See the [source](LeanDb/) and [design proposals](proposals/) for details.
+## Documentation
+
+- [Core concepts](docs/core_concepts_and_terminology.md): types, bases, queries, and migrations.
+- [Terminology](docs/terminology.md): a short glossary.
+- [Roadmap](docs/roadmap.md): current support and future work.
+
+See the [source](LeanDb/) and [release guide](RELEASING.md) for development details.

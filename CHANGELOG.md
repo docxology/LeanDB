@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 - 2026-09-14
+
+- Add a core concepts guide, terminology glossary, and current roadmap.
+- Simplify the README and add the architecture diagram.
+- Replace example CLI transcripts with short usage guides.
+- Remove the old proposal directory and update documentation links.
+- Remove the Gpus, Kernels, and Pricewatch examples.
+- Update release checks for the remaining example packages.
+- Include the typed HTTP client integration and pinned dashboard dependency
+  added after the 0.3.0 tag.
+
+Lean 4.33.0 and the pinned SQLite dependency are unchanged.
+
 ## 0.3.0 - 2026-09-02
 
 LeanDB 0.3.0 separates the engine from the bases and makes a base a
