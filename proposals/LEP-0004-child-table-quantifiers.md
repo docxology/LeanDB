@@ -253,8 +253,8 @@ into the child list is a later ergonomic, not part of this proposal.
 3. `selectP`, `Pred.snapshot`, `pred%`, `Pred.all`/`any`.
 4. eats: `suitable` as one `selectP`; its two-fetch form kept as
    `suitableTwoPhase` for the differential test — both must return the
-   same rows for every `(family, diet, city)` in the seed. Transcript
-   regenerated; the `NOT EXISTS` plan appears in `log`.
+   same rows for every `(family, diet, city)` in the seed. Assert that the
+   `NOT EXISTS` plan appears in `log`.
 5. kernels: once LEP-0003 stage D lands, `highRank`/`anyColMajor` as
    quantifiers; until then, nothing.
 

@@ -551,7 +551,7 @@ The original design (transcript §4) named three encodings, none built:
 | child table — `KernelInput (kernel, position, dtype, rank)` | lists; `ins`, `outs`, `fuses`, `ProgramNode.feeds` | full, via joins | yes |
 
 **R2 built this and wrote up what it could not do** — see
-`examples/kernels/README.md`, "Evidence for LEP-0003". The short version:
+[Kernels design notes](../examples/kernels/DESIGN.md), "Evidence for LEP-0003". The short version:
 every predicate that reads inside `sig` is a full-table fetch; the search
 columns cannot describe a list; `migrate`, the fingerprint and the
 enum-drift scan all stop at the JSON boundary (adding a field to `TensorTy`

@@ -7,7 +7,7 @@
 | Created | 2026-09-01 |
 | Target | Post-LEP-0002 |
 | Primary goal | Structured field types that the schema, migrations and the planner can see |
-| Evidence | `examples/kernels/README.md`, "Evidence for LEP-0003" |
+| Evidence | [Kernels design notes](../examples/kernels/DESIGN.md), "Evidence for LEP-0003" |
 
 ## Summary
 
@@ -16,7 +16,7 @@ needed a signature (`KernelSig`: lists of tensor types with symbolic
 shapes), a launch configuration (four scalars), numeric properties (two
 scalars), a set of fused ops, and stored it all the only way the engine
 allows — a JSON string in a TEXT column, with hand-maintained search
-columns beside it. The README records what that cost, measured:
+columns beside it. The kernels design notes record what that cost, measured:
 
 - every predicate reading inside the column is a full-table fetch;
 - search columns cannot describe a list, are stored twice with no
@@ -278,11 +278,11 @@ check.
    for `s.contains .silu` and a migration test for growing/shrinking the
    world.
 2. **B1 + B2 — JSON derive and shape.** kernels' `KernelSig` moves to
-   `ColCodec.json`; the transcript demonstrates the `TensorTy` field
+   `ColCodec.json`; migration tests demonstrate the `TensorTy` field
    addition now being a fingerprint mismatch, then a safe restamp;
    removing a field is refused by name.
 3. **B3 — derived columns.** kernels' search columns become `@[derived]`;
-   the transcript's "desynchronized search columns accepted" case becomes
+   the "desynchronized search columns accepted" regression case becomes
    a `decode` refusal; `kernelInfo`'s Lean-side check is deleted.
 4. **C — inline.** kernels' `LaunchConfig` flattens; `smemBytes ≤ n`
    pushes.

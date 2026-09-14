@@ -1,0 +1,207 @@
+# Eats design notes — configurable offers
+
+For current usage, see the [example README](README.md). This file preserves
+the evidence and limitations from the LEP-0005 stage 1 investigation.
+Historical transcript references below refer to the
+[archived CLI session](https://github.com/theoriclabs/LeanDB/blob/8890aee065c381de99afb2e58d7aba65d18302e9/examples/eats/CLI_TRANSCRIPT.md).
+Executable checks live in [EatsTests.lean](EatsTests.lean) and
+[EatsOffersTests.lean](EatsOffersTests.lean).
+
+## Evidence for LEP-0005 stage 1: a stored function over a finite type, by hand
+
+Everything below was measured on this base (`eats_offers_tests`, `eats
+log`, `set_option leandb.explain true`); residual counts are from the
+tactic. The code is `Eats/Config.lean` (the space and the rule),
+`Eats/Offers.lean` (the entities), `Eats/OfferQueries.lean`,
+`Eats/OfferSeed.lean`, `EatsOffersTests.lean` — 674 lines of library
+and seed for one configurable family, about a third of which is what
+`deriving LeanDb.Config` and derived child rows would generate.
+
+**The space, and what `decide` can do with it.** `EspressoConfig` is
+`Temp × Size × Milk × Shots × Bool` (`Size` is the base's existing
+`small | regular | large`), 180 drinks, 125 valid after two rules (no
+small iced, no decaf triple). `all`/`allValid` are hand-written list
+comprehensions over `ClosedEnum.all`. The two lints — `overridesDisjoint`
+(no configuration matched by two overrides) and `nonNegative` (no
+configuration priced below zero) — are `Bool` folds over `allValid`, and
+they *are* provable at compile time for the seed rules, with one caveat:
+plain `decide` hits `maxRecDepth` in the elaborator's evaluator, and
+`decide +kernel` (the kernel reduces the closed term directly) proves
+each in about a second — eleven such `example`s in the test file, two of
+them proving the deliberately bad rules `= false`. No `native_decide`.
+The same lints run in the codec's `validate`, so the CLI refuses the
+ambiguous rule too:
+
+```
+$ eats insert espresso_offer {"restaurant":1,"canonical":7,"rule":"{\"base\":500,\"deltas\":[],\"overrides\":[[[{\"milk\":{\"m\":\"oat\"}}],600],[[{\"temp\":{\"t\":\"iced\"}}],550]]}",…}
+{"code":"decode","message":"espresso_offer.rule: ambiguous rule: two overrides match iced/regular/oat/single/regular","ok":false}
+```
+
+**Typed options without field symbols.** A structure gets no
+`Field`/`fieldTy` from LEP-0002, so `Pattern` is typed by a hand-written
+`inductive EspressoOption | temp (t : Temp) | size (s : Size) | …`:
+`#check_failure (EspressoOption.milk .large)` fails with `Unknown
+constant Eats.Milk.large`, and `EspressoOption.milk Size.large` with the
+type mismatch. It is 40 lines (`matches`, `render`, `parse`) per
+configuration type, and it is exactly `Σ f, fieldTy f` written out.
+
+**Which invariants live only in `make`.** `EspressoOffer.make` is the
+one place that establishes `minPrice = rule.minPrice`, `maxPrice =
+rule.maxPrice` and `veganPossible = ∃ c ∈ allValid, vegan allows
+(baseKinds ++ c.ingredients)`. Nothing checks them on read.
+`EspressoOffer.summariesAgree` is a Lean check the tests run, the way
+kernels' `search_columns_agree` is. The tabulation has no constructor at
+all: `OfferSeed.tabulate!` writes it once, from the rule, at seed time,
+and nothing links it to the `rule` column afterwards.
+
+**What a write can desynchronize.** Three ways, all accepted by the
+engine:
+
+- `update` of the rule alone (test `desynchronize`): Samovar's base goes
+  450 → 900 and the row is accepted; afterwards
+  `minPrice=400 rule.minPrice=850 tabulated=(some 600) rule.eval=1050`
+  — the bound says 400, the rule 850; the tabulation quotes 600 for a
+  drink the rule now prices at 1050; `placeOrder` would sell it at 600.
+- CLI `insert` with summaries that contradict the rule is accepted with
+  exit 0 (`minPrice:1, maxPrice:99999, veganPossible:false` on a
+  `base 500` rule → `{"ok":true,"row":{…"id":7,"maxPrice":99999,"minPrice":1…}}`),
+  and it has no `OfferPrice` rows at all: `cheapestConfigured` will
+  never find it, `quote` refuses every configuration, and no query
+  notices that the offer is unsellable.
+- A raw `UPDATE espresso_offer SET rule = …` is the first case without
+  even the Lean-side `update`; a raw `DELETE FROM offer_price` is the
+  second.
+
+A fourth, subtler one is *availability as absence*: Highwire's "no oat"
+is a seed-time filter (`unavailableHighwire`) applied to the tabulation
+only, so its `minPrice`/`maxPrice`/`veganPossible` are computed over all
+125 configurations including the 25 oat ones it does not sell. Here it
+is harmless (oat is not its cheapest milk; almond and soy keep it vegan-
+possible) but that is luck, not a check. The rule is the truth *and* the
+tabulation is the truth, and stage 1 has no single thing that is.
+
+**What stayed residual and why.** The plans, verbatim from `eats log`:
+
+```
+priceOf              offer_price | pushed: (((((t0."offer" IS ? AND t0."temp" IS ?) AND t0."size" IS ?) AND t0."milk" IS ?) AND t0."shots" IS ?) AND t0."decaf" IS ?), residual conjuncts: 0
+cheapestConfigured   espresso_offer×offer_price×restaurant | pushed: ((((((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?) AND t1."size" IS ?) AND t1."milk" IS ?) AND t1."shots" IS ?) AND t1."decaf" IS ?), residual conjuncts: 0
+offersWith           espresso_offer×offer_price×restaurant | pushed: ((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."milk" IS ?), residual conjuncts: 0
+cheapestMatching     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 1
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?), residual conjuncts: 0        -- (none, none)
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: ((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?), residual conjuncts: 0        -- (some .iced, none)
+cheapestOptional     espresso_offer×offer_price×restaurant | pushed: (((((t1."offer" IS t0."id" AND t0."restaurant" IS t2."id") AND t0."available" IS ?) AND t2."city" IS ?) AND t1."temp" IS ?) AND t1."milk" IS ?), residual conjuncts: 0        -- (some .iced, some .oat)
+offersFreeOf         espresso_offer×restaurant | pushed: (((t0."restaurant" IS t1."id" AND t0."available" IS ?) AND t1."city" IS ?) AND ((t0."baseKinds" & ?) = 0)), residual conjuncts: 0
+```
+
+- *A fully specified configuration pushes entirely.* Hand-flattening the
+  config into five columns is what makes `cheapestConfigured` residual 0
+  over three tables: the LEP's acceptance 1 holds, and the answer equals
+  the fold over every SF rule evaluated in Lean (`[600, 725, 725, 725]`
+  both ways; Samovar wins; the planned select equals `selectUnplanned`).
+- *A runtime pattern is residual by nature.* `cheapestMatching (p :
+  Pattern)` keeps `Pattern.matches p op.val.toConfig` in Lean (residual
+  1): the tactic case-splits closed-enum columns and closed-enum
+  parameters, and a `List EspressoOption` typed at the CLI is neither —
+  it cannot emit a conjunction whose length it does not know at compile
+  time. Same reason as `suitableAdHoc`'s `avoid.contains`. The joins and
+  the city still push, so the fetch is the city's rows, not the table.
+- *The `Option`-parameter probe: landed.* `cheapestOptional (temp? :
+  Option Temp) (milk? : Option Milk)` with
+  `(temp?.isNone || some op.val.temp == temp?)` measured residual 2 when
+  this was written — each option conjunct opaque, because the captured-
+  parameter split (`findEnumParam`) asked `ClosedEnum (Option Temp)` and
+  got nothing. That engine finding is now the engine: the split also
+  covers a captured `Option α` for closed `α`, over the world `none ::
+  (ClosedEnum.all α).map some`, guarded by value/value tests on the
+  parameter (`temp? IS none ∧ …`, `temp? IS some c ∧ …`) that fold when
+  the plan value is built. The three `cheapestOptional` lines above are
+  the logged plans for `(none, none)`, `(some .iced, none)` and `(some
+  .iced, some .oat)`: a `none` argument folds its conjunct to `tt` and
+  leaves nothing; a `some` argument leaves `t1."temp" IS ?` /
+  `t1."milk" IS ?`. Residual 0 for every combination, asserted on the
+  query's own log entries in `EatsOffersTests.lean`. With
+  `leandb.explain`, `temp?.isNone` reflects as `(vvEq temp? none ∧ tt) ∨
+  ⋁_c (vvEq temp? (some c) ∧ ff)` and `some op.val.temp == temp?` as
+  `⋁_c (temp IS c ∧ vvEq (some c) temp?)`; the `match temp? with | none
+  => true | some t => op.val.temp == t` spelling reflects as `(vvEq temp?
+  none ∧ tt) ∨ ⋁_c (vvEq temp? (some c) ∧ temp IS c)` — both fold to the
+  same plans. An optional filter is no longer a runtime pattern.
+- *Set membership pushes as a bit test.* `baseKinds` is an `EnumSet
+  IngredientKind` (LEP-0003 A; 22 variants of the 62 a column admits),
+  so `offersFreeOf k city` — `!(o.val.baseKinds.contains k)` — pushes as
+  `((t0."baseKinds" & ?) = 0)` with the kind's bit as the bound value,
+  residual 0, asserted on the query's log entry (`freeOfPlan`). It is
+  one `Pred.bit` leaf whose negation flips a flag, so it stays exact
+  under `!`; the canonical-TEXT `KindSet` this column replaced pushed
+  equality only, and "sugar-free offers in SF" would have been a
+  full-city fetch with the set parsed in Lean. Row JSON shows the names
+  (`"baseKinds":["sugar"]`), the DDL says `CHECK (("baseKinds" &
+  ~4194303) = 0)`, and the fingerprint hashes the variant names — the
+  base's fingerprint moved from `13094967604080386023` to the
+  transcript's.
+
+**What the tabulation costs.** 125 rows per offer (the 125 valid drinks
+of 180), 725 `offer_price` rows for the six seeded offers (Highwire's
+100 = 125 − 25 oat configurations); 725 single-row inserts at seed time,
+one `withLog` entry each. `OrderLine` carries the same five columns
+again as a snapshot. A price change is a rule edit plus a delete-and-
+reinsert of 125 rows that nothing in stage 1 performs — `update` of the
+rule leaves the 125 rows as they were (above). At 5 cafés this is
+nothing; at 5,000 offers it is 625,000 rows that are *entirely*
+determined by 5,000 JSON values, and the only place that knows how to
+regenerate them is a seed function.
+
+**What `deriving Config` and `@[derived]` child rows would remove.**
+- `deriving LeanDb.Config` on `EspressoConfig`: `all`, `allValid`,
+  `render`/`parse`, the `EspressoOption` inductive with `matches`/
+  `render`/`parse`, `Pattern`, and the per-enum `ToJson`/`FromJson`
+  instances — about 120 of `Config.lean`'s 263 lines, plus the
+  `CliArg`s for a config and a pattern. `PriceRule` and its two lints
+  are 60 lines that are already generic over the config type and belong
+  in the library (engine stage 2 of the LEP).
+- Inline flattening (LEP-0003 C): `OfferPrice` and `OrderLine` each
+  spell the five config columns by hand, plus `ofConfig`/`toConfig`;
+  `config : EspressoConfig` would replace both and keep `priceOf`'s six
+  pushed equalities.
+- `@[derived] minPrice/maxPrice/veganPossible` (LEP-0003 B3): `make`
+  and `summariesAgree` go, and the `update`/CLI/raw-SQL desynchronizations
+  above become decode-time refusals.
+- `@[derived] prices : List OfferPrice` (B3 applied to D): `tabulate!`
+  goes, the seed-time filter becomes an `unavailable : List Pattern`
+  field of the offer that the tabulation respects *and* the bounds see,
+  and `update` of the rule regenerates the 125 rows in the same
+  transaction. This is the one mechanism that makes "the rule is the
+  truth" a fact rather than a docstring.
+
+**Deviations from the LEP as written.** `Size` is reused from
+`Enums.lean` (`regular`, not `medium`), so the vocabulary stays one
+closed world per notion. `at` is a Lean keyword; the order-line column is
+`placedAt`. `Delta` is `Int64` and `Money` is `Nat`: `PriceRule.evalRaw`
+sums in `Int` and `eval` floors at zero, with `nonNegative` guarding the
+floor from ever mattering. `configurationsFor` needs the base ingredients
+at query time, so `EspressoOffer` carries one extra column, `baseKinds :
+EnumSet IngredientKind` (LEP-0003 A, the same column type as kernels'
+`fuses`; stage 1 first shipped it as a canonical-TEXT `KindSet` and
+`offersFreeOf` above is what the move bought). Acceptance 4 is met
+through it: on a
+dairy-free latte `configurationsFor … .vegan` returns 75 configurations
+(3 non-dairy milks × 25), every one with `milk ∈ {oat, almond, soy}` and
+none with `whole`.
+
+Transcript excerpts (the seed's ids; offer 4 is Samovar, offer 5 is
+Highwire):
+
+```
+$ eats query cheapestConfigured iced large oat double false sanFrancisco
+{"ok":true,"result":[[{…"id":4,"maxPrice":675,"minPrice":400,"restaurant":7…},[{"decaf":0,"id":488,"milk":"oat","offer":4,"price":600,"shots":"double","size":"large","temp":"iced"},{…"name":"Samovar Tea Lounge"…}]],…
+$ eats query cheapestMatching milk=large sanFrancisco
+{"code":"decode","message":"cli.p: milk: \"large\" is not one of #[whole, skim, oat, almond, soy]","ok":false}
+$ eats query offersWith oat oakland
+{"ok":true,"result":[]}
+$ eats query quote 5 iced/large/oat/double/regular
+{"code":"decode","message":"offer_price.config: offer 5 does not sell iced/large/oat/double/regular: this café does not sell that configuration","ok":false}
+$ eats query placeOrder 4 iced/large/oat/double/regular 1756684800
+{"ok":true,"result":{"decaf":0,"id":1,"milk":"oat","offer":4,"placedAt":1756684800,"quoted":600,"shots":"double","size":"large","temp":"iced"}}
+$ eats query placeOrder 1 iced/small/whole/double/regular 1756684800
+{"code":"decode","message":"offer_price.config: offer 1 does not sell iced/small/whole/double/regular: this café does not sell that configuration","ok":false}
+```

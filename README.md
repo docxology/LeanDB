@@ -1,18 +1,34 @@
 # LeanDB
 
-**Strongly typed SQL in Lean 4.** LeanDB combines Lean's expressive type
-system with SQLite, giving a dependently typed front end to a SQL backend.
-That gives you:
+**Strongly typed SQL in Lean 4.**
 
-- validated, typed data,
-- queries checked against the tables they read, and
-- schema-derived migrations, with typed transformations for changes a mechanical diff can't make.
+Define your data and queries in Lean. Store the data in SQLite.
 
-## Typed Data
+- Types describe your data and its rules.
+- The compiler checks query inputs and result types.
+- Reads validate stored values.
+- Schema changes produce migration plans.
 
-Model domain values directly. Every value read from SQLite or decoded from
-JSON passes through its `ColCodec`, while `Ref User` makes a foreign key's
-target part of its Lean type.
+![LeanDB architecture: typed requests become SQL, and stored rows are validated before returning to the application.](docs/images/leandb-architecture.svg)
+
+## Setup
+
+Install [elan](https://github.com/leanprover/elan), the Lean toolchain manager.
+Then build LeanDB:
+
+```bash
+git clone https://github.com/theoriclabs/LeanDB.git leandb
+cd leandb
+lake build leandb
+```
+
+SQLite is bundled. The first build takes a few minutes.
+Start with the [tickets example](examples/tickets/README.md).
+
+## Typed data
+
+Define tables as Lean structures. Use a codec to validate custom fields.
+This codec rejects empty titles when reading SQLite rows or JSON:
 
 ```lean
 import LeanDb
@@ -42,21 +58,16 @@ structure Ticket where
   status   : Status := .backlog
   reporter : Ref User
   deriving Repr, LeanDb.Entity
-
-def schema : List TableSpec :=
-  [Entity.spec User, Entity.spec Ticket]
 ```
 
-`deriving LeanDb.Entity` produces each table specification; `schema` lists
-those tables in foreign-key dependency order. LeanDB derives the columns,
-default, foreign-key constraint, JSON codec, and migration metadata from the
-entity declarations, so there is no second schema to keep in sync.
+`Ref User` is a typed foreign key.
+`deriving LeanDb.Entity` generates the table schema and row codecs.
+Defaults and foreign keys come from the same declarations.
 
-## Typed Queries
+## Typed queries
 
-The table list fixes the predicate's input type, so a predicate for the wrong
-table does not compile. This join is checked in Lean and runs as one SQL
-statement:
+The table list determines the query's input and result types.
+This query joins tickets with their reporters:
 
 ```lean
 def activeTickets : DbM (Array (Stored Ticket × Stored User)) :=
@@ -65,19 +76,19 @@ def activeTickets : DbM (Array (Stored Ticket × Stored User)) :=
       ticket.val.reporter == user.ref && ticket.val.status != .done)
     (.key fun (ticket, _) => ticket.val.title)
 
--- `select [User]` requires a `Stored User → Bool`, so this is rejected:
+-- A predicate for the wrong table does not compile.
 #check_failure
   select [User] (fun (ticket : Stored Ticket) => ticket.val.status == .done)
 ```
 
-LeanDB reifies the part of the predicate it can express in SQL and always
-checks the original Lean predicate on the returned rows, preserving Lean's
-reference semantics.
+LeanDB translates supported expressions into SQL.
+It always applies the original Lean predicate to the decoded rows.
+Expressions it cannot translate run in Lean.
+Use `log` to see the generated query plans.
 
 ## Schema migrations
 
-A migration starts as a type-safe schema edit. For example, adding an optional
-field is enough to produce a non-destructive migration plan:
+Edit a type to change the schema. For example, add an optional assignee:
 
 ```diff
  structure Ticket where
@@ -88,463 +99,95 @@ field is enough to produce a non-destructive migration plan:
    deriving Repr, LeanDb.Entity
 ```
 
-```console
-$ tickets migrate status
-{"destructive":false,"notes":[],"ok":true,"steps":["add column \"ticket\".\"assignee\""]}
+Rebuild your base. Run `migrate status` to inspect the plan.
+Run `migrate apply` to apply it.
 
-$ tickets migrate apply
-{"applied":["add column \"ticket\".\"assignee\""],"ok":true,…}
-```
+Automatic migrations need an `Option` type or a default for new columns.
+Migrations run in transactions and create backups by default.
+Dropping tables or columns requires `--allow-destructive`.
 
-This is the *unfrozen* mode: every change is diffed mechanically, and anything
-needing application-specific row conversion is refused with a reason rather
-than guessed. `migrate freeze` (below, “Versioned, typed migrations”) gives a
-base a history and lets exactly those changes be written as typed functions.
+Use `migrate freeze` to version the schema.
+Typed row transformations handle changes that need custom conversion.
+See the [legacy example](examples/legacy/README.md) for a full migration.
 
-Backed by SQLite ([leansqlite](https://github.com/leanprover/leansqlite),
-bundled — nothing to install). Machine-first: every command emits one JSON
-value; errors are typed with stable codes; exit codes mean things.
+## Create a base
 
-## Setup
+A *base* is a Lean package with tables, queries, and a CLI.
+An *instance* is the SQLite file it uses.
 
-You need [`elan`](https://github.com/leanprover/elan) (the Lean toolchain
-manager). Then:
+From the repository root:
 
 ```bash
-git clone https://github.com/theoriclabs/LeanDB.git leandb && cd leandb
-lake build            # engine (first build compiles bundled SQLite; takes a few minutes)
-lake build leandb     # the importer executable (used in "Importing" below)
-lake build leandb_tests && .lake/build/bin/leandb_tests   # optional: "all engine tests passed"
-```
-
-Maintainers can run the full engine, example, and importer release pass with
-`./scripts/release_check.sh`; see `RELEASING.md` for the tag checklist.
-
-## A new base from scratch
-
-A LeanDB database ("base") is an ordinary Lake package depending on
-`leandb`: types, queries, and one `LeanDb.Base` value that ties them
-together; the instance (the SQLite file) is chosen at run time.
-`leandb new notes --leandb-git https://github.com/theoriclabs/LeanDB.git --rev v0.3.0`
-(or `--leandb-path /path/to/leandb`) scaffolds one laid out like the
-examples, tests included. By hand it is three files. Make a directory anywhere and add:
-
-**`lean-toolchain`** — must match the engine's (copy it):
-
-```
-leanprover/lean4:v4.33.0
-```
-
-**`lakefile.toml`**:
-
-```toml
-name = "notes"
-defaultTargets = ["notes"]
-
-[[require]]
-name = "leandb"
-path = "/absolute/path/to/leandb"   # or a relative path
-
-[[lean_exe]]
-name = "notes"
-root = "Main"
-```
-
-**`Main.lean`** — a complete base in one file:
-
-```lean
-import LeanDb
-
-open LeanDb LeanDb.Cli
-
-/-- A validated newtype: database and JSON decoding use its smart constructor. -/
-structure Title where
-  raw : String
-  deriving Repr
-
-def Title.make (s : String) : Except String Title :=
-  let t := s.trimAscii.toString
-  if t.isEmpty then .error "title must be nonempty" else .ok ⟨t⟩
-
-instance : ColCodec Title := ColCodec.via (·.raw) Title.make
-
-/-- A closed world: these are ALL the statuses. Stored as TEXT with a
-    CHECK constraint; not an entity — you cannot insert or delete one. -/
-inductive Status where
-  | draft | published
-  deriving Repr, DecidableEq, Ord, LeanDb.ClosedEnum
-
-structure Note where
-  title  : Title
-  body   : String
-  status : Status := .draft
-  deriving Repr, LeanDb.Entity
-
-/-- Domain logic the query compiler may unfold into SQL. -/
-@[db] def Note.isDraft (n : Note) : Bool := n.status == .draft
-
-def drafts : DbM (Array (Stored Note)) :=
-  select [Note] (fun n => n.val.isDraft) (.key (·.val.title.raw))
-
-/-- The base as a value: tables (the schema is derived from them) and
-    queries. A larger base puts this in its library so other packages
-    can `import` it. -/
-def base : LeanDb.Base := {
-  name := "notes"
-  tables := [.of Note]
-  queries := [query% drafts]   -- CLI arity/parsing derived from the def's signature
-}
-
-def main (args : List String) : IO UInt32 := Cli.run base args
-```
-
-Build and use. The instance file is `data/notes.sqlite` unless `--db
-<path>` or `$LEANDB_DB` says otherwise, and it is created on first touch:
-
-```bash
+./.lake/build/bin/leandb new notes --out ../notes --leandb-path "$PWD"
+cd ../notes
 lake build
-notes=./.lake/build/bin/notes
-
-$ $notes insert note '{"title":"  First  ","body":"hello"}'
-{"ok":true,"row":{"body":"hello","id":1,"status":"draft","title":"First"}}
-#         title trimmed by the smart constructor ─┘        └─ default filled in
-
-$ $notes insert note '{"title":"   ","body":"no"}'
-{"code":"decode","message":"note.title: title must be nonempty","ok":false}   # exit 2
-
-$ $notes query drafts
-{"ok":true,"result":[{"body":"hello","id":1,"status":"draft","title":"First"}]}
-
-$ $notes version
-{"code_fingerprint":"…","in_sync":true,"instance_fingerprint":"…","ok":true,"schema_version":1}
+./.lake/build/bin/notes seed
+./.lake/build/bin/notes query drafts
 ```
 
-## Changing the schema — migrations
+The generated package includes types, queries, and tests.
+Use `--db <path>` or `LEANDB_DB` to choose an instance.
 
-The schema is the code, so a migration starts with an edit. Add a variant
-to the closed world and a new field:
+## Import a SQLite database
 
-```lean
-inductive Status where
-  | draft | published | archived      -- grew the world
-  ...
-structure Note where
-  title  : Title
-  body   : String
-  status : Status := .draft
-  pinned : Option Bool                -- new column: Option, or give it a default
-  ...
-```
-
-`lake build`, then watch the instance refuse to lie about what it holds:
+From the repository root, generate a base from an existing database:
 
 ```bash
-$ $notes rows note
-{"code":"schema_mismatch","message":"schema fingerprint mismatch: …","ok":false}   # exit 4
-
-$ $notes migrate status
-{"destructive":false,"notes":["\"note\".\"status\" changed shape → table rebuild"],
- "ok":true,"steps":["rebuild table \"note\" (copying 3 columns)"]}
-
-$ $notes migrate apply
-{"applied":["rebuild table \"note\" (copying 3 columns)"],"fingerprint":"…","ok":true,…}
-
-$ $notes rows note --eq status=draft
-{"count":1,"ok":true,"rows":[{"body":"hello","id":1,"pinned":null,"status":"draft","title":"First"}]}
-
-$ $notes version
-{…,"in_sync":true,"schema_version":2}
+./.lake/build/bin/leandb import-sqlite inventory.db \
+  --name inventory --out ../inventory --require-path "$PWD"
 ```
 
-The rules, all loud:
-
-- **New columns must be `Option` or carry a `:= default`** — a declared
-  default backfills existing rows (and shows up in the DDL and the
-  `schema` output); without one, a `NOT NULL` addition is refused with
-  guidance rather than inventing a value.
-- **New tables** apply as plain `CREATE TABLE`.
-- **Changed column shapes** (a grown/renamed closed world, a type change)
-  rebuild the table in place, copying surviving columns. **Shrinking a
-  closed world** with rows still using the removed variant fails the new
-  CHECK during the copy and **rolls back** — vocabulary shrinks only when
-  the data already conforms.
-- **Dropping tables or columns** is refused unless you pass
-  `migrate apply --allow-destructive`.
-- Everything runs in one transaction with a foreign-key check before
-  commit; each apply is journaled in `_leandb_migrations` and bumps
-  `schema_version`.
-- **Every apply is preceded by a full backup** (`VACUUM INTO`) under
-  `data/backups/`, named in the journal and the report; `migrate
-  rollback` restores it (writes made after the migration are not in
-  it, and the response says so). `--no-backup` opts out.
-
-## Versioned, typed migrations
-
-The rules above are the *unfrozen* mode: the instance remembers its
-schema and every change is diffed mechanically. Freezing gives the base a
-history, and lets a change that needs judgment be written as a typed
-function instead of refused:
-
-```bash
-$ legacy migrate freeze              # once: Legacy/Migrations/V0.lean, the origin
-```
-
-Add `import Legacy.Migrations`, `chain := some Legacy.Migrations.chain`
-to the base, and `leandb_check_head Legacy.Migrations.chain Legacy.base.specs`
-to the tests. Now edit an entity — say the imported `qty : Int64` becomes
-a closed world:
-
-```lean
-inductive OrderSize where | small | bulk   deriving …, LeanDb.ClosedEnum
-structure Orders where
-  customer_id : Ref Customers
-  item : OrdersItem
-  size : OrderSize        -- was `qty : Int64`
-```
-
-`lake build` is red — the tests say the code's schema is not the chain's
-head — but `lake build legacy && legacy migrate freeze` writes `V1.lean`:
-the new snapshot, the raw row types of V0 (`V0.Orders` with `qty :
-Int64`), and the migration with one hole, commented with the refusal:
-
-```lean
-def M1 : LeanDb.Migration := {
-  fromFingerprint := "7882435756683641985"
-  toFingerprint := "17105251411370212804"
-  snapshot := V1.schema
-  steps := [
-    -- table "orders": new column "size" is NOT NULL with no default — …
-    LeanDb.Step.transformT V0.Orders Legacy.Orders fun (old : V0.Orders) =>
-      sorry]
-}
-```
-
-Fill it — `size := if old.qty > 10 then .bulk else .small` — and the
-build is green. The instance follows:
-
-```console
-$ legacy migrate status
-{"ok":true,"mode":"chain","instance_version":0,"head_version":1,"destructive":true,
- "pending":[{"version":1,"steps":[{"describe":"rebuild table \"orders\" (copying 2 columns)",
-   "table":"orders","rows":3,"destructive":true,"transform":"provided"}],…}],…}
-$ legacy migrate apply --allow-destructive
-{"ok":true,"mode":"chain","applied":[{"version":1,"applied":["transform rows of \"orders\" (… → …): 3 rows"],
- "backup":"data/backups/legacy-v0-….sqlite"}],"instance_version":1,…}
-```
-
-`migrate status` also says what the change *reaches*: `changed` lists the
-columns it touches, `impact` every registered query whose plan reads one
-of them (the tactic records each plan's footprint at compile time;
-`query%` carries it) with how many logged runs did, and
-`unregistered_runs` counts logged selects from outside the registered
-queries. The log itself now stores each select's plan as data with its
-footprint and the query it ran under.
-
-One transaction per version, a full backup before each, ids kept, the
-first row the transform rejects aborts the whole migration by id. An
-instance whose fingerprint is in no snapshot is `unknown_lineage` (exit
-4); an adopted file with no stamp is stamped at the version whose
-columns it has. `examples/legacy` is this example, tests included.
-
-## Importing an existing SQLite database
-
-Point the importer at any SQLite file; it generates a complete typed base:
-
-```bash
-$ leandb import-sqlite inventory.db --name inventory --out ./inventory \
-    --require-path /absolute/path/to/leandb
-{"imported":["vendors","parts"],"skipped":[],…}
-
-$ cd inventory && mkdir -p data && cp ../inventory.db data/   # adopt the file
-$ lake build
-$ ./.lake/build/bin/inventory rows parts --eq vendor_id=1
-{"count":1,"ok":true,"rows":[{"id":1,"label":"sprocket","qty":12,"vendor_id":1}]}
-```
-
-What you get: `INTEGER` → `Int64`, FKs → `Ref <Table>`, nullable →
-`Option`, and **every TEXT column becomes its own named newtype with an
-identity smart constructor** — *import loose, tighten forever*: the base
-is never stringly, and each future validation is one `make` function away
-(followed by the ordinary migration flow above). Everything that can't be
-carried — views, triggers, composite-key tables, BLOB columns — is listed
-**by name** with a reason in the generated `IMPORT.md` /
-`import-report.json`. Silent partiality is forbidden.
-
-The adopted file keeps working with plain `sqlite3` the whole time; LeanDB
-adds its `_leandb_*` bookkeeping tables on first open.
+LeanDB derives types from the stored schema.
+You can then add stronger validation to those types.
+Unsupported features are listed in the generated `IMPORT.md`.
+See the [legacy example](examples/legacy/README.md) to adopt and migrate a file.
 
 ## The CLI every base gets
 
-`Cli.run` derives the whole surface from the base value; `--db <path>`
-(or `$LEANDB_DB`) picks the instance for any command:
+Run `<base> help` for table names, queries, and arguments.
+Commands return JSON. Quote JSON arguments in your shell.
 
-| Command | Meaning |
+| Command | Purpose |
 |---|---|
-| `schema` | schema as JSON, derived from the types (closed worlds visible) |
-| `version` | code vs instance fingerprint, `schema_version`, `in_sync` |
-| `insert <table> <json>` | decode through the smart constructors; defaults fill omitted fields |
-| `get <table> <id>` · `delete <table> <id>` | typed row ops; `delete` of a referenced row → `restricted` |
-| `update <table> <id> <partial-json>` | column-level merge, re-validated, written compare-and-swap |
-| `rows <table> [--eq col=value]… [--limit n]` | conjunctive equality filters — the CLI's whole filter language, by design |
-| `query <name> [args…]` | your `query%`-registered queries; args parse by type (`help` lists each query's parameters) |
-| `seed` | the base's seed, when it declares one |
-| `migrate status` / `migrate apply [--allow-destructive] [--no-backup]` | see above; `apply` takes a full backup first |
-| `migrate freeze` | snapshot the schema as data, giving the base a typed migration history (see "Versioned, typed migrations") |
-| `migrate rollback` · `migrate history` · `backup` · `restore <file>` | return to the pre-migration copy; the journal; copies on demand |
-| `log [n]` | the query log: verb, reified SQL plan (text and as data with its footprint), the query it ran under, outcome, row count |
-| `serve` | JSON-lines over stdio on one persistent connection (each request is a JSON argv array) |
-| `serve --mcp` | Model Context Protocol over stdio: one tool per table verb and per registered query (parameters from the signature) |
-| `serve --http <port> [--bind <host>] [--auth-token <t>]` | the same surface over HTTP/1.1: `GET /tables/ticket?eq=status=done`, `GET /query/slaBreached/1700000000`, `POST /rpc` with an argv array, `POST /migrate/apply`, … — statuses from the response `code`, `X-LeanDb-Fingerprint` refused when stale, `GET /healthz` always open, everything else 401 without the bearer when a token is set (`$LEANDB_TOKEN` also sets it) |
+| `schema` | Show the derived schema. |
+| `version` | Check whether code and database schemas match. |
+| `insert <table> <json>` | Validate and insert a row. |
+| `get <table> <id>` | Read a row. |
+| `update <table> <id> <json>` | Validate and apply a partial update. |
+| `delete <table> <id>` | Delete a row. |
+| `rows <table> [--eq col=value] [--limit n]` | List or filter rows. |
+| `query <name> [args…]` | Run a registered query. |
+| `seed` | Load the base's sample data. |
+| `migrate status` / `migrate apply` | Inspect or apply schema changes. |
+| `migrate freeze` | Save a schema version. |
+| `migrate history` / `migrate rollback` | Show migrations or restore the last migration backup. |
+| `backup` / `restore <file>` | Save or restore a database copy. |
+| `log [n]` | Show recent query plans and outcomes. |
+| `serve` | Serve JSON requests over standard input and output. |
+| `serve --mcp` | Expose tables and queries as MCP tools. |
+| `serve --http <port>` | Serve the same API over HTTP. |
 
-Exit codes: `0` ok · `2` typed `DbError` (JSON on stderr, `code` field:
-`decode`, `not_found`, `stale`, `restricted`, `missing_ref`, `duplicate`, `schema`, `enum_drift`,
-`migrate`, `sqlite`) · `3` usage · `4` schema/version mismatch (`schema_mismatch`) or an
-instance whose fingerprint is in no migration snapshot (`unknown_lineage`).
+Exit codes: `0` for success, `2` for database errors, `3` for usage errors,
+and `4` for schema or migration history mismatches.
 
-## Queries are Lean
+## Examples
 
-`select` takes a plain lambda; the four verbs are all there is:
+| Example | Shows |
+|---|---|
+| [tickets](examples/tickets/README.md) | An issue tracker with typed references and joins. Start here. |
+| [crm](examples/crm/README.md) | Queries across companies, contacts, and asks. |
+| [shop](examples/shop/README.md) | Basket joins and inventory filtering. |
+| [eats](examples/eats/README.md) | Menus, opening hours, and configurable offers. |
+| [legacy](examples/legacy/README.md) | Importing SQLite data and writing typed migrations. |
+| [dashboard](examples/dashboard/Main.lean) | Calling typed queries locally, over stdio, and over HTTP. |
 
-```lean
-insert Ticket {...}         -- : DbM (Stored Ticket), returns assigned id
-update old new              -- compare-and-swap: a lost race is .stale, never a clobber
-delete someId               -- referenced row → .restricted
-select [Ticket, User] (fun (t, u) => t.val.reporter == u.ref && t.val.priority == .p0)
-  (.andThen (.key fun (t, _) => t.val.createdAt) (.desc (.key fun (_, u) => u.val.handle)))
-```
+## Development
 
-At each call site an elaboration tactic reifies the predicate into a plan:
-column/value comparisons (captured variables become bound SQL parameters),
-joins, `&&`/`||`/`!`, `Option` null tests, `@[db]` helpers unfolded — and a
-`match` on a closed world compiles to SQL by case-splitting it (the gpus
-example's `Chip.vendor c == .amd`, a seven-constructor match, executes as
-`chip IS 'mi300x' OR chip IS 'mi325x'`). Whatever the tactic can't
-translate stays a *residual* conjunct: the lambda is **always** applied to
-what comes back, so plans narrow fetches but can never change results.
-`log` shows exactly what was pushed; `set_option leandb.explain true`
-shows plans at compile time.
-
-## Using a base from another project
-
-A base is a Lake package; another project `require`s it and gets the
-types, the `base` value and the query defs. `examples/dashboard` is one:
-
-```lean
-import Tickets
-import LeanDbHttp
-open LeanDb
-
--- in-process, against an instance file, with the base's own schema check
-let open_ ← Tickets.base.withInstance (Instance.ofPath "data/tickets.sqlite") Tickets.openTickets
-
--- over the wire, against a served base: the def's signature becomes a stub
-def slaBreachedRemote := client% Tickets.slaBreached   -- Timestamp → ClientM (Array (Stored Ticket × Stored User))
-let client ← Client.connect "path/to/tickets" (fingerprint Tickets.base.specs)
-  ["--db", "data/tickets.sqlite"] >>= fun
-    | .ok client => pure client
-    | .error e => throw <| IO.userError (toString e)
-let rows ← (slaBreachedRemote ⟨1700000000⟩).run client
-
--- over HTTP, through the optional sibling leandb-http package
-let httpClient ← LeanDb.HttpClient.connectUrl "https://db.example.com/bases/tickets"
-  (fingerprint Tickets.base.specs) >>= fun
-    | .ok client => pure client
-    | .error e => throw <| IO.userError (toString e)
-let httpRows ← (slaBreachedRemote ⟨1700000000⟩).run httpClient
-```
-
-The HTTP adapter lives in the separately publishable `leandb-http`
-package and uses the separately publishable, libcurl-backed `leanhttp`
-client. Clone all three repositories side by side when using path
-dependencies. LeanDB itself has no HTTP-client or libcurl dependency.
-
-Many bases behind one port: `leandb host --port 8080 tickets=examples/tickets/.lake/build/bin/tickets eats=examples/eats/.lake/build/bin/eats`
-serves them under `/bases/tickets/…` and `/bases/eats/…` (each base is
-its own binary, so the host supervises processes and speaks their
-JSON-lines protocol).
-
-Deploying: `--auth-token <t>` (or `LEANDB_TOKEN`) on `serve --http` and
-`host` requires `Authorization: Bearer <t>` on every request except
-`GET /healthz`; without a token the server is open and binds
-`127.0.0.1`. The root `Dockerfile` builds any example base into an
-image — `docker build --build-arg BASE=tickets -t leandb-tickets .`,
-then `docker run -p 7411:7411 -v tickets-data:/data -e LEANDB_TOKEN=s3cret leandb-tickets`
-— and `leandb new` emits the same for a standalone base. TLS is a
-reverse proxy's job; the server speaks plain HTTP/1.1.
-
-Both `Client.connect` (stdio) and `HttpClient.connectUrl` (HTTP) refuse a
-base whose schema fingerprint is not the one the client was compiled
-against. Arguments render through `CliRender`, results decode through
-`QueryIn`; a base adds instances for its own newtypes (tickets'
-`Timestamp`).
-
-## Example bases
-
-The hand-written bases are standalone packages with tests and a
-`CLI_TRANSCRIPT.md`; `legacy` is the checked-in importer output:
-
-| Base | Domain | Worth seeing |
-|---|---|---|
-| `examples/tickets` | issue tracker | SLA join, `@[db]` helpers, the reference base |
-| `examples/crm` | companies/people/asks | pipeline join, keyword enum variant `«open»` |
-| `examples/shop` | ecommerce | basket/revenue joins, Money/Sku/Qty scalars |
-| `examples/gpus` | GPU SKUs & providers | match→CASE pushdown; `#check_failure LeanDb.delete (α := Chip) ⟨1⟩` — you can't delete a chip from the universe |
-| `examples/gpumarket` | GPU rental market + models | providers as a *closed world* (deleting Lambda doesn't typecheck), total vocabulary functions, `query h100 onDemand` → cheapest first, `canServe <model>` joins models against listings |
-| `examples/pricewatch` | ecommerce price comparison | typed hard constraints plus sorted, Pareto-front, and knee-point selection strategies |
-| `examples/legacy` | generated by `import-sqlite`, then tightened | what the importer emits, and a frozen V0→V1 typed migration |
-| `examples/dashboard` | not a base | imports `tickets` and `eats`: the same typed query in-process, over stdio, and over `leanhttp` |
+Run the engine tests:
 
 ```bash
-cd examples/tickets && lake build tickets
-./.lake/build/bin/tickets query seed
-./.lake/build/bin/tickets query slaBreached 1700000000
-./.lake/build/bin/tickets log 3
+lake build leandb_tests
+./.lake/build/bin/leandb_tests
 ```
 
-## Repo map
-
-```text
-LeanDb/Core.lean     Id/Ref/Stored, Col, ColCodec, ClosedEnum, ColumnSpec, DbError
-LeanDb/Entity.lean   Entity class, TableSpec, DDL generation, fingerprint
-LeanDb/Derive.lean   deriving LeanDb.Entity / LeanDb.ClosedEnum (incl. field defaults)
-LeanDb/Select.lean   Rows ts, SortBy, RowsOf, selectSpec (the reference semantics)
-LeanDb/Pred.lean     typed plan IR (Pred)  LeanDb/PlanElab.lean  the leandb_plan tactic, @[db]
-LeanDb/Db.lean       DbM, the four verbs, joined executor, open checks, query log
-LeanDb/Migrate.lean  schema diff → steps, transactional apply, journal, backups
-LeanDb/Render.lean   Lean-source rendering shared by the importer and migrate freeze
-LeanDb/Migration.lean chains: Step (typed transforms), Migration, Chain, adoption, apply
-LeanDb/Freeze.lean   migrate freeze: V<n>.lean (snapshot, raw types, holes) and the roll-up
-LeanDb/Http.lean     serve --http: routes as sugar over Base.handle (Std.Http.Server)
-LeanDb/Client.lean   transport-neutral Client, stdio constructor, client%, CliRender, QueryIn
-LeanDb/Mcp.lean      serve --mcp: tools derived from the base, JSON-RPC over stdio
-LeanDb/Host.lean     leandb host: many base processes under /bases/<name>/…
-LeanDb/Scaffold.lean leandb new: a standalone base package (path or git require)
-LeanDb/Json.lean     schema/row/error JSON, merge decode
-LeanDb/Base.lean     Base (tables → derived schema, queries, seed), Instance, QueryEntry
-LeanDb/Cli.lean      the CLI driver (CliArg, QueryOut, verbs, serve)
-LeanDb/CliQuery.lean query%                LeanDb/Import.lean  import-sqlite generator
-Tests.lean           engine tests          Main.lean            the leandb executable
-```
-
-Design docs: [`plan.md`](plan.md) (interface spec),
-[`plan-v2.md`](plan-v2.md) (milestones and status),
-[`LEP-0001`](proposals/LEP-0001-database-derived-row-symbols.md)
-(database-derived row symbols for query ergonomics),
-[`LEP-0002`](proposals/LEP-0002-typed-predicate-ir.md)
-(typed predicate IR: `Field` symbols, `Pred ts`, pushdown soundness by theorem — landed),
-[`LEP-0003`](proposals/LEP-0003-nested-values.md)
-(nested values: `EnumSet`, JSON columns with a declared shape, derived columns, inline flatten, child tables),
-[`LEP-0004`](proposals/LEP-0004-child-table-quantifiers.md)
-(`exists`/`forall` over a related table as one pushed `select`),
-[`LEP-0005`](proposals/LEP-0005-configurable-entities.md)
-(configurable entities: modifiers and variants as stored functions over finite types — rule, tabulation, bounds),
-[`claude-discussion.md`](claude-discussion.md) (original design
-discussion), [`leanhttp` implementation plan](proposals/leanhttp-http-client-plan.md)
-(a libcurl-backed HTTP client, so a typed `client%` stub can reach a
-served base directly — implemented as separate sibling projects). Deferred, by
-name: plan re-execution replay (the log stores the plan as data and
-`migrate status` reads its footprint, but nothing re-runs it against a
-candidate schema), the `Query : Type → Type` universe and LEP-0001 row
-symbols, `--output-lean`, `--infer-enums` on import, column-arithmetic
-pushdown, aggregates as a verb, pushed `SortBy`/`LIMIT`, cross-instance
-queries (`ATTACH`).
+See the [source](LeanDb/) and [design proposals](proposals/) for details.

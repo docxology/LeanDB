@@ -346,8 +346,8 @@ into the symbol immediately:
    `log` renders it; `describe` survives as the human form.
 
 Steps 1–2 can merge independently and carry no risk to bases. Step 3 is
-the change; its verification is the existing suite plus every example
-base's transcript reproducing the same SQL in `log`.
+the change; its verification is the existing suite plus example query checks
+that reproduce the same SQL in `log`.
 
 ## Failure behavior
 
@@ -416,7 +416,7 @@ And:
 1. Every existing golden in `Tests.lean` is ported and passes with the same
    rendered SQL.
 2. `gpumarket log` reproduces byte-identical `pushed:` strings for every
-   query in its transcript, including `under` after the projection fix.
+   covered query, including `under` after the projection fix.
 3. The coherence property `(reify p).denote r = p r` holds over the
    fixture entities for every golden, by property test.
 4. `Cli.rowsWhere` rejects an unknown column with a typed error that lists
