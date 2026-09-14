@@ -1,0 +1,116 @@
+date: 2026-09-14T19:09:06Z
+engine_sha: ad8d7f3de883176b7de0b6433cb8cd3fc25a8763
+engine_describe: v0.3.1
+b2t2_pin: fd227efadf532a20aefd25c7a8580978c2d684a2
+lean: Lean (version 4.33.0, arm64-apple-darwin24.6.0, commit d8b18978322de05a8f3dba51ef03cf5461676c17, Release)
+uname: Darwin arm64
+---
+⚠ [22/102] Replayed SQLite.Blob.Classes
+warning: SQLite/Blob/Classes.lean:280:0: `instFromBinaryProd`: universes `u_1`, `u_2` only occur together. This usually means there is a `max` expression in the type where none of these universes appear on their own.
+
+Note: This linter can be disabled with `set_option linter.checkUnivs false`
+⚠ [61/102] Replayed LeanDb.Mcp
+warning: LeanDb/Mcp.lean:39:13: Variable name `b` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _b
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [64/102] Replayed LeanDb.Scaffold
+warning: LeanDb/Scaffold.lean:35:74: `String.get` has been deprecated: Use `String.Pos.Raw.get` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.get` to `String.Pos.Raw.get x`).
+ℹ [72/102] Replayed B2T2Tests
+info: B2T2Tests.lean:41:0: { name := "Bob", age := 12, favoriteColor := "blue" } : Student
+info: B2T2Tests.lean:42:26: failed to synthesize instance of type class
+  OfNat String 12
+numerals are polymorphic in Lean, but the numeral `12` cannot be used in a context where the expected type is
+  String
+due to the absence of the instance above
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+info: B2T2Tests.lean:42:37: Type mismatch
+  "Bob"
+has type
+  String
+but is expected to have type
+  Nat
+info: B2T2Tests.lean:42:0: { name := sorry, age := sorry, favoriteColor := "blue" } : Student
+info: B2T2Tests.lean:45:16: Fields missing: `favoriteColor`
+
+Hint: Add missing fields:
+  ,̲ ̲f̲a̲v̲o̲r̲i̲t̲e̲C̲o̲l̲o̲r̲ ̲:̲=̲ ̲_̲
+info: B2T2Tests.lean:45:0: { name := "Bob", age := 12, favoriteColor := sorry } : Student
+info: B2T2Tests.lean:48:69: `extra` is not a field of structure `Student`
+info: B2T2Tests.lean:48:0: { name := "Bob", age := 12, favoriteColor := "blue" } : Student
+info: B2T2Tests.lean:51:15: overloaded, errors 
+  51:30 Application type mismatch: The argument
+    ("Bob", 12, "blue")
+  has type
+    String × ?m.6 × String
+  but is expected to have type
+    Student
+  in the application
+    LeanDb.insert Student ("Bob", 12, "blue")
+  
+  failed to synthesize instance of type class
+    Insert Type (String × ?m.8 × String)
+  
+  Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+info: B2T2Tests.lean:54:0: fun g => g.midterm : Gradebook → Nat
+info: B2T2Tests.lean:55:40: Invalid field `mid`: The environment does not contain `B2T2.Gradebook.mid`, so it is not possible to project the field `mid` from an expression
+  g
+of type `Gradebook`
+info: B2T2Tests.lean:55:0: fun g => sorry : (g : Gradebook) → ?m.2 g
+info: B2T2Tests.lean:58:0: fun j => j.black && j.white : JellyAnon → Bool
+info: B2T2Tests.lean:59:40: Invalid field `blackAndWhite`: The environment does not contain `B2T2.JellyAnon.blackAndWhite`, so it is not possible to project the field `blackAndWhite` from an expression
+  j
+of type `JellyAnon`
+info: B2T2Tests.lean:59:0: fun j => sorry : (j : JellyAnon) → ?m.2 j
+info: B2T2Tests.lean:62:0: select [Student] (fun r => r.val.favoriteColor == "green") SortBy.preserve
+  (id (Pred.eq (Pred.Col.here Student.Field.favoriteColor) EqOp.eq "green")) : DbM (Array (Rows [Student]))
+info: B2T2Tests.lean:63:42: Type mismatch
+  r.val.favoriteColor
+has type
+  String
+but is expected to have type
+  Bool
+info: B2T2Tests.lean:63:0: select [Student] (fun r => sorry) SortBy.preserve (id (Pred.opaque fun row => sorry)) : DbM (Array (Rows [Student]))
+info: B2T2Tests.lean:66:0: fun j => j.brown : JellyAnon → Bool
+info: B2T2Tests.lean:67:40: Invalid field `color`: The environment does not contain `B2T2.JellyAnon.color`, so it is not possible to project the field `color` from an expression
+  j
+of type `JellyAnon`
+info: B2T2Tests.lean:67:0: fun j => sorry : (j : JellyAnon) → ?m.2 j
+info: B2T2Tests.lean:70:0: select [Student] (fun s => decide (s.val.age ≥ 13)) SortBy.preserve
+  (id (Pred.ord (Pred.Col.here Student.Field.age) OrdOp.ge 13)) : DbM (Array (Rows [Student]))
+info: B2T2Tests.lean:71:32: Application type mismatch: The argument
+  fun g => decide (g.val.quiz1 > 0)
+has type
+  Stored Gradebook → Bool
+but is expected to have type
+  Rows [Student] → Bool
+in the application
+  @select [Student] ?m.3 fun g => decide (g.val.quiz1 > 0)
+info: B2T2Tests.lean:71:0: select [Student] sorry SortBy.preserve (id (Pred.opaque fun row => sorry row)) : DbM (Array (Rows [Student]))
+info: B2T2Tests.lean:74:15: overloaded, errors 
+  failed to synthesize instance of type class
+    Entity Bool
+  
+  Hint: Adding the command `deriving instance LeanDb.Entity for Bool` may allow Lean to derive the missing instance.
+  
+  failed to synthesize instance of type class
+    Insert Type Bool
+  
+  Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+info: B2T2Tests.lean:82:0: fun r => (r.value, r.count) : CountRow → Bool × Nat
+info: B2T2Tests.lean:83:39: Invalid field `true`: The environment does not contain `CountRow.true`, so it is not possible to project the field `true` from an expression
+  r
+of type `CountRow`
+info: B2T2Tests.lean:83:0: fun r => sorry : (r : CountRow) → ?m.2 r
+info: B2T2Tests.lean:84:39: Invalid field `getAcne`: The environment does not contain `CountRow.getAcne`, so it is not possible to project the field `getAcne` from an expression
+  r
+of type `CountRow`
+info: B2T2Tests.lean:84:0: fun r => sorry : (r : CountRow) → ?m.2 r
+Build completed successfully (102 jobs).
+---
+b2t2: fixture, operation, program, and error tests passed

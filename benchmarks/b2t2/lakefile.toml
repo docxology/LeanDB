@@ -1,0 +1,17 @@
+name = "b2t2"
+version = "0.1.0"
+defaultTargets = ["b2t2_tests"]
+
+# Isolated evaluation package. `path` uses the in-repo engine; the
+# measured baseline is LeanDB v0.3.1 at
+# ad8d7f3de883176b7de0b6433cb8cd3fc25a8763 (see BASELINE.md).
+[[require]]
+name = "leandb"
+path = "../.."
+
+[[lean_lib]]
+name = "B2T2"
+
+[[lean_exe]]
+name = "b2t2_tests"
+root = "B2T2Tests"
