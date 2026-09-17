@@ -163,12 +163,42 @@ Commands return JSON. Quote JSON arguments in your shell.
 | `migrate history` / `migrate rollback` | Show migrations or restore the last migration backup. |
 | `backup` / `restore <file>` | Save or restore a database copy. |
 | `log [n]` | Show recent query plans and outcomes. |
+| `log prune <keep>` | Delete older audit entries, keeping the newest count. |
 | `serve` | Serve JSON requests over standard input and output. |
 | `serve --mcp` | Expose tables and queries as MCP tools. |
 | `serve --http <port>` | Serve the same API over HTTP. |
 
 Exit codes: `0` for success, `2` for database errors, `3` for usage errors,
 and `4` for schema or migration history mismatches.
+
+### Audit log storage and migration impact
+
+The audit log is **unbounded by default** and is included in database backups.
+To opt into retention, set `LEANDB_LOG_MAX` to the number of recent entries to
+keep. Pruning runs when the database opens and every `min(128, keep)` logged
+operations on each connection, so a long-running connection can temporarily
+retain up to 127 extra entries. `0` clears existing history at open and disables
+new log entries; `unlimited` preserves all history. Pruning is irreversible
+unless a backup contains the removed entries. It frees SQLite pages for reuse;
+it does not shrink the database file immediately.
+
+For one-off maintenance, `<base> log prune 10000` keeps the newest 10,000
+entries; `log prune 0` clears the log. This changes no retention setting and
+does not delete application rows or migration history.
+
+Migration impact reports inspect the newest **1,000 logged selects** by default.
+Set `LEANDB_LOG_IMPACT_LIMIT` to change the window (`0` skips historical scans).
+The `impact_log` object reports `limit`, `scanned`, `truncated`, and `skipped`.
+`logged_runs` and `unregistered_runs` count only that window, not lifetime use;
+static footprints of registered queries are still checked in full. No plans
+are scanned when there are no changed columns. Successful migration-apply
+responses and already-current schemas do not generate an impact report.
+
+Base authors can set `log := { maxEntries := some 10000, impactLimit := 1000 }`
+on `LeanDb.Base`; library callers can pass the same `LogConfig` to `openDb` or
+`openDbRaw`. Environment settings override those defaults at connection open,
+including after restore. Counts must be nonnegative integers below
+`9223372036854775807`; invalid settings fail before the database is opened.
 
 ## Examples
 

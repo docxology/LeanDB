@@ -135,6 +135,9 @@ structure Base where
   /-- Modules a generated migration imports to see the head entity
       types; empty = `[<module>.Entities]`. -/
   freezeImports : List String := []
+  /-- Audit retention and migration impact budget; environment settings
+      override these defaults when a connection opens. -/
+  log : LogConfig := {}
 
 /-- Dedup by table name (first occurrence wins) and order so that every
     foreign-key target precedes its referrer. The sort is stable: among

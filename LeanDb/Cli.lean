@@ -100,6 +100,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "query <name> [args...]"] ++
       (if b.seed.isSome then #[Json.str "seed"] else #[]) ++ #[
       Json.str "log [limit]",
+      Json.str "log prune <keep>  (delete older audit entries; 0 clears the log)",
       Json.str "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit] | freeze [--module M]",
       Json.str "backup  (full copy under <instance dir>/backups)",
       Json.str "restore <file>",
@@ -164,6 +165,13 @@ private def command (b : Base) : List String → Except String (DbM Json)
       pure ((← table? b t).updateJson (← parseId i) (← parseJson j))
   | ["delete", t, i] => do pure ((← table? b t).deleteRow (← parseId i))
   | ["log"] => .ok (logJson 50)
+  | ["log", "prune", n] => do
+      let some keep := n.toNat? | throw s!"expected a retention count, got {String.quote n}"
+      if keep >= Int64.maxValue.toNatClampNeg then throw "log retention count is out of range"
+      pure (do
+        let deleted ← pruneLog keep
+        return Json.mkObj [("ok", Json.bool true), ("deleted", Lean.toJson deleted),
+          ("keep", Lean.toJson keep)])
   | ["log", n] => do
       let some limit := n.toNat? | throw s!"expected a limit, got {String.quote n}"
       pure (logJson limit)
@@ -217,7 +225,7 @@ private def gateOf (b : Base) (conn : Conn) : IO (Option DbError) := do
 def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := do
   if let some parent := inst.path.parent then
     IO.FS.createDirAll parent
-  match ← openDbRaw inst.path with
+  match ← openDbRaw inst.path b.log with
   | .error e => return .error e
   | .ok conn =>
       let gate ← IO.mkRef (← gateOf b conn)
@@ -260,7 +268,7 @@ private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : Sys
     IO.FS.rename tmp inst.path
   catch e =>
     return .error (.sqlite s!"restore failed: {e}")
-  match ← openDbRaw inst.path with
+  match ← openDbRaw inst.path b.log with
   | .error e => return .error e
   | .ok conn =>
       sess.conn.set conn
@@ -386,8 +394,13 @@ def changedColumns (old new : List TableSpec) : List (String × String) := Id.ru
 
 /-- Which registered queries (by their static footprints) and which logged
     runs (by the footprints the log recorded) a change touches. -/
-private def impactJson (b : Base) (conn : Conn) (changed : List (String × String)) : IO (Json × Json) := do
-  let logged ← logFootprints conn 100000
+private def impactJson (b : Base) (conn : Conn) (changed : List (String × String)) : IO (Json × Json × Json) := do
+  let limit := conn.logConfig.impactLimit
+  let skipped := changed.isEmpty || limit == 0
+  let scan ← if skipped then pure ({} : LogFootprintScan) else scanLogFootprints conn limit
+  let logged := scan.entries
+  let window := Json.mkObj [("limit", Lean.toJson limit), ("scanned", Lean.toJson logged.size),
+    ("truncated", Json.bool scan.truncated), ("skipped", Json.bool skipped)]
   let runsOf := fun (name : String) =>
     logged.foldl (init := 0) fun n (q, cols) =>
       if q == some name && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
@@ -404,7 +417,7 @@ private def impactJson (b : Base) (conn : Conn) (changed : List (String × Strin
   -- logged selects outside any registered query (scripts, other programs)
   let anonymous := logged.foldl (init := 0) fun n (q, cols) =>
     if q.isNone && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
-  return (Json.arr items, Lean.toJson anonymous)
+  return (Json.arr items, Lean.toJson anonymous, window)
 
 private def changedJson (changed : List (String × String)) : Json :=
   Json.arr (changed.map fun (t, c) => Json.str s!"{t}.{c}").toArray
@@ -453,12 +466,13 @@ private def chainMigrate (b : Base) (inst : Instance) (sess : Session) (c : Chai
                 describes := describes.push (Json.str s!"V{v}: {d}")
       prev := m.snapshot
     let changed := changedColumns ((c.at? k).getD []) c.head
-    let (impact, anonymous) ← impactJson b conn changed
+    let (impact, anonymous, window) ← impactJson b conn changed
     return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
       ("instance_version", Lean.toJson k), ("head_version", Lean.toJson c.headVersion),
       ("steps", Json.arr describes), ("destructive", Json.bool destructive),
       ("notes", Json.arr (notes.map Json.str)), ("pending", Json.arr items),
-      ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
+      ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous),
+      ("impact_log", window)]
   -- apply, one migration per transaction, each after its own backup
   let mut applied : Array Json := #[]
   let mut prev := (c.at? k).getD []
@@ -568,12 +582,13 @@ where
             let plan := plan?.getD {}
             let old ← readStoredSchema conn
             let changed := changedColumns (old.getD []) b.specs
-            let (impact, anonymous) ← impactJson b conn changed
+            let (impact, anonymous, window) ← impactJson b conn changed
             return Json.mkObj [("ok", Json.bool true),
               ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
               ("destructive", Json.bool plan.isDestructive),
               ("notes", Json.arr (plan.notes.map Json.str).toArray),
-              ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
+              ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous),
+              ("impact_log", window)]
 
 /-- The one place argv meets an open instance: every transport (one-shot
     CLI, JSON-lines `serve`, and the servers built on it) sends argv here
