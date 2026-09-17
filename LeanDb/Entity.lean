@@ -220,10 +220,17 @@ def childDecodeError (table : String) (msg : String) : DbError :=
       .decode table sub (String.intercalate ": " rest)
   | _ => .decode table "*" msg
 
-/-- A column value as a SQL literal (for `DEFAULT` clauses). -/
+/-- A column value as a SQL literal (for `DEFAULT` clauses). REAL values
+    render exactly (`renderRealExact`): `toString` would print six decimals
+    and silently record a different default. A non-finite REAL has no SQL
+    literal — `validateSchema` refuses it before any DDL is built, so
+    meeting one here is a caller bug; panic rather than emit invalid SQL. -/
 def Col.sqlLit : Col → String
   | .int v => toString v
-  | .real v => toString v
+  | .real v =>
+      match renderRealExact v with
+      | .ok s => s
+      | .error msg => panic! msg
   | .text v => "'" ++ (v.replace "'" "''") ++ "'"
   | .null => "NULL"
 
@@ -288,6 +295,10 @@ def validateSchema (specs : List TableSpec) : Except DbError Unit := do
       if let some target := col.fkTable then
         unless tableNames.contains target do
           throw (.schemaInvalid s!"{spec.name}.{col.name} references missing table {String.quote target}")
+      if let some (.real v) := col.dflt then
+        unless v.isFinite do
+          throw (.schemaInvalid s!"{spec.name}.{col.name}: REAL default is not finite \
+(NaN and infinities have no exact SQL literal)")
       if let some vs := col.enumSet then
         if vs.size > EnumSet.maxVariants then
           throw (.schemaInvalid s!"{spec.name}.{col.name}: closed world has {vs.size} variants; \

@@ -168,6 +168,63 @@ private def testDefaults : IO Unit := do
     fun j => (rowOfJson Draft j).toOption
   check (d2.map (·.note == none) == some true) "explicit null beats a default"
 
+/-- Parse a rendered REAL literal back through SQLite itself — the actual
+    consumer of a DDL DEFAULT. (`String.toFloat?` does not exist on this
+    toolchain, and SQLite's parser is the one that matters here.) -/
+private def sqliteReal (lit : String) : IO (Option Float) := do
+  let db ← SQLite.open ":memory:"
+  let stmt ← db.prepare s!"SELECT ({lit})"
+  if ← stmt.step then return some (← stmt.columnDouble 0) else return none
+
+private def testRealLiterals : IO Unit := do
+  -- Float.toString prints six decimals (printf %f): every value here was
+  -- silently misrecorded in DDL defaults and frozen snapshots (issue #34)
+  let vals : List Float := [0.1, 1/3, 1e-300, 5e-7, 1e300, -0.0, 123456.789012345, 0.000001]
+  for v in vals do
+    match renderRealExact v with
+    | .error m => throw <| IO.userError s!"FAIL: {v} must render exactly, got error: {m}"
+    | .ok lit =>
+        match ← sqliteReal lit with
+        | some back => check (back == v) s!"exact REAL literal {lit} must round-trip to {v}, got {back}"
+        | none => throw <| IO.userError s!"FAIL: no row for literal {lit}"
+  -- a tiny REAL default must survive the DDL, not collapse to 0.000000
+  let tiny : TableSpec :=
+    ⟨"tiny", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
+                 dflt := some (.real 1e-300) }]⟩
+  let ddl := tiny.ddl
+  let some lit := (renderRealExact 1e-300).toOption
+    | throw <| IO.userError "FAIL: 1e-300 must render exactly"
+  -- the default token in the DDL is the exact literal, not a six-decimal
+  -- rounding of it (`DEFAULT 0.000000` is what Float.toString used to emit)
+  let defaultTok := ((((ddl.splitOn "DEFAULT ").getD 1 "").splitOn ",").getD 0 "").splitOn ")" |>.getD 0 ""
+  check (defaultTok == lit) s!"DDL default must be the exact literal, got {defaultTok}"
+  -- the DDL is executable and the stored default is the exact value
+  let db ← SQLite.open ":memory:"
+  db.exec ddl
+  db.exec "INSERT INTO tiny DEFAULT VALUES"
+  let stmt ← db.prepare "SELECT ratio FROM tiny"
+  if ← stmt.step then
+    check ((← stmt.columnDouble 0) == 1e-300) "the stored REAL default is the exact value"
+  else throw <| IO.userError "FAIL: default insert produced no row"
+  -- a frozen snapshot carries the exact literal too (Render.colLit)
+  let snap := Render.specsLit [tiny]
+  check ((snap.splitOn s!"LeanDb.Col.real ({lit})").length == 2)
+    s!"frozen snapshot must carry the exact literal, got {snap}"
+  check (Render.colLit (.real 5e-7) != "LeanDb.Col.real (0.000000)")
+    "a sub-microscopic REAL must not render as the six-decimal rounding 0.000000"
+  -- non-finite REAL defaults are refused loudly, not rendered as inf/NaN
+  let bad (v : Float) : TableSpec :=
+    ⟨"bad", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
+                dflt := some (.real v) }]⟩
+  match validateSchema [bad (1.0/0.0)] with
+  | .error (.schemaInvalid msg) =>
+      check ((msg.splitOn "bad.ratio").length == 2) s!"refusal must name table and column, got {msg}"
+  | _ => throw <| IO.userError "FAIL: an infinite REAL default must be refused"
+  match validateSchema [bad (0.0/0.0)] with
+  | .error _ => pure ()
+  | .ok _ => throw <| IO.userError "FAIL: a NaN REAL default must be refused"
+
+
 private def testClosedEnum : IO Unit := do
   check (roundtrip Status.inProgress && roundtrip Status.done) "closed enum roundtrip"
   check ((fromCol (α := Status) (.text "cancelled")).isOk == false)
@@ -2977,6 +3034,7 @@ def main : IO UInt32 := do
   testCoherence
   testClosedEnum
   testDefaults
+  testRealLiterals
   testJson
   testEndToEnd
   testClosedEndToEnd
