@@ -3136,11 +3136,19 @@ private def testRowsLimitPushdown : IO Unit := do
   let capped ← withDb rowsDbPath schema do fetchFiltered (α := Author) (ts := [Author]) .tt (some 3)
   check ((← expectOk capped "capped fetch").size == 3) "the cap bounds the fetch"
 
+private def testModuleNameOk : IO Unit := do
+  for s in ["Tickets", "tickets", "A.B.C", "_Private", "M1.Migrations", "a_b'c"] do
+    check (Freeze.moduleNameOk s) s!"a plain dotted identifier is accepted: {s}"
+  for s in ["/tmp/pwn", "../pwn", "a/b", "..", "a..b", "a./x", "1foo",
+            "a b", "a-/x", "a\nb", "", ".", "a.", ".a", "a b.Migrations"] do
+    check (!Freeze.moduleNameOk s) s!"a non-identifier module is refused: {s}"
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
   testRowsLimitPushdown
   testPortOf
+  testModuleNameOk
   testHttpBodyLimits
   testCodecs
   testBaseSpecs

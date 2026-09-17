@@ -520,7 +520,18 @@ private def freezeJson (b : Base) (flags : List String) : IO Json := do
       let module := module?.getD b.module
       if module.isEmpty then
         return usageErr "freeze needs the base's Lean module: set `module` on the base or pass --module <Module>"
-      let t := Freeze.Target.ofModule module (if imports.isEmpty then b.freezeImports else imports)
+      let imports := if imports.isEmpty then b.freezeImports else imports
+      -- the module and import names become the write target and the
+      -- generated source itself; anything that is not a plain dotted
+      -- identifier must be refused before any IO (a `/` or `..` would
+      -- write outside the package, newlines or comment tokens would
+      -- inject source into the generated files)
+      unless Freeze.moduleNameOk module do
+        return usageErr s!"--module {String.quote module} is not a plain dotted Lean identifier"
+      for i in imports do
+        unless Freeze.moduleNameOk i do
+          return usageErr s!"--imports {String.quote i} is not a plain dotted Lean identifier"
+      let t := Freeze.Target.ofModule module imports
       let cur := b.specs
       -- freeze renders the schema as source (DDL defaults, snapshot
       -- literals); an invalid schema — e.g. a non-finite REAL default,
