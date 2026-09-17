@@ -2968,9 +2968,17 @@ private def testPortOf : IO Unit := do
   for s in ["0", "65536", "70000", "-1", "oops", ""] do
     check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
 
+private def testModuleNameOk : IO Unit := do
+  for s in ["Tickets", "tickets", "A.B.C", "_Private", "M1.Migrations", "a_b'c"] do
+    check (Freeze.moduleNameOk s) s!"a plain dotted identifier is accepted: {s}"
+  for s in ["/tmp/pwn", "../pwn", "a/b", "..", "a..b", "a./x", "1foo",
+            "a b", "a-/x", "a\nb", "", ".", "a.", ".a", "a b.Migrations"] do
+    check (!Freeze.moduleNameOk s) s!"a non-identifier module is refused: {s}"
+
 def main : IO UInt32 := do
   testCliLimits
   testPortOf
+  testModuleNameOk
   testHttpBodyLimits
   testCodecs
   testBaseSpecs
