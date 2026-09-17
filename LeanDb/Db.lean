@@ -12,14 +12,43 @@ Backed by `leansqlite` (bundled SQLite). SQL text appears only in this file
 — it is the compilation target of the typed layer, never its interface.
 -/
 
+/-- Audit history is retained unless pruning is explicitly enabled. Impact
+    reports inspect only the newest `impactLimit` logged selects. -/
+structure LogConfig where
+  maxEntries : Option Nat := none
+  impactLimit : Nat := 1000
+  deriving Repr
+
+/-- Environment settings override the base's policy. Zero retains no logs
+    (or skips historical impact scanning); `unlimited` disables retention. -/
+def LogConfig.ofSettings (config : LogConfig) (maxEntries impactLimit : Option String) :
+    Except String LogConfig := do
+  let parse := fun (name s : String) => do
+    let some n := s.toNat? | throw s!"{name} must be a nonnegative integer"
+    if n >= Int64.maxValue.toNatClampNeg then throw s!"{name} is out of range"
+    pure n
+  let maxEntries ← match maxEntries with
+    | none => pure config.maxEntries
+    | some "unlimited" => pure none
+    | some s => some <$> parse "LEANDB_LOG_MAX" s
+  let impactLimit ← match impactLimit with
+    | none => pure config.impactLimit
+    | some s => parse "LEANDB_LOG_IMPACT_LIMIT" s
+  if maxEntries.any (· >= Int64.maxValue.toNatClampNeg) || impactLimit >= Int64.maxValue.toNatClampNeg then
+    throw "log limits must be smaller than Int64.maxValue"
+  return { maxEntries, impactLimit }
+
 structure Conn where
   raw : SQLite
   /-- The registered query being run, if any: `query <name>` sets it so
       the log can attribute the plans it records. -/
   queryName : IO.Ref (Option String)
+  logConfig : LogConfig := {}
+  /-- Writes since the last retention pass on this connection. -/
+  logWrites : IO.Ref Nat
 
-def Conn.ofRaw (raw : SQLite) : IO Conn := do
-  return { raw, queryName := ← IO.mkRef none }
+def Conn.ofRaw (raw : SQLite) (logConfig : LogConfig := {}) : IO Conn := do
+  return { raw, queryName := ← IO.mkRef none, logConfig, logWrites := ← IO.mkRef 0 }
 
 /-- The database monad: a connection, typed errors, IO. -/
 abbrev DbM := ReaderT Conn (ExceptT DbError IO)
@@ -34,6 +63,22 @@ private def sqliteWith (onErr : IO.Error → DbError) (act : SQLite → IO α) :
 
 private def sqlite (act : SQLite → IO α) : DbM α :=
   sqliteWith (fun e => .sqlite (toString e)) act
+
+/-- Keep the newest N entries, including when ids have gaps. The OFFSET
+    scan runs only at open or at a retention batch boundary, not per verb. -/
+private def pruneLogRaw (db : SQLite) (keep : Nat) : IO Nat := do
+  if keep >= Int64.maxValue.toNatClampNeg then
+    throw <| IO.userError "log retention limit is out of range"
+  if keep == 0 then
+    db.exec "DELETE FROM _leandb_log"
+  else
+    let stmt ← db.prepare "DELETE FROM _leandb_log WHERE id <= (SELECT id FROM _leandb_log ORDER BY id DESC LIMIT 1 OFFSET ?)"
+    stmt.bindInt64 1 (Int64.ofNat keep)
+    stmt.exec
+  return (← db.changes).toNatClampNeg
+
+/-- Explicitly prune audit history without changing the connection's policy. -/
+def pruneLog (keep : Nat) : DbM Nat := sqlite (pruneLogRaw · keep)
 
 private def hasSub (s sub : String) : Bool := (s.splitOn sub).length > 1
 
@@ -84,9 +129,15 @@ def bindCol (stmt : SQLite.Stmt) (idx : Int32) : Col → IO Unit
          column the write fails with a misleading constraint error, and
          against a nullable one it "succeeds" but the value silently
          reads back `none`. Refuse it at the write boundary instead —
-         a NaN has no SQLite representation that survives a round trip. -/
-      if v.isNaN then
-        throw <| IO.userError "REAL value is NaN (SQLite stores NaN as NULL; the value would not survive a round trip)"
+         a NaN has no SQLite representation that survives a round trip.
+         The same refusal covers the infinities: they bind and store,
+         but every JSON surface renders them as the *strings*
+         "Infinity"/"-Infinity", so the column stops being a REAL the
+         moment it is read back as JSON (see `Col.fromJson`). A REAL
+         value that cannot round-trip as a REAL is refused at the
+         boundary. -/
+      if v.isNaN || v.isInf then
+        throw <| IO.userError s!"REAL value is {if v.isNaN then "NaN" else "infinite"} (it has no SQLite representation that survives a round trip as a REAL)"
       else stmt.bindFloat idx v
   | .null => stmt.bindNull idx
 
@@ -137,6 +188,7 @@ def DbM.ofExcept (r : Except DbError α) : DbM α :=
 /-- Append to `_leandb_log`. Best-effort: the log never fails an operation. -/
 private def logOp (verb detail : String) (ok : Bool) (error : Option String) (rows : Nat)
     (plan : Option String) : DbM Unit := fun conn => ExceptT.mk do
+  if conn.logConfig.maxEntries == some 0 then return .ok ()
   try
     let query ← conn.queryName.get
     let stmt ← conn.raw.prepare
@@ -155,6 +207,14 @@ private def logOp (verb detail : String) (ok : Bool) (error : Option String) (ro
     | some q => stmt.bindText 7 q
     | none => stmt.bindNull 7
     stmt.exec
+    if let some keep := conn.logConfig.maxEntries then
+      let writes := (← conn.logWrites.get) + 1
+      conn.logWrites.set writes
+      -- Bound steady-state growth without scanning the retention window
+      -- after every operation. Small windows get proportionally smaller batches.
+      if writes >= min 128 (max 1 keep) then
+        discard <| pruneLogRaw conn.raw keep
+        conn.logWrites.set 0
     return .ok ()
   catch _ => return .ok ()
 
@@ -380,14 +440,22 @@ def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.table
     (`Pred.forTable`), and a quantifier among them needs the alias to
     correlate its subquery with the outer row. Callers pass an opaque-free
     tree (`Pred.approx`). -/
-def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts) :
-    DbM (Array (Stored α)) := do
-  if pred.isTrivial then return ← fetchAll α
+def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts)
+    (limit : Option Nat := none) : DbM (Array (Stored α)) := do
+  if pred.isTrivial && limit.isNone then return ← fetchAll α
   let (whereSql, binds) := pred.render fun _ => "t0"
-  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id"
+  -- a caller-supplied cap ships to SQL as a bound parameter, so the
+  -- fetch (and the child-list attachment under it) is bounded by the
+  -- cap, not by the table (issue: `rows --limit` never reached SQL)
+  let limitBind : Array LeanDb.Col := match limit with
+    | some n => #[LeanDb.Col.int (Int64.ofNat n)]
+    | none => #[]
+  let limitSql := match limit with | some _ => " LIMIT ?" | none => ""
+  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id{limitSql}"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 binds
+    bindCols stmt (binds.size + 1) limitBind
     let mut out := #[]
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
@@ -655,7 +723,11 @@ FROM _leandb_migrations ORDER BY idx DESC LIMIT ?"
     or applied. A server holds a connection opened this way so it can
     answer `version`/`migrate` on a drifted instance; `Conn.verify` is the
     step that admits the base's verbs. -/
-def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
+def openDbRaw (path : System.FilePath) (logConfig : LogConfig := {}) : IO (Except DbError Conn) := do
+  let logConfig ← match logConfig.ofSettings (← IO.getEnv "LEANDB_LOG_MAX")
+      (← IO.getEnv "LEANDB_LOG_IMPACT_LIMIT") with
+    | .ok config => pure config
+    | .error m => return .error (.sqlite s!"invalid log configuration: {m}")
   try
     let db ← SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
@@ -664,7 +736,9 @@ def openDbRaw (path : System.FilePath) : IO (Except DbError Conn) := do
     db.exec migrationsDdl
     ensureColumns db "_leandb_migrations" journalColumns
     ensureColumns db "_leandb_log" logColumns
-    return .ok (← Conn.ofRaw db)
+    db.exec "CREATE INDEX IF NOT EXISTS _leandb_log_select_id ON _leandb_log(id DESC) WHERE verb = 'select' AND plan IS NOT NULL"
+    if let some keep := logConfig.maxEntries then discard <| pruneLogRaw db keep
+    return .ok (← Conn.ofRaw db logConfig)
   catch e =>
     return .error (.sqlite (toString e))
 
@@ -681,7 +755,23 @@ def Conn.verify (conn : Conn) (specs : List TableSpec) (initialVersion : Nat := 
     | some stored =>
         if stored != fp then
           return .error (.schemaMismatch fp stored)
-    | none => pure ()
+    | none =>
+        -- a file with no fingerprint meta was not created by this engine.
+        -- Stamping the base's fingerprint onto a foreign file whose
+        -- physical tables contradict `specs` would make the metadata lie
+        -- (later verbs fail with raw SQL errors instead of a typed
+        -- mismatch, and `migrate` plans from a phantom baseline), so a
+        -- first open of a file that already carries user tables is
+        -- refused by name. Empty files (and files this engine's own DDL
+        -- has just created) pass.
+        let stmt ← db.prepare
+          "SELECT name FROM sqlite_master WHERE type = 'table' \
+AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_leandb\\_%' ESCAPE '\\'"
+        if ← stmt.step then
+          let existing ← stmt.columnText 0
+          return .error (.migrate s!"the file already carries tables (first: {String.quote existing}) \
+but records no LeanDB schema: it was not created by this base. Adopt it with \
+`leandb import-sqlite` instead of opening it as this base's instance")
     for spec in specs do
       db.exec spec.ddl
     -- Drift scan: stored closed-world values must still be in the vocabulary.
@@ -714,8 +804,8 @@ def Conn.verify (conn : Conn) (specs : List TableSpec) (initialVersion : Nat := 
 /-- Open (creating if absent) an instance for the given schema: `openDbRaw`
     then `Conn.verify`. Refuses to open an instance whose fingerprint
     disagrees with the code's. -/
-def openDb (path : System.FilePath) (specs : List TableSpec) : IO (Except DbError Conn) := do
-  match ← openDbRaw path with
+def openDb (path : System.FilePath) (specs : List TableSpec) (logConfig : LogConfig := {}) : IO (Except DbError Conn) := do
+  match ← openDbRaw path logConfig with
   | .error e => return .error e
   | .ok conn =>
       match ← conn.verify specs with
@@ -749,15 +839,22 @@ def readLog (limit : Nat) : DbM (Array Lean.Json) := sqlite fun db => do
     else break
   return out
 
-/-- Logged selects, newest first: `(query name, footprint columns)` — what
-    `migrate status` scans to say which recorded runs a change touches. -/
-def logFootprints (conn : Conn) (limit : Nat) : IO (Array (Option String × List (String × String))) := do
+structure LogFootprintScan where
+  entries : Array (Option String × List (String × String)) := #[]
+  truncated : Bool := false
+
+/-- Inspect at most `limit` plans and probe one extra row without parsing
+    its JSON, so callers can disclose that older history was excluded. -/
+def scanLogFootprints (conn : Conn) (limit : Nat) : IO LogFootprintScan := do
+  if limit >= Int64.maxValue.toNatClampNeg then
+    throw <| IO.userError "log impact limit is out of range"
   let stmt ← conn.raw.prepare
     "SELECT query, plan FROM _leandb_log WHERE verb = 'select' AND plan IS NOT NULL ORDER BY id DESC LIMIT ?"
-  stmt.bindInt64 1 (Int64.ofNat limit)
+  stmt.bindInt64 1 (Int64.ofNat (limit + 1))
   let mut out := #[]
   repeat
     if ← stmt.step then
+      if out.size == limit then return { entries := out, truncated := true }
       let q ← (do if (← stmt.columnType 0) == .null then pure none else some <$> stmt.columnText 0)
       let plan := (Lean.Json.parse (← stmt.columnText 1)).toOption.getD Lean.Json.null
       let cols := ((plan.getObjVal? "footprint" >>= (·.getObjValAs? (Array String) "columns")).toOption.getD #[]).toList
@@ -767,7 +864,11 @@ def logFootprints (conn : Conn) (limit : Nat) : IO (Array (Option String × List
         | _ => none
       out := out.push (q, pairs)
     else break
-  return out
+  return { entries := out }
+
+/-- Logged selects, newest first: `(query name, footprint columns)`. -/
+def logFootprints (conn : Conn) (limit : Nat) : IO (Array (Option String × List (String × String))) := do
+  return (← scanLogFootprints conn limit).entries
 
 /-- Open, run, and report — the whole lifecycle for scripts and tests. -/
 def withDb (path : System.FilePath) (specs : List TableSpec) (act : DbM α) :

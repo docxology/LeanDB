@@ -168,6 +168,63 @@ private def testDefaults : IO Unit := do
     fun j => (rowOfJson Draft j).toOption
   check (d2.map (·.note == none) == some true) "explicit null beats a default"
 
+/-- Parse a rendered REAL literal back through SQLite itself — the actual
+    consumer of a DDL DEFAULT. (`String.toFloat?` does not exist on this
+    toolchain, and SQLite's parser is the one that matters here.) -/
+private def sqliteReal (lit : String) : IO (Option Float) := do
+  let db ← SQLite.open ":memory:"
+  let stmt ← db.prepare s!"SELECT ({lit})"
+  if ← stmt.step then return some (← stmt.columnDouble 0) else return none
+
+private def testRealLiterals : IO Unit := do
+  -- Float.toString prints six decimals (printf %f): every value here was
+  -- silently misrecorded in DDL defaults and frozen snapshots (issue #34)
+  let vals : List Float := [0.1, 1/3, 1e-300, 5e-7, 1e300, -0.0, 123456.789012345, 0.000001]
+  for v in vals do
+    match renderRealExact v with
+    | .error m => throw <| IO.userError s!"FAIL: {v} must render exactly, got error: {m}"
+    | .ok lit =>
+        match ← sqliteReal lit with
+        | some back => check (back == v) s!"exact REAL literal {lit} must round-trip to {v}, got {back}"
+        | none => throw <| IO.userError s!"FAIL: no row for literal {lit}"
+  -- a tiny REAL default must survive the DDL, not collapse to 0.000000
+  let tiny : TableSpec :=
+    ⟨"tiny", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
+                 dflt := some (.real 1e-300) }]⟩
+  let ddl := tiny.ddl
+  let some lit := (renderRealExact 1e-300).toOption
+    | throw <| IO.userError "FAIL: 1e-300 must render exactly"
+  -- the default token in the DDL is the exact literal, not a six-decimal
+  -- rounding of it (`DEFAULT 0.000000` is what Float.toString used to emit)
+  let defaultTok := ((((ddl.splitOn "DEFAULT ").getD 1 "").splitOn ",").getD 0 "").splitOn ")" |>.getD 0 ""
+  check (defaultTok == lit) s!"DDL default must be the exact literal, got {defaultTok}"
+  -- the DDL is executable and the stored default is the exact value
+  let db ← SQLite.open ":memory:"
+  db.exec ddl
+  db.exec "INSERT INTO tiny DEFAULT VALUES"
+  let stmt ← db.prepare "SELECT ratio FROM tiny"
+  if ← stmt.step then
+    check ((← stmt.columnDouble 0) == 1e-300) "the stored REAL default is the exact value"
+  else throw <| IO.userError "FAIL: default insert produced no row"
+  -- a frozen snapshot carries the exact literal too (Render.colLit)
+  let snap := Render.specsLit [tiny]
+  check ((snap.splitOn s!"LeanDb.Col.real ({lit})").length == 2)
+    s!"frozen snapshot must carry the exact literal, got {snap}"
+  check (Render.colLit (.real 5e-7) != "LeanDb.Col.real (0.000000)")
+    "a sub-microscopic REAL must not render as the six-decimal rounding 0.000000"
+  -- non-finite REAL defaults are refused loudly, not rendered as inf/NaN
+  let bad (v : Float) : TableSpec :=
+    ⟨"bad", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
+                dflt := some (.real v) }]⟩
+  match validateSchema [bad (1.0/0.0)] with
+  | .error (.schemaInvalid msg) =>
+      check ((msg.splitOn "bad.ratio").length == 2) s!"refusal must name table and column, got {msg}"
+  | _ => throw <| IO.userError "FAIL: an infinite REAL default must be refused"
+  match validateSchema [bad (0.0/0.0)] with
+  | .error _ => pure ()
+  | .ok _ => throw <| IO.userError "FAIL: a NaN REAL default must be refused"
+
+
 private def testClosedEnum : IO Unit := do
   check (roundtrip Status.inProgress && roundtrip Status.done) "closed enum roundtrip"
   check ((fromCol (α := Status) (.text "cancelled")).isOk == false)
@@ -1189,6 +1246,29 @@ private def testNanReal : IO Unit := do
     return (← select [Book] (fun _ => true)).size
   check ((← expectOk count "rows after the refused NaN write") == 0)
     "nothing was stored for the refused write"
+
+private def testInfReal : IO Unit := do
+  if ← nanDbPath.pathExists then IO.FS.removeFile nanDbPath
+  -- the bind boundary refuses infinities like NaN (issue: Infinity
+  -- binds, stores, and then leaves every JSON surface as the string
+  -- "Infinity")
+  let r ← withDb nanDbPath schema do
+    discard <| insert Author ⟨"Ada", 36⟩
+    discard <| insert Book ⟨"Inf", ⟨1⟩, some (1.0 / 0.0)⟩
+  expectErr r "sqlite" "Infinity into a REAL column is refused at the bind boundary"
+  -- the JSON decode boundary refuses non-finite REALs too (a raw 1e999
+  -- overflows to inf; Lean renders non-finite floats as strings, so the
+  -- column would stop being a REAL the moment it is read back)
+  let realSpec := (Entity.spec Book).columns.getD 2 default
+  check (((Col.fromJson realSpec (Lean.Json.num 1e999)).toOption.map (·.describe)) == none)
+    "a JSON 1e999 for a REAL column is refused"
+  check (((Col.fromJson realSpec (Lean.Json.str "Infinity")).isOk == false)
+    && ((Col.fromJson realSpec (Lean.Json.str "-Infinity")).isOk == false))
+    "the Infinity strings are not REALs"
+  check (((fromCol (α := Float) (.real (1.0 / 0.0))).isOk == false)
+    && ((fromCol (α := Float) (.real (0.0 / 0.0))).isOk == false))
+    "the Float codec refuses non-finite stored values"
+
 
 /-! ## Importer: what it reports as not carried (§5.3 — partial support is
 fine, *silent* partiality is not). `planOf` is pure, so this drives it
@@ -2769,6 +2849,63 @@ private def testSession : IO Unit := do
   check ((rs.getObjValAs? Bool "in_sync").toOption == some true) "restore of a current backup stays in sync"
   check ((← b.handle inst sess ["rows", "author"] |>.map code) == "") "verbs admitted after restore"
 
+/-! ## Restore safety: a bad source is refused before the instance is touched
+
+Issue #25: `restore` used to overwrite the instance before validating the
+source, destroying user data on failure and leaving the session silently
+serving an empty in-memory database. -/
+
+structure Probe where
+  label : String
+  deriving Repr, LeanDb.Entity
+
+private def restoreDbPath : System.FilePath := ".lake" / "leandb_test_restore.sqlite"
+
+private def testRestoreSafety : IO Unit := do
+  if ← restoreDbPath.pathExists then IO.FS.removeFile restoreDbPath
+  let garbage : System.FilePath := ".lake" / "leandb_test_restore_garbage.txt"
+  IO.FS.writeFile garbage "dear instance, I am not a database"
+  let dir : System.FilePath := ".lake" / "leandb_test_restore_dir"
+  unless ← dir.pathExists do IO.FS.createDir dir
+  -- the magic check, pure: text, a truncated header, the real magic
+  check (!Cli.Restore.headerOk "definitely not sqlite".toUTF8) "magic check rejects text"
+  check (!Cli.Restore.headerOk "SQLite format 3".toUTF8) "magic check rejects a truncated header"
+  check (Cli.Restore.headerOk Cli.Restore.magic) "magic check accepts the magic"
+  discard <| expectOk (← withDb restoreDbPath [Entity.spec Probe] (pure ()))
+    "create the restore probe"
+  let head ← IO.FS.readBinFile restoreDbPath
+  check (Cli.Restore.headerOk (head.extract 0 16)) "a real instance carries the magic header"
+  let b : Base := { name := "r", tables := [CliTable.of Probe] }
+  let inst := Instance.ofPath restoreDbPath
+  let sess ← expectOk (← Cli.Session.open b inst) "open the probe"
+  discard <| b.handle inst sess ["insert", "probe", "{\"label\":\"keep\"}"]
+  let before ← IO.FS.readBinFile restoreDbPath
+  -- a garbage source: refused with a typed error, the live session and
+  -- the instance file untouched
+  let refused ← b.handle inst sess ["restore", garbage.toString]
+  check ((refused.getObjValAs? Bool "ok").toOption == some false) s!"garbage restore refused: {refused}"
+  check ((refused.getObjValAs? String "code").toOption == some "migrate")
+    s!"garbage restore is a typed migrate error: {refused}"
+  let rows ← b.handle inst sess ["rows", "probe"]
+  check ((rows.getObjValAs? Nat "count").toOption == some 1) s!"session still serves the live data: {rows}"
+  check ((← IO.FS.readBinFile restoreDbPath) == before) "garbage restore left the instance file untouched"
+  -- a directory as source: refused the same way
+  let refusedDir ← b.handle inst sess ["restore", dir.toString]
+  check ((refusedDir.getObjValAs? Bool "ok").toOption == some false)
+    s!"directory restore refused: {refusedDir}"
+  let rowsDir ← b.handle inst sess ["rows", "probe"]
+  check ((rowsDir.getObjValAs? Nat "count").toOption == some 1)
+    "session still serves the live data after a directory source"
+  check ((← IO.FS.readBinFile restoreDbPath) == before) "directory restore left the instance file untouched"
+  -- the happy path is unchanged: backup, insert more, restore back
+  let bk ← b.handle inst sess ["backup"]
+  let bkPath := (bk.getObjValAs? String "backup").toOption.getD ""
+  discard <| b.handle inst sess ["insert", "probe", "{\"label\":\"extra\"}"]
+  let rs ← b.handle inst sess ["restore", bkPath]
+  check ((rs.getObjValAs? Bool "ok").toOption == some true) s!"restore of a valid backup succeeds: {rs}"
+  let rows ← b.handle inst sess ["rows", "probe"]
+  check ((rows.getObjValAs? Nat "count").toOption == some 1) "the restored instance holds the backup's rows"
+
 /-! ## Chains: a typed transform carries rows the mechanical diff refuses -/
 
 /-- `author` as stored at V0 (what `migrate freeze` would generate). -/
@@ -2855,12 +2992,62 @@ where
 
 private def adoptDbPath : System.FilePath := ".lake" / "leandb_test_adopt.sqlite"
 
+private def colRating : ColumnSpec := (Entity.spec Book).columns.getD 2 default
+
+private def testStrictSchemaJson : IO Unit := do
+  -- a valid spec still round-trips byte for byte
+  let c := Entity.spec Book
+  for col in c.columns do
+    check ((ColumnSpec.fromJson? col.toJson).toOption == some col) s!"ColumnSpec round trip: {col.name}"
+  -- a present-but-malformed optional is an ERROR, not an absence: the
+  -- lossy decode would make migrate diff a schema that was never stored
+  let bad : List (String × Lean.Json) := [
+    ("references", Lean.Json.num 3),
+    ("enum", Lean.Json.arr #[Lean.Json.str "a", Lean.Json.num 1]),
+    ("enumSet", Lean.Json.arr #[Lean.Json.bool true]),
+    ("default", Lean.Json.str "junk"),
+    ("shape", Lean.Json.num 7),
+    ("group", Lean.Json.arr #[]),
+    ("cascade", Lean.Json.str "yes")]
+  for (key, v) in bad do
+    let j := (colRating.toJson).mergeObj (Lean.Json.mkObj [(key, v)])
+    check ((ColumnSpec.fromJson? j).isOk == false) s!"malformed \"{key}\" is refused, not dropped"
+  -- an ABSENT optional is still fine, and the untouched spec round-trips
+  check ((ColumnSpec.fromJson? colRating.toJson).toOption == some colRating)
+    "the untouched spec decodes"
+
 /-- An adopted file keeps whatever declared types it was created with:
     BIGINT, VARCHAR — affinity synonyms of INTEGER and TEXT. The snapshot
     records the canonical spelling, so `matchesSnapshot` must normalize by
     SQLite's affinity rules; a raw string comparison matches no version,
     the file is stamped at the head, and the migrations in between
     silently never run. -/
+private def foreignDbPath : System.FilePath := ".lake" / "leandb_test_foreign.sqlite"
+
+/-- A file no LeanDB engine ever created — user tables, no schema meta —
+    must be refused at open, not silently stamped as this base's
+    instance: the stamped metadata would lie, later verbs would fail with
+    raw SQL errors instead of a typed mismatch, and `migrate` would plan
+    from a phantom baseline. -/
+private def testForeignFileRefused : IO Unit := do
+  if ← foreignDbPath.pathExists then IO.FS.removeFile foreignDbPath
+  let db ← SQLite.open foreignDbPath
+  db.exec "CREATE TABLE user (weird_col BLOB NOT NULL)"
+  db.exec "INSERT INTO user VALUES (x'00')"
+  let r ← openDb foreignDbPath schema
+  expectErr r "migrate" "a foreign file with tables is refused, not adopted silently"
+  match r with
+  | .error e =>
+      check ((e.message.splitOn "import-sqlite").length > 1) s!"the refusal points at import-sqlite, got {e.message}"
+  | .ok _ => pure ()
+  let stamped ← (← SQLite.open foreignDbPath).prepare "SELECT COUNT(*) FROM _leandb_meta"
+  discard <| stamped.step
+  check ((← stamped.columnInt64 0) == 0) "no meta was stamped onto the foreign file"
+  -- a fresh file still opens and stamps normally
+  if ← foreignDbPath.pathExists then IO.FS.removeFile foreignDbPath
+  discard <| expectOk (← withDb foreignDbPath schema do discard <| insert Author ⟨"Ada", 36⟩)
+    "a fresh file opens and stamps"
+
 private def testAdoptAffinity : IO Unit := do
   if ← adoptDbPath.pathExists then IO.FS.removeFile adoptDbPath
   let colX : ColumnSpec := { name := "x", sqlType := .integer, nullable := false, fkTable := none }
@@ -2942,6 +3129,109 @@ private def testFootprints : IO Unit := do
   check (impact.any fun i => (i.getObjValAs? String "query").toOption == some "unratedByAuthor"
       && (i.getObjValAs? Nat "logged_runs").toOption == some 1) s!"impact names the query and its run: {st}"
   check (((st.getObjValAs? (Array String) "changed").toOption.getD #[]).contains "book.*") s!"changed lists book.*: {st}"
+  -- The historical window is explicit, and static impact survives a disabled scan.
+  for _ in [0:2] do
+    discard <| b.handle inst sess ["query", "unratedByAuthor", toString adaId]
+  let limited := { b2 with log := { impactLimit := 1 } }
+  let limitedSess ← expectOk (← Cli.Session.open limited inst) "open with an impact budget"
+  let limitedStatus ← limited.handle inst limitedSess ["migrate", "status"]
+  let window := (limitedStatus.getObjVal? "impact_log").toOption.getD .null
+  check ((window.getObjValAs? Nat "limit").toOption == some 1 &&
+    (window.getObjValAs? Nat "scanned").toOption == some 1 &&
+    (window.getObjValAs? Bool "truncated").toOption == some true) s!"bounded impact window: {limitedStatus}"
+  let limitedImpact := (limitedStatus.getObjValAs? (Array Lean.Json) "impact").toOption.getD #[]
+  check (limitedImpact.any fun i => (i.getObjValAs? Nat "logged_runs").toOption == some 1)
+    "impact counts only the recent window"
+  let staticOnly := { b2 with log := { impactLimit := 0 } }
+  let staticSess ← expectOk (← Cli.Session.open staticOnly inst) "open with historical scans disabled"
+  let staticStatus ← staticOnly.handle inst staticSess ["migrate", "status"]
+  let staticImpact := (staticStatus.getObjValAs? (Array Lean.Json) "impact").toOption.getD #[]
+  check (staticImpact.any fun i => (i.getObjValAs? String "query").toOption == some "unratedByAuthor" &&
+    (i.getObjValAs? Nat "logged_runs").toOption == some 0) "static impact does not depend on history"
+  let unchanged ← b.handle inst sess ["migrate", "status"]
+  check ((unchanged.getObjVal? "impact_log").toOption.isNone &&
+    ((unchanged.getObjValAs? (Array String) "notes").toOption.getD #[]).contains "schema already up to date")
+    "an unchanged schema returns before computing impact"
+  let migration : Migration := {
+    fromFingerprint := fingerprint b.specs
+    toFingerprint := fingerprint b2.specs
+    snapshot := b2.specs }
+  let chained := { limited with chain := some { origin := b.specs, migrations := [migration] } }
+  let chainSess ← expectOk (← Cli.Session.open chained inst) "open versioned impact fixture"
+  let chainStatus ← chained.handle inst chainSess ["migrate", "status"]
+  let chainWindow := (chainStatus.getObjVal? "impact_log").toOption.getD .null
+  check ((chainWindow.getObjValAs? Nat "scanned").toOption == some 1 &&
+    (chainWindow.getObjValAs? Bool "truncated").toOption == some true) s!"chain impact is bounded too: {chainStatus}"
+
+private def testLogPolicy : IO Unit := do
+  let .ok defaults := LogConfig.ofSettings {} none none | throw <| IO.userError "default log config failed"
+  check (defaults.maxEntries.isNone && defaults.impactLimit == 1000) "preserve history by default"
+  let .ok overrides := LogConfig.ofSettings { maxEntries := some 9 } (some "unlimited") (some "0") |
+    throw <| IO.userError "log overrides failed"
+  check (overrides.maxEntries.isNone && overrides.impactLimit == 0) "explicit unlimited and zero scan"
+  for s in ["", "-1", "oops", "9223372036854775807", "18446744073709551616"] do
+    check ((LogConfig.ofSettings {} (some s) none).toOption.isNone) s!"bad retention {s}"
+    check ((LogConfig.ofSettings {} none (some s)).toOption.isNone) s!"bad impact limit {s}"
+  let path : System.FilePath := ".lake/leandb_test_log_policy.sqlite"
+  if ← path.pathExists then IO.FS.removeFile path
+  let conn ← expectOk (← openDb path schema) "open log-policy fixture"
+  for id in [2, 5, 9, 17, 30] do
+    conn.raw.exec s!"INSERT INTO _leandb_log(id,verb,detail,ok,rows) VALUES ({id},'insert','fixture',1,0)"
+  let reopened ← expectOk (← openDbRaw path) "reopen with default retention"
+  check ((← expectOk (← (readLog 10).run reopened) "default history").size == 5) "default open never prunes"
+  let conn ← expectOk (← openDb path schema { maxEntries := some 3 }) "open with retention"
+  let kept ← expectOk (← (readLog 10).run conn) "retained history"
+  check (kept.map (fun j => (j.getObjValAs? Nat "id").toOption.getD 0) == #[30, 17, 9])
+    "retention keeps the newest entries despite id gaps"
+  for i in [0:7] do
+    discard <| expectOk (← (insert Author ⟨s!"author-{i}", i⟩).run conn) "logged write"
+    let entries ← expectOk (← (readLog 10).run conn) "batched retention"
+    check (entries.size <= 5) "a long-lived connection stays within its retention batch"
+  let entries ← expectOk (← (readLog 10).run conn) "history after seven writes"
+  check (entries.size == 4) "retention runs repeatedly without reopening"
+  let removed ← expectOk (← (pruneLog 1).run conn) "manual prune"
+  check (removed == 3) "manual prune returns the deleted count"
+  check ((← expectOk (← (fetchAll Author).run conn) "application rows").size == 7)
+    "pruning never deletes application data"
+  let b : Base := { name := "log_policy", tables := [CliTable.of Author, CliTable.of Book] }
+  let inst := Instance.ofPath path
+  let sess ← expectOk (← Cli.Session.open b inst) "CLI log session"
+  let cleared ← b.handle inst sess ["log", "prune", "0"]
+  check ((cleared.getObjValAs? Nat "deleted").toOption == some 1) "CLI can clear history explicitly"
+  let bad ← b.handle inst sess ["log", "prune", "-1"]
+  check ((bad.getObjValAs? String "code").toOption == some "usage") "invalid prune is a usage error"
+  discard <| expectOk (← (insert Author ⟨"before-disable", 1⟩).run conn) "write before disabling logs"
+  let disabled ← expectOk (← openDb path schema { maxEntries := some 0 }) "disable logging"
+  discard <| expectOk (← (insert Author ⟨"no-log", 1⟩).run disabled) "writes still work without logs"
+  check ((← expectOk (← (readLog 10).run disabled) "disabled history").isEmpty) "zero clears and disables logs"
+  -- Only select plans enter the scan; the one-row lookahead is not parsed.
+  let plan := "{\"footprint\":{\"columns\":[\"author.age\"]}}"
+  for q in ["old", "new"] do
+    let st ← disabled.raw.prepare "INSERT INTO _leandb_log(verb,detail,ok,rows,query,plan) VALUES ('select','fixture',1,0,?,?)"
+    st.bindText 1 q
+    st.bindText 2 plan
+    st.exec
+  disabled.raw.exec "INSERT INTO _leandb_log(verb,detail,ok,rows,plan) VALUES ('insert','ignored',1,0,'not-json')"
+  let scan ← scanLogFootprints disabled 1
+  check (scan.entries == #[(some "new", [("author", "age")])] && scan.truncated)
+    "scan counts select plans only, newest first, with truncation"
+  let exact ← scanLogFootprints disabled 2
+  check (exact.entries.size == 2 && !exact.truncated) "exact window is not truncated"
+  let zero ← scanLogFootprints disabled 0
+  check (zero.entries.isEmpty && zero.truncated) "zero scan parses no plans"
+  -- Restoring reopens the file with the base's policy, not the raw defaults.
+  let backup : System.FilePath := ".lake/leandb_test_log_policy_backup.sqlite"
+  if ← backup.pathExists then IO.FS.removeFile backup
+  backupTo disabled backup
+  let retainedBase := { b with log := { maxEntries := some 1, impactLimit := 2 } }
+  let retainedSess ← expectOk (← Cli.Session.open retainedBase inst) "configured restore session"
+  let restored ← retainedBase.handle inst retainedSess ["restore", backup.toString]
+  check ((restored.getObjValAs? Bool "ok").toOption == some true) s!"restore: {restored}"
+  let restoredConn ← retainedSess.conn.get
+  check (restoredConn.logConfig.maxEntries == some 1 && restoredConn.logConfig.impactLimit == 2)
+    "restore preserves configured limits"
+  check ((← expectOk (← (readLog 10).run restoredConn) "restored log").size == 1)
+    "restore reapplies retention to restored history"
 
 private def testHttpBodyLimits : IO Unit := do
   check ((Http.bodyLimitOf none).toOption == some (2 * 1024 * 1024)) "HTTP default body limit"
@@ -2989,13 +3279,92 @@ private def testPortOf : IO Unit := do
   for s in ["0", "65536", "70000", "-1", "oops", ""] do
     check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
 
+private def rowsDbPath : System.FilePath := ".lake" / "leandb_test_rows_limit.sqlite"
+
+private def testRowsLimitPushdown : IO Unit := do
+  -- the cap must reach SQL, not trim after a full-table fetch
+  if ← rowsDbPath.pathExists then IO.FS.removeFile rowsDbPath
+  discard <| expectOk (← withDb rowsDbPath schema do
+    for i in [0:10] do
+      discard <| insert Author ⟨s!"a{i}", i⟩) "seed ten authors"
+  -- the CLI `rows` path (`rowsWhere`): the cap ships as a bound LIMIT ?
+  -- over the trivial plan, so exactly three rows are fetched, not ten
+  let j ← expectOk (← withDb rowsDbPath schema do
+    (CliTable.of Author).rowsWhere [] 3) "rows with limit 3"
+  check ((j.getObjValAs? Nat "count").toOption == some 3) s!"three rows: {j}"
+  -- direct: fetchFiltered with a cap bounds the fetch itself
+  let capped ← withDb rowsDbPath schema do fetchFiltered (α := Author) (ts := [Author]) .tt (some 3)
+  check ((← expectOk capped "capped fetch").size == 3) "the cap bounds the fetch"
+
+private def testModuleNameOk : IO Unit := do
+  for s in ["Tickets", "tickets", "A.B.C", "_Private", "M1.Migrations", "a_b'c"] do
+    check (Freeze.moduleNameOk s) s!"a plain dotted identifier is accepted: {s}"
+  for s in ["/tmp/pwn", "../pwn", "a/b", "..", "a..b", "a./x", "1foo",
+            "a b", "a-/x", "a\nb", "", ".", "a.", ".a", "a b.Migrations"] do
+    check (!Freeze.moduleNameOk s) s!"a non-identifier module is refused: {s}"
+
+/-- An inline field with a space in the name: legal for the derive, which
+    builds syntax; the freeze text renderer would emit the binder
+    with two tokens. -/
+structure Sp where
+  «a b» : Int64
+  deriving Repr, LeanDb.Entity
+private def testFreezeNames : IO Unit := do
+  -- plain identifiers and keywords (for columns) are accepted
+  for s in ["user", "user_profile", "M1", "a_b'c"] do
+    check (Freeze.freezeNameOk s false) s!"a plain identifier is accepted: {s}"
+  for s in ["end", "structure", "rec"] do
+    check (Freeze.freezeNameOk s true) s!"a keyword column is accepted: {s}"
+  -- the shapes the freeze renderer cannot emit, from issue #35
+  for s in ["1foo", "a b", "a b_w", "a-/x", "a\nb", "", "a.b", "«quoted»"] do
+    check (!Freeze.freezeNameOk s false) s!"a non-identifier table name is refused: {s}"
+  for s in ["1foo", "a b_w", "a\nb"] do
+    check (!Freeze.freezeNameOk s true) s!"a non-identifier, non-keyword column is refused: {s}"
+  -- end to end: a schema with a space-named column is refused by freeze
+  let r := Freeze.checkNames [Entity.spec Sp]
+  check (r.isOk == false) "a schema with a composite guillemet column is refused"
+  match r with
+  | .error m => check ((m.splitOn "a b").length > 1) s!"the refusal names the column, got {m}"
+  | .ok _ => pure ()
+
+private def lineStream (s : String) : IO (IO.Ref IO.FS.Stream.Buffer) := do
+  IO.mkRef { data := s.toUTF8, pos := 0 }
+
+private def testStdioLineCap : IO Unit := do
+  -- ordinary lines, then EOF
+  let buf ← lineStream "ping\npong\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf)
+  check ((← r.next) matches .line "ping") "first line"
+  check ((← r.next) matches .line "pong") "second line (pushback survives the chunk boundary)"
+  check ((← r.next) matches .eof) "eof after the last newline"
+  -- EOF right after bytes: the unterminated line is still delivered
+  let buf ← lineStream "tail"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf)
+  check ((← r.next) matches .line "tail") "unterminated final line"
+  -- over the budget: drained, not buffered; the next line still reads
+  let buf ← lineStream "abcdef\nok\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf) 3
+  check ((← r.next) matches .tooLong) "a line beyond the budget is refused"
+  check ((← r.next) matches .line "ok") "the next line still reads"
+  -- exactly at the budget is accepted
+  let buf ← lineStream "abcd\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf) 4
+  check ((← r.next) matches .line "abcd") "a line at the budget reads"
+
 def main : IO UInt32 := do
   testCliLimits
+  testStrictSchemaJson
+  testRowsLimitPushdown
+  testFreezeNames
   testPortOf
+  testModuleNameOk
+  testStdioLineCap
   testHttpBodyLimits
+  testLogPolicy
   testCodecs
   testBaseSpecs
   testSession
+  testRestoreSafety
   testChain
   testFootprints
   testDerivedSpec
@@ -3006,9 +3375,11 @@ def main : IO UInt32 := do
   testCoherence
   testClosedEnum
   testDefaults
+  testRealLiterals
   testJson
   testEndToEnd
-  testClosedEndToEnd
+  testNanReal
+  testInfReal
   testParamSplitEndToEnd
   testQuantifiersEndToEnd
   testMigrations
@@ -3017,10 +3388,10 @@ def main : IO UInt32 := do
   testBlobColumn
   testUniqueConstraint
   testConstraintClassify
-  testNanReal
   testImportNotCarried
   testQuotedEndToEnd
   testAdoptAffinity
+  testForeignFileRefused
   testImportUnusableNames
   Lep3.run
   EnumSetA.run

@@ -44,10 +44,19 @@ def rawType (c : ColumnSpec) : String :=
     | .real => "Float"
   if c.nullable then s!"Option {base}" else base
 
+/-- A `Col` as Lean source. REAL values render exactly (`renderRealExact`,
+    parenthesized: the literal may be negative) so a frozen `V<n>.schema`
+    re-elaborates to the very same double — `toString`'s six decimals would
+    phantom-diff the snapshot against `base.specs`. A non-finite REAL has
+    no literal; `migrate freeze` validates the schema (and so refuses one)
+    before rendering, so meeting one here is a caller bug: panic. -/
 def colLit : Col → String
   | .int v => s!"LeanDb.Col.int {v}"
   | .text v => s!"LeanDb.Col.text {String.quote v}"
-  | .real v => s!"LeanDb.Col.real {v}"
+  | .real v =>
+      match renderRealExact v with
+      | .ok s => s!"LeanDb.Col.real ({s})"
+      | .error msg => panic! msg
   | .null => "LeanDb.Col.null"
 
 private def strArr (xs : Array String) : String :=

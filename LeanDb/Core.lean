@@ -32,6 +32,57 @@ def Col.describe : Col → String
   | .real v => s!"REAL {v}"
   | .null => "NULL"
 
+/-- Drop trailing `'0'`s of a fraction; exact (see `renderRealExact`). -/
+private def trimTrailingZeros (l : List Char) : List Char := go l.length
+where
+  /-- The first `n` chars of `l`, minus any trailing `'0'`s. -/
+  go : Nat → List Char
+    | 0 => []
+    | n + 1 =>
+        match l[n]? with
+        | some '0' => go n
+        | _ => l.take (n + 1)
+
+/-- The exact decimal expansion of a finite `Float`, rendered as a plain
+    numeric literal. Why not `Float.toString` (or any shortest-repr): it is
+    `printf %f` on this toolchain — six decimals — so a REAL default or a
+    frozen migration snapshot silently records a different value (a default
+    below 5e-7 collapses to `0.000000`, `1/3` loses all but six digits).
+    This decodes the IEEE-754 bits into `m * 2^e`; for `e ≥ 0` the value is
+    the exact integer `m * 2^e`, for `e < 0` it is `m * 5^(-e)` with the
+    decimal point shifted `(-e)` digits left — `Nat` is arbitrary-precision,
+    so no digit is ever rounded away. Trailing zeros of the fractional part
+    are dropped (they multiply out exactly); nothing else is trimmed, and
+    the result parses back to the very same double. Non-finite values have
+    no decimal form and no SQL literal: an error, so callers refuse loudly
+    instead of emitting `inf`/`NaN` into DDL. -/
+def renderRealExact (v : Float) : Except String String :=
+  if v.isNaN then .error "REAL value is NaN: NaN has no exact decimal literal"
+  else if v.isInf then .error "REAL value is infinite: infinities have no exact decimal literal"
+  else
+    let bits := v.toBits.toNat
+    let sign := bits >>> 63 != 0
+    let biased := (bits >>> 52) &&& 0x7FF
+    let mant := bits &&& ((1 <<< 52) - 1)
+    let (m, e) : Nat × Int :=
+      if biased == 0 then (mant, -1074) else ((1 <<< 52) + mant, (biased : Int) - 1075)
+    let body : String :=
+      if e >= 0 then
+        toString (m * 2 ^ e.toNat)
+      else
+        let d := (-e).toNat
+        let digits := (toString (m * 5 ^ d)).toList
+        let (intL, fracL) : List Char × List Char :=
+          if digits.length > d then
+            (digits.take (digits.length - d), digits.drop (digits.length - d))
+          else
+            (['0'], List.replicate (d - digits.length) '0' ++ digits)
+        let int := String.ofList intL
+        match trimTrailingZeros fracL with
+        | [] => int
+        | frac => int ++ "." ++ String.ofList frac
+    .ok (if sign then "-" ++ body else body)
+
 /-- Typed database errors. Constructors are the machine-readable codes;
     the `String` fields are diagnostics, never identity. -/
 inductive DbError where
@@ -212,7 +263,10 @@ instance : ColCodec Float where
   sqlType := .real
   toCol := .real
   fromCol
-    | .real v => .ok v
+    -- a non-finite REAL cannot round-trip as a REAL (the JSON surfaces
+    -- render it as the string "Infinity"/"NaN"); refuse it like any
+    -- other value outside the column's closed world
+    | .real v => if v.isNaN || v.isInf then .error s!"expected a finite REAL, found {v}" else .ok v
     | .int v => .ok v.toFloat
     | c => expected "REAL" c
 

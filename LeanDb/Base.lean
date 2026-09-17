@@ -105,7 +105,7 @@ def CliTable.of (α : Type) [Entity α] : CliTable where
             | .error e => throw (.decode spec.name col e)
           conds := conds.push ⟨f, tv⟩
     let pred : Pred [α] := conds.foldl (init := .tt) fun p c => p.andS (.eq (.here c.1) .eq c.2)
-    let rows ← fetchFiltered α pred
+    let rows ← fetchFiltered α pred (some limit)
     let rows := rows.toList.take limit
     return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.length),
       ("rows", Json.arr (rows.map (rowJson α)).toArray)]
@@ -135,6 +135,9 @@ structure Base where
   /-- Modules a generated migration imports to see the head entity
       types; empty = `[<module>.Entities]`. -/
   freezeImports : List String := []
+  /-- Audit retention and migration impact budget; environment settings
+      override these defaults when a connection opens. -/
+  log : LogConfig := {}
 
 /-- Dedup by table name (first occurrence wins) and order so that every
     foreign-key target precedes its referrer. The sort is stable: among

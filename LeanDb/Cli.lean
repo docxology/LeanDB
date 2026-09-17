@@ -100,6 +100,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "query <name> [args...]"] ++
       (if b.seed.isSome then #[Json.str "seed"] else #[]) ++ #[
       Json.str "log [limit]",
+      Json.str "log prune <keep>  (delete older audit entries; 0 clears the log)",
       Json.str "migrate status | apply [--allow-destructive] [--no-backup] | rollback | history [limit] | freeze [--module M]",
       Json.str "backup  (full copy under <instance dir>/backups)",
       Json.str "restore <file>",
@@ -187,6 +188,13 @@ private def command (b : Base) : List String → Except String (DbM Json)
       pure ((← table? b t).updateJson (← parseId i) (← parseJson j))
   | ["delete", t, i] => do pure ((← table? b t).deleteRow (← parseId i))
   | ["log"] => .ok (logJson 50)
+  | ["log", "prune", n] => do
+      let some keep := n.toNat? | throw s!"expected a retention count, got {String.quote n}"
+      if keep >= Int64.maxValue.toNatClampNeg then throw "log retention count is out of range"
+      pure (do
+        let deleted ← pruneLog keep
+        return Json.mkObj [("ok", Json.bool true), ("deleted", Lean.toJson deleted),
+          ("keep", Lean.toJson keep)])
   | ["log", n] => do
       pure (logJson (← limitOf n))
   | "rows" :: t :: flags => do
@@ -239,7 +247,7 @@ private def gateOf (b : Base) (conn : Conn) : IO (Option DbError) := do
 def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := do
   if let some parent := inst.path.parent then
     IO.FS.createDirAll parent
-  match ← openDbRaw inst.path with
+  match ← openDbRaw inst.path b.log with
   | .error e => return .error e
   | .ok conn =>
       let gate ← IO.mkRef (← gateOf b conn)
@@ -263,31 +271,93 @@ private def backupJson (b : Base) (inst : Instance) (sess : Session) : IO Json :
   catch e =>
     return (DbError.sqlite s!"backup failed: {e}").toJson
 
-/-- Replace the instance file with `src` and reopen: the old handle is
-    released first (its finalizer closes it), the copy lands under a
-    temporary name and is renamed into place so no reader ever sees a
-    half-written file, and stale `-wal`/`-shm` siblings go with the old
-    file. Assumes this process is the only writer. -/
+/-! ### Restore safety: validate first, swap last
+
+Issue #25: `restore <garbage>` used to drop the live connection and
+overwrite the instance before validating the source, so a failed restore
+destroyed user data and left the session silently serving an empty
+in-memory database; `restore /dev/zero` read the whole source into
+memory. -/
+
+/-- The 16-byte magic string every SQLite 3 file begins with. -/
+def Restore.magic : ByteArray := "SQLite format 3\u0000".toUTF8
+
+/-- Do these leading bytes carry the SQLite 3 magic header? -/
+def Restore.headerOk (bytes : ByteArray) : Bool :=
+  bytes.size >= Restore.magic.size &&
+    (List.range Restore.magic.size).all fun i => bytes[i]! == Restore.magic[i]!
+
+/-- Validate a restore source before anything destructive happens: the
+    magic header refuses text files and directories cheaply, then the
+    source must open as a database and pass `PRAGMA quick_check`. -/
+private def Restore.validate (src : System.FilePath) : IO (Except DbError Unit) := do
+  let head ← try
+      let h ← IO.FS.Handle.mk src .read
+      let bytes ← h.read Restore.magic.size.toUSize
+      pure bytes
+    catch e => return .error (.migrate s!"restore source cannot be read: {src} ({e})")
+  unless Restore.headerOk head do
+    return .error (.migrate s!"restore source is not a SQLite database: {src}")
+  try
+    let db ← SQLite.open src
+    let stmt ← db.prepare "PRAGMA quick_check"
+    if ← stmt.step then
+      let verdict ← stmt.columnText 0
+      if verdict == "ok" then return .ok ()
+      return .error (.migrate s!"restore source failed quick_check: {src} ({verdict})")
+    return .error (.migrate s!"restore source failed quick_check: {src}")
+  catch e =>
+    return .error (.migrate s!"restore source is not a valid SQLite database: {src} ({e})")
+
+/-- Bounded-memory file copy: 1 MiB reads, so the source's size never
+    sets the process's memory use. -/
+private def Restore.copyChunked (src dest : System.FilePath) : IO Unit := do
+  let chunk : USize := 1024 * 1024
+  let input ← IO.FS.Handle.mk src .read
+  let output ← IO.FS.Handle.mk dest .write
+  repeat
+    let bytes ← input.read chunk
+    if bytes.isEmpty then break
+    output.write bytes
+
+/-- Replace the instance file with `src` and reopen. Validation runs
+    BEFORE anything destructive; the copy lands under a temporary name
+    and is renamed into place so no reader ever sees a half-written file,
+    and stale `-wal`/`-shm` siblings go with the old file. The old
+    connection stays open until the rename has succeeded and the new
+    file has opened cleanly; a failure past the swap sets the gate (so
+    verbs are refused loudly instead of silently hitting an empty
+    database) and reopens the instance file. Assumes this process is the
+    only writer. -/
 private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
     IO (Except DbError Unit) := do
   unless ← src.pathExists do
     return .error (.migrate s!"restore source does not exist: {src}")
+  match ← Restore.validate src with
+  | .error e => return .error e
+  | .ok () => pure ()
   try
-    sess.conn.set (← Conn.ofRaw (← SQLite.open ":memory:"))
     let tmp : System.FilePath := inst.path.toString ++ ".restore"
-    IO.FS.writeBinFile tmp (← IO.FS.readBinFile src)
+    try
+      Restore.copyChunked src tmp
+    catch e =>
+      try IO.FS.removeFile tmp catch _ => pure ()
+      throw e
     for suffix in ["-wal", "-shm", "-journal"] do
       let side : System.FilePath := inst.path.toString ++ suffix
       if ← side.pathExists then IO.FS.removeFile side
     IO.FS.rename tmp inst.path
   catch e =>
     return .error (.sqlite s!"restore failed: {e}")
-  match ← openDbRaw inst.path with
-  | .error e => return .error e
+  match ← openDbRaw inst.path b.log with
   | .ok conn =>
       sess.conn.set conn
       sess.gate.set (← gateOf b conn)
       return .ok ()
+  | .error e =>
+      sess.gate.set (some e)
+      if let .ok conn ← openDbRaw inst.path b.log then sess.conn.set conn
+      return .error e
 
 private def restoreJson (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
     IO Json := do
@@ -408,8 +478,13 @@ def changedColumns (old new : List TableSpec) : List (String × String) := Id.ru
 
 /-- Which registered queries (by their static footprints) and which logged
     runs (by the footprints the log recorded) a change touches. -/
-private def impactJson (b : Base) (conn : Conn) (changed : List (String × String)) : IO (Json × Json) := do
-  let logged ← logFootprints conn 100000
+private def impactJson (b : Base) (conn : Conn) (changed : List (String × String)) : IO (Json × Json × Json) := do
+  let limit := conn.logConfig.impactLimit
+  let skipped := changed.isEmpty || limit == 0
+  let scan ← if skipped then pure ({} : LogFootprintScan) else scanLogFootprints conn limit
+  let logged := scan.entries
+  let window := Json.mkObj [("limit", Lean.toJson limit), ("scanned", Lean.toJson logged.size),
+    ("truncated", Json.bool scan.truncated), ("skipped", Json.bool skipped)]
   let runsOf := fun (name : String) =>
     logged.foldl (init := 0) fun n (q, cols) =>
       if q == some name && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
@@ -426,7 +501,7 @@ private def impactJson (b : Base) (conn : Conn) (changed : List (String × Strin
   -- logged selects outside any registered query (scripts, other programs)
   let anonymous := logged.foldl (init := 0) fun n (q, cols) =>
     if q.isNone && !(cols.filter fun (t, c) => changed.any fun (t', c') => t == t' && (c == c' || c' == "*")).isEmpty then n + 1 else n
-  return (Json.arr items, Lean.toJson anonymous)
+  return (Json.arr items, Lean.toJson anonymous, window)
 
 private def changedJson (changed : List (String × String)) : Json :=
   Json.arr (changed.map fun (t, c) => Json.str s!"{t}.{c}").toArray
@@ -475,12 +550,13 @@ private def chainMigrate (b : Base) (inst : Instance) (sess : Session) (c : Chai
                 describes := describes.push (Json.str s!"V{v}: {d}")
       prev := m.snapshot
     let changed := changedColumns ((c.at? k).getD []) c.head
-    let (impact, anonymous) ← impactJson b conn changed
+    let (impact, anonymous, window) ← impactJson b conn changed
     return Json.mkObj [("ok", Json.bool true), ("mode", Json.str "chain"),
       ("instance_version", Lean.toJson k), ("head_version", Lean.toJson c.headVersion),
       ("steps", Json.arr describes), ("destructive", Json.bool destructive),
       ("notes", Json.arr (notes.map Json.str)), ("pending", Json.arr items),
-      ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
+      ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous),
+      ("impact_log", window)]
   -- apply, one migration per transaction, each after its own backup
   let mut applied : Array Json := #[]
   let mut prev := (c.at? k).getD []
@@ -520,8 +596,29 @@ private def freezeJson (b : Base) (flags : List String) : IO Json := do
       let module := module?.getD b.module
       if module.isEmpty then
         return usageErr "freeze needs the base's Lean module: set `module` on the base or pass --module <Module>"
-      let t := Freeze.Target.ofModule module (if imports.isEmpty then b.freezeImports else imports)
+      let imports := if imports.isEmpty then b.freezeImports else imports
+      -- the module and import names become the write target and the
+      -- generated source itself; anything that is not a plain dotted
+      -- identifier must be refused before any IO (a `/` or `..` would
+      -- write outside the package, newlines or comment tokens would
+      -- inject source into the generated files)
+      unless Freeze.moduleNameOk module do
+        return usageErr s!"--module {String.quote module} is not a plain dotted Lean identifier"
+      for i in imports do
+        unless Freeze.moduleNameOk i do
+          return usageErr s!"--imports {String.quote i} is not a plain dotted Lean identifier"
+      let t := Freeze.Target.ofModule module imports
       let cur := b.specs
+      -- freeze renders the schema as source (DDL defaults, snapshot
+      -- literals); an invalid schema — e.g. a non-finite REAL default,
+      -- which has no exact literal — must be refused, not frozen
+      if let .error e := validateSchema cur then
+        return e.toJson
+      -- the freeze text renderer cannot emit every name the derive
+      -- accepts; refuse those before any IO instead of writing an
+      -- uncompilable (or injectable) file
+      if let .error e := Freeze.checkNames cur then
+        return (DbError.migrate e).toJson
       let (n, prev) ← match b.chain with
         | some c =>
             if fingerprint c.head == fingerprint cur then
@@ -590,12 +687,13 @@ where
             let plan := plan?.getD {}
             let old ← readStoredSchema conn
             let changed := changedColumns (old.getD []) b.specs
-            let (impact, anonymous) ← impactJson b conn changed
+            let (impact, anonymous, window) ← impactJson b conn changed
             return Json.mkObj [("ok", Json.bool true),
               ("steps", Json.arr (plan.steps.map (Json.str ·.describe)).toArray),
               ("destructive", Json.bool plan.isDestructive),
               ("notes", Json.arr (plan.notes.map Json.str).toArray),
-              ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous)]
+              ("changed", changedJson changed), ("impact", impact), ("unregistered_runs", anonymous),
+              ("impact_log", window)]
 
 /-- The one place argv meets an open instance: every transport (one-shot
     CLI, JSON-lines `serve`, and the servers built on it) sends argv here
@@ -638,6 +736,62 @@ def exitCodeOf (j : Json) : UInt32 :=
     | some "schema_mismatch" | some "unknown_lineage" => 4
     | _ => 2
 
+/-- Max bytes of one request line on the stdio transports — the stdio
+    analogue of the HTTP body cap (#21/#23). -/
+def defaultMaxLineBytes : Nat := 2 * 1024 * 1024
+
+/-- One request line from a stdio peer. -/
+inductive StdLine where
+  | /-- EOF with no bytes buffered. -/
+    eof
+  | /-- A complete line (the newline dropped). -/
+    line (s : String)
+  | /-- The line exceeded the budget: it was drained, not buffered. -/
+    tooLong
+
+private partial def readLineLoop (h : IO.FS.Stream) (cap : Nat) (chunkSize : USize)
+    (pending : IO.Ref ByteArray) (acc : ByteArray) (over : Bool) : IO StdLine := do
+  let mut chunk ← pending.get
+  pending.set ByteArray.empty
+  if chunk.isEmpty then chunk ← h.read chunkSize
+  if chunk.isEmpty then
+    if over then return .tooLong
+    if acc.isEmpty then return .eof
+    return .line (String.fromUTF8? acc |>.getD "")
+  match chunk.findIdx? (· == 10) with
+  | some i =>
+      -- the rest of the chunk is the next request's first bytes: never
+      -- discard it (a peer may pipeline)
+      pending.set (chunk.extract (i + 1) chunk.size)
+      if over || acc.size + i > cap then return .tooLong
+      return .line (String.fromUTF8? (acc ++ chunk.extract 0 i) |>.getD "")
+  | none =>
+      -- no newline: keep going, but once the budget is gone, drain and
+      -- discard — the bytes are never buffered past `cap`
+      if acc.size + chunk.size > cap then readLineLoop h cap chunkSize pending ByteArray.empty true
+      else readLineLoop h cap chunkSize pending (acc ++ chunk) over
+
+/-- A line reader over a stdio peer, with a byte budget per request line —
+    the stdio analogue of the HTTP body cap (#21/#23). Chunked reads with
+    one chunk of pushback, so a pipelined peer's following lines survive;
+    a misbehaving peer that emits a newline-less megabyte stream gets
+    `tooLong` instead of an OOM. -/
+structure LineReader where
+  stream : IO.FS.Stream
+  cap : Nat := defaultMaxLineBytes
+  pending : IO.Ref ByteArray
+
+/-- Open a reader over a stream. -/
+def LineReader.new (stream : IO.FS.Stream) (cap : Nat := defaultMaxLineBytes) :
+    IO LineReader := do
+  let pending ← IO.mkRef ByteArray.empty
+  return { stream, cap, pending }
+
+/-- The next request line. EOF right after bytes is that (unterminated)
+    line, like `Handle.getLine` would return it. -/
+def LineReader.next (r : LineReader) : IO StdLine :=
+  readLineLoop r.stream r.cap 4096 r.pending ByteArray.empty false
+
 /-- Served mode: JSON-lines over stdio against one persistent connection.
     Each request line is a JSON array of argv strings; each response is one
     JSON object line. EOF ends the session. A drifted instance is served
@@ -650,20 +804,25 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
   | .ok sess =>
       let stdin ← IO.getStdin
       let out ← IO.getStdout
+      let reader ← LineReader.new stdin
       repeat
-        let line ← stdin.getLine
-        if line.isEmpty then break
-        let line := line.trimAscii.toString
-        if line.isEmpty then continue
-        let argv? := Lean.Json.parse line >>= fun j => do
-          let arr ← j.getArr?
-          arr.toList.mapM (·.getStr?)
-        match argv? with
-        | .error m =>
-            out.putStrLn (usageErr s!"expected a JSON array of argv strings: {m}").compress
-        | .ok argv =>
-            out.putStrLn (← b.handle inst sess argv).compress
-        out.flush
+        match ← reader.next with
+        | .eof => break
+        | .tooLong =>
+            out.putStrLn (usageErr s!"request line exceeds {defaultMaxLineBytes} bytes").compress
+            out.flush
+        | .line rawLine =>
+          let line := rawLine.trimAscii.toString
+          if line.isEmpty then continue
+          let argv? := Lean.Json.parse line >>= fun j => do
+            let arr ← j.getArr?
+            arr.toList.mapM (·.getStr?)
+          match argv? with
+          | .error m =>
+              out.putStrLn (usageErr s!"expected a JSON array of argv strings: {m}").compress
+          | .ok argv =>
+              out.putStrLn (← b.handle inst sess argv).compress
+          out.flush
       return 0
 
 /-- The HTTP server, registered by `LeanDb.Http` at initialization so the

@@ -143,41 +143,46 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
       let stdin ← IO.getStdin
       let out ← IO.getStdout
       let toolList := tools b
+      let reader ← Cli.LineReader.new stdin
       repeat
-        let line ← stdin.getLine
-        if line.isEmpty then break
-        let line := line.trimAscii.toString
-        if line.isEmpty then continue
-        match Json.parse line with
-        | .error m =>
-            out.putStrLn (rpcError Json.null (-32700) s!"parse error: {m}").compress
-        | .ok msg =>
-            let id := (msg.getObjVal? "id").toOption.getD Json.null
-            let method := (msg.getObjValAs? String "method").toOption.getD ""
-            let params := (msg.getObjVal? "params").toOption.getD (Json.mkObj [])
-            -- notifications carry no id and get no reply
-            let isNotification := (msg.getObjVal? "id").toOption.isNone
-            let reply? : Option Json ← do
-              match method with
-              | "initialize" => pure <| some <| result id <| Json.mkObj [
-                  ("protocolVersion", str ((params.getObjValAs? String "protocolVersion").toOption.getD "2025-06-18")),
-                  ("capabilities", Json.mkObj [("tools", Json.mkObj [("listChanged", Json.bool false)])]),
-                  ("serverInfo", Json.mkObj [("name", str s!"leandb-{b.name}"), ("version", str "0.3.1")]),
-                  ("instructions", str s!"The {b.name} base: typed tables and registered queries. Every tool is one command of the base's CLI; errors carry a typed code.")]
-              | "ping" => pure <| some <| result id (Json.mkObj [])
-              | "tools/list" => pure <| some <| result id (Json.mkObj [("tools", Json.arr toolList)])
-              | "tools/call" =>
-                  let name := (params.getObjValAs? String "name").toOption.getD ""
-                  let args := (params.getObjVal? "arguments").toOption.getD (Json.mkObj [])
-                  match argvOf b name args with
-                  | .error m => pure <| some <| rpcError id (-32602) m
-                  | .ok argv => pure <| some <| toolResult id (← b.handle inst sess argv)
-              | _ =>
-                  if isNotification then pure none
-                  else pure <| some <| rpcError id (-32601) s!"method not found: {method}"
-            if let some reply := reply? then
-              out.putStrLn reply.compress
-              out.flush
+        match ← reader.next with
+        | .eof => break
+        | .tooLong =>
+            out.putStrLn (rpcError Json.null (-32700) s!"request line exceeds {Cli.defaultMaxLineBytes} bytes").compress
+            out.flush
+        | .line rawLine =>
+          let line := rawLine.trimAscii.toString
+          if line.isEmpty then continue
+          match Json.parse line with
+          | .error m =>
+              out.putStrLn (rpcError Json.null (-32700) s!"parse error: {m}").compress
+          | .ok msg =>
+              let id := (msg.getObjVal? "id").toOption.getD Json.null
+              let method := (msg.getObjValAs? String "method").toOption.getD ""
+              let params := (msg.getObjVal? "params").toOption.getD (Json.mkObj [])
+              -- notifications carry no id and get no reply
+              let isNotification := (msg.getObjVal? "id").toOption.isNone
+              let reply? : Option Json ← do
+                match method with
+                | "initialize" => pure <| some <| result id <| Json.mkObj [
+                    ("protocolVersion", str ((params.getObjValAs? String "protocolVersion").toOption.getD "2025-06-18")),
+                    ("capabilities", Json.mkObj [("tools", Json.mkObj [("listChanged", Json.bool false)])]),
+                    ("serverInfo", Json.mkObj [("name", str s!"leandb-{b.name}"), ("version", str "0.3.1")]),
+                    ("instructions", str s!"The {b.name} base: typed tables and registered queries. Every tool is one command of the base's CLI; errors carry a typed code.")]
+                | "ping" => pure <| some <| result id (Json.mkObj [])
+                | "tools/list" => pure <| some <| result id (Json.mkObj [("tools", Json.arr toolList)])
+                | "tools/call" =>
+                    let name := (params.getObjValAs? String "name").toOption.getD ""
+                    let args := (params.getObjVal? "arguments").toOption.getD (Json.mkObj [])
+                    match argvOf b name args with
+                    | .error m => pure <| some <| rpcError id (-32602) m
+                    | .ok argv => pure <| some <| toolResult id (← b.handle inst sess argv)
+                | _ =>
+                    if isNotification then pure none
+                    else pure <| some <| rpcError id (-32601) s!"method not found: {method}"
+              if let some reply := reply? then
+                out.putStrLn reply.compress
+                out.flush
       return 0
 
 initialize
