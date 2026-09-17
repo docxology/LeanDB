@@ -374,14 +374,22 @@ def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.table
     (`Pred.forTable`), and a quantifier among them needs the alias to
     correlate its subquery with the outer row. Callers pass an opaque-free
     tree (`Pred.approx`). -/
-def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts) :
-    DbM (Array (Stored α)) := do
-  if pred.isTrivial then return ← fetchAll α
+def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts)
+    (limit : Option Nat := none) : DbM (Array (Stored α)) := do
+  if pred.isTrivial && limit.isNone then return ← fetchAll α
   let (whereSql, binds) := pred.render fun _ => "t0"
-  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id"
+  -- a caller-supplied cap ships to SQL as a bound parameter, so the
+  -- fetch (and the child-list attachment under it) is bounded by the
+  -- cap, not by the table (issue: `rows --limit` never reached SQL)
+  let limitBind : Array LeanDb.Col := match limit with
+    | some n => #[LeanDb.Col.int (Int64.ofNat n)]
+    | none => #[]
+  let limitSql := match limit with | some _ => " LIMIT ?" | none => ""
+  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id{limitSql}"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 binds
+    bindCols stmt (binds.size + 1) limitBind
     let mut out := #[]
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
