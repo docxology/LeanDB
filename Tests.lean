@@ -3129,6 +3129,109 @@ private def testFootprints : IO Unit := do
   check (impact.any fun i => (i.getObjValAs? String "query").toOption == some "unratedByAuthor"
       && (i.getObjValAs? Nat "logged_runs").toOption == some 1) s!"impact names the query and its run: {st}"
   check (((st.getObjValAs? (Array String) "changed").toOption.getD #[]).contains "book.*") s!"changed lists book.*: {st}"
+  -- The historical window is explicit, and static impact survives a disabled scan.
+  for _ in [0:2] do
+    discard <| b.handle inst sess ["query", "unratedByAuthor", toString adaId]
+  let limited := { b2 with log := { impactLimit := 1 } }
+  let limitedSess ← expectOk (← Cli.Session.open limited inst) "open with an impact budget"
+  let limitedStatus ← limited.handle inst limitedSess ["migrate", "status"]
+  let window := (limitedStatus.getObjVal? "impact_log").toOption.getD .null
+  check ((window.getObjValAs? Nat "limit").toOption == some 1 &&
+    (window.getObjValAs? Nat "scanned").toOption == some 1 &&
+    (window.getObjValAs? Bool "truncated").toOption == some true) s!"bounded impact window: {limitedStatus}"
+  let limitedImpact := (limitedStatus.getObjValAs? (Array Lean.Json) "impact").toOption.getD #[]
+  check (limitedImpact.any fun i => (i.getObjValAs? Nat "logged_runs").toOption == some 1)
+    "impact counts only the recent window"
+  let staticOnly := { b2 with log := { impactLimit := 0 } }
+  let staticSess ← expectOk (← Cli.Session.open staticOnly inst) "open with historical scans disabled"
+  let staticStatus ← staticOnly.handle inst staticSess ["migrate", "status"]
+  let staticImpact := (staticStatus.getObjValAs? (Array Lean.Json) "impact").toOption.getD #[]
+  check (staticImpact.any fun i => (i.getObjValAs? String "query").toOption == some "unratedByAuthor" &&
+    (i.getObjValAs? Nat "logged_runs").toOption == some 0) "static impact does not depend on history"
+  let unchanged ← b.handle inst sess ["migrate", "status"]
+  check ((unchanged.getObjVal? "impact_log").toOption.isNone &&
+    ((unchanged.getObjValAs? (Array String) "notes").toOption.getD #[]).contains "schema already up to date")
+    "an unchanged schema returns before computing impact"
+  let migration : Migration := {
+    fromFingerprint := fingerprint b.specs
+    toFingerprint := fingerprint b2.specs
+    snapshot := b2.specs }
+  let chained := { limited with chain := some { origin := b.specs, migrations := [migration] } }
+  let chainSess ← expectOk (← Cli.Session.open chained inst) "open versioned impact fixture"
+  let chainStatus ← chained.handle inst chainSess ["migrate", "status"]
+  let chainWindow := (chainStatus.getObjVal? "impact_log").toOption.getD .null
+  check ((chainWindow.getObjValAs? Nat "scanned").toOption == some 1 &&
+    (chainWindow.getObjValAs? Bool "truncated").toOption == some true) s!"chain impact is bounded too: {chainStatus}"
+
+private def testLogPolicy : IO Unit := do
+  let .ok defaults := LogConfig.ofSettings {} none none | throw <| IO.userError "default log config failed"
+  check (defaults.maxEntries.isNone && defaults.impactLimit == 1000) "preserve history by default"
+  let .ok overrides := LogConfig.ofSettings { maxEntries := some 9 } (some "unlimited") (some "0") |
+    throw <| IO.userError "log overrides failed"
+  check (overrides.maxEntries.isNone && overrides.impactLimit == 0) "explicit unlimited and zero scan"
+  for s in ["", "-1", "oops", "9223372036854775807", "18446744073709551616"] do
+    check ((LogConfig.ofSettings {} (some s) none).toOption.isNone) s!"bad retention {s}"
+    check ((LogConfig.ofSettings {} none (some s)).toOption.isNone) s!"bad impact limit {s}"
+  let path : System.FilePath := ".lake/leandb_test_log_policy.sqlite"
+  if ← path.pathExists then IO.FS.removeFile path
+  let conn ← expectOk (← openDb path schema) "open log-policy fixture"
+  for id in [2, 5, 9, 17, 30] do
+    conn.raw.exec s!"INSERT INTO _leandb_log(id,verb,detail,ok,rows) VALUES ({id},'insert','fixture',1,0)"
+  let reopened ← expectOk (← openDbRaw path) "reopen with default retention"
+  check ((← expectOk (← (readLog 10).run reopened) "default history").size == 5) "default open never prunes"
+  let conn ← expectOk (← openDb path schema { maxEntries := some 3 }) "open with retention"
+  let kept ← expectOk (← (readLog 10).run conn) "retained history"
+  check (kept.map (fun j => (j.getObjValAs? Nat "id").toOption.getD 0) == #[30, 17, 9])
+    "retention keeps the newest entries despite id gaps"
+  for i in [0:7] do
+    discard <| expectOk (← (insert Author ⟨s!"author-{i}", i⟩).run conn) "logged write"
+    let entries ← expectOk (← (readLog 10).run conn) "batched retention"
+    check (entries.size <= 5) "a long-lived connection stays within its retention batch"
+  let entries ← expectOk (← (readLog 10).run conn) "history after seven writes"
+  check (entries.size == 4) "retention runs repeatedly without reopening"
+  let removed ← expectOk (← (pruneLog 1).run conn) "manual prune"
+  check (removed == 3) "manual prune returns the deleted count"
+  check ((← expectOk (← (fetchAll Author).run conn) "application rows").size == 7)
+    "pruning never deletes application data"
+  let b : Base := { name := "log_policy", tables := [CliTable.of Author, CliTable.of Book] }
+  let inst := Instance.ofPath path
+  let sess ← expectOk (← Cli.Session.open b inst) "CLI log session"
+  let cleared ← b.handle inst sess ["log", "prune", "0"]
+  check ((cleared.getObjValAs? Nat "deleted").toOption == some 1) "CLI can clear history explicitly"
+  let bad ← b.handle inst sess ["log", "prune", "-1"]
+  check ((bad.getObjValAs? String "code").toOption == some "usage") "invalid prune is a usage error"
+  discard <| expectOk (← (insert Author ⟨"before-disable", 1⟩).run conn) "write before disabling logs"
+  let disabled ← expectOk (← openDb path schema { maxEntries := some 0 }) "disable logging"
+  discard <| expectOk (← (insert Author ⟨"no-log", 1⟩).run disabled) "writes still work without logs"
+  check ((← expectOk (← (readLog 10).run disabled) "disabled history").isEmpty) "zero clears and disables logs"
+  -- Only select plans enter the scan; the one-row lookahead is not parsed.
+  let plan := "{\"footprint\":{\"columns\":[\"author.age\"]}}"
+  for q in ["old", "new"] do
+    let st ← disabled.raw.prepare "INSERT INTO _leandb_log(verb,detail,ok,rows,query,plan) VALUES ('select','fixture',1,0,?,?)"
+    st.bindText 1 q
+    st.bindText 2 plan
+    st.exec
+  disabled.raw.exec "INSERT INTO _leandb_log(verb,detail,ok,rows,plan) VALUES ('insert','ignored',1,0,'not-json')"
+  let scan ← scanLogFootprints disabled 1
+  check (scan.entries == #[(some "new", [("author", "age")])] && scan.truncated)
+    "scan counts select plans only, newest first, with truncation"
+  let exact ← scanLogFootprints disabled 2
+  check (exact.entries.size == 2 && !exact.truncated) "exact window is not truncated"
+  let zero ← scanLogFootprints disabled 0
+  check (zero.entries.isEmpty && zero.truncated) "zero scan parses no plans"
+  -- Restoring reopens the file with the base's policy, not the raw defaults.
+  let backup : System.FilePath := ".lake/leandb_test_log_policy_backup.sqlite"
+  if ← backup.pathExists then IO.FS.removeFile backup
+  backupTo disabled backup
+  let retainedBase := { b with log := { maxEntries := some 1, impactLimit := 2 } }
+  let retainedSess ← expectOk (← Cli.Session.open retainedBase inst) "configured restore session"
+  let restored ← retainedBase.handle inst retainedSess ["restore", backup.toString]
+  check ((restored.getObjValAs? Bool "ok").toOption == some true) s!"restore: {restored}"
+  let restoredConn ← retainedSess.conn.get
+  check (restoredConn.logConfig.maxEntries == some 1 && restoredConn.logConfig.impactLimit == 2)
+    "restore preserves configured limits"
+  check ((← expectOk (← (readLog 10).run restoredConn) "restored log").size == 1)
+    "restore reapplies retention to restored history"
 
 private def testHttpBodyLimits : IO Unit := do
   check ((Http.bodyLimitOf none).toOption == some (2 * 1024 * 1024)) "HTTP default body limit"
@@ -3257,6 +3360,7 @@ def main : IO UInt32 := do
   testModuleNameOk
   testStdioLineCap
   testHttpBodyLimits
+  testLogPolicy
   testCodecs
   testBaseSpecs
   testSession
