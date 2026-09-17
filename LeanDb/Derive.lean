@@ -110,6 +110,16 @@ def tableNameOf (declName : Name) : String :=
     else
       acc ++ c.toString
 
+/-- Field/column names LeanDB cannot generate as a field symbol: `rec`
+    collides with the recursor every inductive gets (`Field.rec`), and the
+    modifier keywords cannot start a constructor declaration (an
+    `inductive T.Field where | unsafe` fails to parse). A structure can
+    carry such a field under guillemets, but `deriving LeanDb.Entity`
+    would then fail with an unattributed kernel or parser error, so the
+    derive refuses them by name (and the importer skips such columns). -/
+def unusableSymNames : List String :=
+  ["rec", "unsafe", "noncomputable", "partial", "private", "protected"]
+
 private def fieldBinder (i : Nat) : Ident := mkIdent (Name.mkSimple s!"f{i}")
 
 /-- An identifier for a declaration generated next to `declName`, anchored
@@ -670,6 +680,18 @@ private def mkChildLink (declName : Name) (tblName : String) (gens : Array Field
       attach := $attachBody
       attachRecomputing := $attachRecBody : LeanDb.ChildLink $(mkCIdent declName) })
 
+/-- Refuse the field/column names `unusableSymNames` covers: the generated
+    symbol inductive cannot declare them, and the failure would otherwise
+    be an unattributed kernel or parser error. -/
+private def checkSymNames (who : String) (declName : Name) (gens : Array FieldGen) :
+    TermElabM Unit := do
+  for g in gens do
+    for c in g.cols do
+      if unusableSymNames.contains c.colName then
+        throwError "{who}: {declName} declares field '{c.colName}', whose name cannot be \
+generated as a LeanDB field symbol (an inductive constructor with that name is refused by Lean); \
+rename the field"
+
 /-- `deriving LeanDb.Entity` for `declName`. `tableName?` overrides the
     table name (a generated child's `<parent>_<field>`); `cascade` names
     the `Ref` fields whose FK cascades and the table each references (a
@@ -689,6 +711,7 @@ partial def deriveEntityCore (declName : Name) (tableName? : Option String := no
   -- 1. The walk, then the field symbols (one per column: an inline field
   --    contributes `field_sub` for each of its sub-fields; a child list none).
   let gens ← liftTermElabM (walkFields who declName (entity := true) cascade)
+  liftTermElabM (checkSymNames who declName gens)
   declareSymbols who declName gens
   -- 2. The child entities, one per child list, each with its own symbols
   --    and instance — declared before the parent's instance names them.
@@ -751,6 +774,7 @@ def deriveInline (declName : Name) : CommandElabM Bool := do
   checkStructure who declName
   let fieldTyName := declName ++ `Field
   let gens ← liftTermElabM (walkFields who declName (entity := false))
+  liftTermElabM (checkSymNames who declName gens)
   declareSymbols who declName gens
   let cmds ← liftTermElabM do
     let b ← buildShared declName gens

@@ -1266,6 +1266,29 @@ private def testImportNotCarried : IO Unit := do
       (e.reason.splitOn "1 unnamed").length > 1)
     "the unnamed CHECK is reported with a count"
 
+/-- A column named `rec` (or a Lean modifier keyword) cannot become a
+    field symbol: the derive would fail with an unattributed kernel or
+    parser error. The importer skips it by name, like a BLOB. -/
+private def testImportUnusableNames : IO Unit := do
+  let t : RawTable :=
+    { name := "widget"
+      createSql := "CREATE TABLE widget (id INTEGER PRIMARY KEY, rec TEXT NOT NULL, safe TEXT)"
+      columns := #[
+        { name := "id", declType := "INTEGER", notnull := true, pkIndex := 1, defaultSql := none },
+        { name := "rec", declType := "TEXT", notnull := true, pkIndex := 0, defaultSql := none },
+        { name := "safe", declType := "TEXT", notnull := false, pkIndex := 0, defaultSql := none }]
+      fks := #[]
+      indexes := #[] }
+  let plan := planOf "wn" "Wn" { tables := #[t], views := #[], triggers := #[], indexes := #[] }
+  check ((plan.tables.map (·.table)) == #["widget"]) "the table still imports"
+  let skipped := (plan.tables.find? (·.table == "widget")).map fun tp =>
+    (tp.skippedColumns.map (·.1)).toList
+  check (skipped == some ["rec"]) s!"rec is skipped by name, got {repr skipped}"
+  check ((plan.tables.find? (·.table == "widget")).any fun tp =>
+      (tp.skippedColumns.find? (·.1 == "rec")).any fun (_, r) =>
+        (r.splitOn "field symbol").length > 1)
+    "the skip reason says why"
+
 end Importer
 
 /-! ## LEP-0003 B: JSON columns with a declared shape, derived columns -/
@@ -1297,6 +1320,7 @@ structure Point where
   deriving Repr, DecidableEq, LeanDb.DbJson
 
 /-- `Point` plus a defaulted field: additive. -/
+
 structure Widened where
   x : Nat
   y : Nat := 0
@@ -2925,6 +2949,7 @@ def main : IO UInt32 := do
   testImportNotCarried
   testQuotedEndToEnd
   testAdoptAffinity
+  testImportUnusableNames
   Lep3.run
   EnumSetA.run
   testOptionalParamPlans
