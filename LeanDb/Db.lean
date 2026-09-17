@@ -73,7 +73,15 @@ private def constraintError (table : String) (fkError : DbError) (e : IO.Error) 
 def bindCol (stmt : SQLite.Stmt) (idx : Int32) : Col → IO Unit
   | .int v => stmt.bindInt64 idx v
   | .text v => stmt.bindText idx v
-  | .real v => stmt.bindFloat idx v
+  | .real v =>
+      /- SQLite stores a bound NaN as NULL: against a NOT NULL REAL
+         column the write fails with a misleading constraint error, and
+         against a nullable one it "succeeds" but the value silently
+         reads back `none`. Refuse it at the write boundary instead —
+         a NaN has no SQLite representation that survives a round trip. -/
+      if v.isNaN then
+        throw <| IO.userError "REAL value is NaN (SQLite stores NaN as NULL; the value would not survive a round trip)"
+      else stmt.bindFloat idx v
   | .null => stmt.bindNull idx
 
 /-- Bind row values starting at parameter `first` (bind params are 1-based). -/

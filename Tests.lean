@@ -1146,6 +1146,28 @@ private def testUniqueConstraint : IO Unit := do
   expectErr (← withDb uniqDbPath schema do discard <| insert Author ⟨"Ada", 41⟩)
     "duplicate" "uniqueness violation is typed, not a raw sqlite error"
 
+private def nanDbPath : System.FilePath := ".lake" / "leandb_test_nan.sqlite"
+
+/-- A NaN Float has no SQLite representation: bound, it becomes NULL, so a
+    NOT NULL REAL column failed with a misleading constraint error and a
+    nullable one silently reads back `none`. The bind boundary refuses it
+    by name instead. -/
+private def testNanReal : IO Unit := do
+  if ← nanDbPath.pathExists then IO.FS.removeFile nanDbPath
+  let nan : Float := 0.0 / 0.0
+  let r ← withDb nanDbPath schema do
+    discard <| insert Author ⟨"Ada", 36⟩
+    discard <| insert Book ⟨"NaN", ⟨1⟩, some nan⟩
+  expectErr r "sqlite" "NaN into a REAL column is refused at the bind boundary"
+  match r with
+  | .error e =>
+      check ((e.message.splitOn "NaN").length > 1) s!"the refusal names NaN, got {e.message}"
+  | .ok _ => pure ()
+  let count ← withDb nanDbPath schema do
+    return (← select [Book] (fun _ => true)).size
+  check ((← expectOk count "rows after the refused NaN write") == 0)
+    "nothing was stored for the refused write"
+
 /-! ## Importer: what it reports as not carried (§5.3 — partial support is
 fine, *silent* partiality is not). `planOf` is pure, so this drives it
 over a hand-built schema rather than a database file. -/
@@ -1176,6 +1198,7 @@ private def phantomTable : RawTable :=
         pkIndex := 0, defaultSql := none }]
     fks := #[]
     indexes := #[] }
+
 
 /-- Real constraints: an inline `UNIQUE`, a named `CONSTRAINT ... CHECK`,
     an unnamed inline `CHECK`, and a table-level `UNIQUE (sku, qty)`. -/
@@ -2865,6 +2888,7 @@ def main : IO UInt32 := do
   testEmptyEntity
   testBlobColumn
   testUniqueConstraint
+  testNanReal
   testImportNotCarried
   testQuotedEndToEnd
   Lep3.run
