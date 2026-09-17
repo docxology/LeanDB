@@ -2961,8 +2961,16 @@ private def testCliLimits : IO Unit := do
     check ((Cli.limitOf s).toOption.isNone) s!"a limit beyond Int64 range is refused: {s}"
   check ((Cli.limitOf "oops").toOption.isNone) "a non-numeric limit is refused"
 
+private def testPortOf : IO Unit := do
+  check ((Cli.portOf "7411").toOption == some 7411) "ordinary port parses"
+  check ((Cli.portOf "1").toOption == some 1) "lowest port parses"
+  check ((Cli.portOf "65535").toOption == some 65535) "highest port parses"
+  for s in ["0", "65536", "70000", "-1", "oops", ""] do
+    check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
+
 def main : IO UInt32 := do
   testCliLimits
+  testPortOf
   testHttpBodyLimits
   testCodecs
   testBaseSpecs

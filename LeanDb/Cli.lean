@@ -140,6 +140,16 @@ private def table? (b : Base) (name : String) : Except String CliTable :=
   | some t => .ok t
   | none => .error s!"unknown table {String.quote name}; tables: {b.tables.map (·.name)}"
 
+/-- Parse a `serve --http` port: a plain number in 1..65535. `Nat.toUInt16`
+    reduces modulo 2^16, so an unguarded conversion silently binds an
+    unintended port (`70000` → 4464) while the operator watches for 70000. -/
+def portOf (s : String) : Except String UInt16 :=
+  match s.toNat? with
+  | some p =>
+      if p == 0 || p > 65535 then .error s!"port out of range: {s} (expected 1..65535)"
+      else .ok p.toUInt16
+  | none => .error s!"expected a port, got {String.quote s}"
+
 private def logJson (limit : Nat) : DbM Json := do
   let rows ← readLog limit
   return Json.mkObj [("ok", Json.bool true), ("count", Lean.toJson rows.size),
@@ -687,8 +697,11 @@ def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
           match parse rest with
           | .error m => IO.eprintln (usageErr m).compress; return 3
           | .ok (port?, host?, token?) =>
-              match port?.bind (·.toNat?) with
-              | some port => http b inst (host?.getD "127.0.0.1") port.toUInt16 token?
+              match port? with
+              | some p =>
+                  match portOf p with
+                  | .ok port => http b inst (host?.getD "127.0.0.1") port token?
+                  | .error m => IO.eprintln (usageErr m).compress; return 3
               | none => IO.eprintln (usageErr "serve --http <port> [--bind <host>] [--auth-token <token>]").compress; return 3
       | none =>
           IO.eprintln (usageErr "HTTP serving is not linked into this base").compress
