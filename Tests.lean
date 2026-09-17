@@ -3119,9 +3119,27 @@ private def testPortOf : IO Unit := do
   for s in ["0", "65536", "70000", "-1", "oops", ""] do
     check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
 
+private def rowsDbPath : System.FilePath := ".lake" / "leandb_test_rows_limit.sqlite"
+
+private def testRowsLimitPushdown : IO Unit := do
+  -- the cap must reach SQL, not trim after a full-table fetch
+  if ← rowsDbPath.pathExists then IO.FS.removeFile rowsDbPath
+  discard <| expectOk (← withDb rowsDbPath schema do
+    for i in [0:10] do
+      discard <| insert Author ⟨s!"a{i}", i⟩) "seed ten authors"
+  -- the CLI `rows` path (`rowsWhere`): the cap ships as a bound LIMIT ?
+  -- over the trivial plan, so exactly three rows are fetched, not ten
+  let j ← expectOk (← withDb rowsDbPath schema do
+    (CliTable.of Author).rowsWhere [] 3) "rows with limit 3"
+  check ((j.getObjValAs? Nat "count").toOption == some 3) s!"three rows: {j}"
+  -- direct: fetchFiltered with a cap bounds the fetch itself
+  let capped ← withDb rowsDbPath schema do fetchFiltered (α := Author) (ts := [Author]) .tt (some 3)
+  check ((← expectOk capped "capped fetch").size == 3) "the cap bounds the fetch"
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
+  testRowsLimitPushdown
   testPortOf
   testHttpBodyLimits
   testCodecs
