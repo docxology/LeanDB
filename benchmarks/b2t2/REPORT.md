@@ -145,6 +145,12 @@ Compiler messages name the Lean field or the `Rows [Student]` type. They do not 
 
 ## Comparison with other table systems
 
+The [head-to-head comparison](COMPARISON.md) compares the same operations,
+example programs, and error cases across LeanDB, TypeScript, Empirical, and
+Rotella's Lean tables. It includes source revisions and qualifications such as
+TypeScript's fixed sampling example and Rotella's specialized quiz proofs.
+The [README](README.md#head-to-head-how-does-leandb-compare) has a compact table.
+
 B2T2's [Media catalog](https://github.com/brownplt/B2T2/blob/fd227efadf532a20aefd25c7a8580978c2d684a2/Media/README.md)
 lists TypeScript and Empirical implementations, with other projects in progress.
 Being listed does not establish complete conformance. The comparison below is
@@ -191,6 +197,7 @@ These are proposed improvements, outside the measured v0.3.1 results.
 | File | Contents |
 |---|---|
 | [INVENTORY.md](INVENTORY.md) | Every upstream case and its classification |
+| [COMPARISON.md](COMPARISON.md) | Head-to-head capabilities, error cases, versions, and source evidence |
 | [REPRESENTATION.md](REPRESENTATION.md) | Name mapping, IDs, missing values, child tables |
 | [DATASHEET.md](DATASHEET.md) | Completed upstream template |
 | [B2T2Tests.lean](B2T2Tests.lean) | Runnable checks and `#check_failure` controls |

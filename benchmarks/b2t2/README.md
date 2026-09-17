@@ -88,6 +88,43 @@ as `pivotWider`, which turns cell values into new column names, remain unsupport
 in this evaluation. See the [representation notes](REPRESENTATION.md) for the
 underlying choices.
 
+## Head-to-head: how does LeanDB compare?
+
+**TypeScript and Rotella's Lean tables cover more of B2T2's schema-changing
+operations. LeanDB combines checks on declared schemas with SQLite persistence.**
+Empirical shares more of LeanDB's restrictions on dynamic column names, and its
+published port cannot represent sequence or nested-table cells.
+
+This compares our **v0.3.1 run** with the **published TypeScript reference,
+Empirical 0.6.9, and Rotella's 2024 thesis implementation**. The other candidates
+were reviewed through their datasheets and source, not re-run. Their reports use
+different benchmark revisions, so the cells describe capabilities rather than a
+common pass rate.
+
+| Capability | LeanDB v0.3.1 | TypeScript reference | Empirical 0.6.9 | Rotella's Lean tables |
+|---|---|---|---|---|
+| Represent example data | All 10, with encodings | All, per datasheet | No sequence/nested cells | Sequence/nested cells supported |
+| Add, drop, or rename columns generically | Requires a new type or specialized projection | Implemented; some constraints escape types | Limited; schema changes missing | Implemented with schema proofs; some semantic differences |
+| `pivotLonger` / `pivotWider` | Unsupported | Implemented | Unsupported | Implemented |
+| Discover quiz columns by name | Hardcoded fields | Name filtering plus casts | Limited; computed-name example not established | Prefix proofs; quiz examples still specialized |
+| Reject an unknown field / string filter | Compile-time with typed access | Compile-time diagnostics | Compile-time diagnostics | Compile-time type/proof checks |
+| Reject row 1 of a one-row result | Runtime bounds check | Datasheet reports no detection | Runtime array bounds check | Bounds proof rejects the example |
+| Sampling example | Seeded generator; size and membership checked | Example hardcodes row indices | Reported unavailable | Seeded generator; size bounded by type |
+
+Sources and qualifications: [TypeScript datasheet][ts-datasheet] and
+[programs][ts-programs], [Empirical datasheet][emp-datasheet] and
+[errors][emp-errors], [Rotella's thesis][rotella-thesis] and
+[programs][rotella-programs]. The [detailed comparison](COMPARISON.md) links the
+individual APIs and error cases, explains the different scoring conventions,
+and includes pandas as a familiar reference point.
+
+Our reading: **LeanDB has substantial ground to cover on generic table
+transformations.** Its error checks are useful, but compile-time field checks
+are also present in the other typed candidates. Rotella's library goes further
+on row-bound proofs. LeanDB's persistence, references, and migrations address
+application storage; this evaluation does not rank those features against the
+other systems.
+
 ## Why this matters for LeanDB
 
 LeanDB's promise is to connect Lean types to stored SQL data. B2T2 tests that
@@ -138,6 +175,7 @@ produce different results. For a fresh checkout of the evaluated code, use the
 | File | Read it for |
 |---|---|
 | [Report](REPORT.md) | Detailed results, comparisons, and limits of the evidence |
+| [Head-to-head comparison](COMPARISON.md) | The same capabilities and error cases across four candidates |
 | [Coverage matrix](INVENTORY.md) | The status of every benchmark case |
 | [Table representations](REPRESENTATION.md) | Column names, missing values, row IDs, sequences, and child tables |
 | [Datasheet](DATASHEET.md) | Answers in B2T2's standard reporting format |
@@ -148,3 +186,10 @@ produce different results. For a fresh checkout of the evaluated code, use the
 
 Example tables and case names are adapted from B2T2, copyright Brown University
 PLT, under the [MIT license](LICENSE-B2T2.txt).
+
+[ts-datasheet]: https://github.com/brownplt/B2T2/blob/fd227efadf532a20aefd25c7a8580978c2d684a2/Media/TypeScript/Datasheet.md
+[ts-programs]: https://github.com/brownplt/B2T2/blob/fd227efadf532a20aefd25c7a8580978c2d684a2/Media/TypeScript/ExamplePrograms.ts
+[emp-datasheet]: https://github.com/brownplt/B2T2/blob/fd227efadf532a20aefd25c7a8580978c2d684a2/Media/Empirical/Datasheet.md
+[emp-errors]: https://github.com/brownplt/B2T2/blob/fd227efadf532a20aefd25c7a8580978c2d684a2/Media/Empirical/Errors.md
+[rotella-thesis]: https://cs.brown.edu/media/filer_public/b8/d7/b8d70bb1-9c0e-467f-aec6-aaf42019f169/rotellajoseph.pdf
+[rotella-programs]: https://github.com/jrr6/lean-tables/blob/7dfa8308e13cb7b15296cc63fa2cbd26c0d0f712/Table/ExamplePrograms.lean
