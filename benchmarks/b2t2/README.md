@@ -1,44 +1,150 @@
-# LeanDB × B2T2
+# LeanDB on B2T2
 
-Isolated evaluation of LeanDB **v0.3.1**
-(`ad8d7f3de883176b7de0b6433cb8cd3fc25a8763`) against the Brown Benchmark
-for Table Types **v1.2**
-(`fd227efadf532a20aefd25c7a8580978c2d684a2`).
+## TL;DR
 
-The engine is not modified. The write-up is [REPORT.md](REPORT.md): pins, scores, comparison with TypeScript, Empirical, pandas, and Rotella's Lean tables.
+**LeanDB provides useful compile-time checks for tables with known schemas. Its
+biggest gap is working with tables whose columns are computed at runtime.**
 
-## Reproduce
+In our evaluation of **LeanDB v0.3.1** against **B2T2 v1.2**:
 
-From this directory, with [elan](https://github.com/leanprover/elan) installed:
+- All **10 example datasets** can be stored and read back, with some encoding changes.
+- **12 of 14 error situations** are prevented in their typed Lean adaptations.
+  The other two remain expressible and need runtime checks or application logic.
+- The API has a mix of engine support, extra Lean helpers, and substantial gaps.
+  The example programs need adaptations; matching their sample output does not
+  mean supporting their full interface.
+
+This is evidence about **what you can express and which mistakes types catch**.
+It gives no query-speed or throughput score. The recorded run passed on
+September 14, 2026; the [report](REPORT.md) explains the evidence and limitations.
+
+## What is B2T2?
+
+B2T2 is the **Brown Benchmark for Table Types**, created by Kuang-Chen Lu,
+Ben Greenman, and Shriram Krishnamurthi. It gives languages and libraries a common
+set of table operations, programs, and mistakes to evaluate. The aim is to make
+claims about “typed tables” concrete and comparable.
+See the [paper](https://cs.brown.edu/people/sk/Publications/Papers/Published/lgk-b2t2/)
+and [upstream benchmark](https://github.com/brownplt/B2T2/tree/fd227efadf532a20aefd25c7a8580978c2d684a2).
+
+The examples look like ordinary data work: student records, employee departments,
+gradebooks, filtering, joining, grouping, and calculating averages. Some ask harder
+questions: can a program discover every column beginning with `quiz`, establish
+that those columns contain numbers, and calculate an average safely?
+
+This evaluation inventories **10 example tables, 49 API operations and overloads,
+8 example programs, and 14 error situations**. It examines three separate things:
+
+1. **Correctness:** does the adapted program produce the expected result?
+2. **Expressiveness:** can it handle the general operation, or just a known schema?
+3. **Error handling:** when is a mistake caught, and does the message help locate it?
+
+## How are we doing?
+
+| Area | Result | How to read it |
+|---|---|---|
+| Example data | **10 / 10 encoded and loaded** | Missing values work. Sequences use a local JSON codec; nested tables become child tables. Column names and row identity also need adaptation. |
+| Table API | **31 direct/helper adaptations, 12 schema-specific adaptations, 6 unsupported** | These classify the 49 inventory entries. Many run in Lean after fetching rows; they are not 43 built-in database operations or 43 fully verified implementations. |
+| Example programs | **8 adaptations; 0 / 8 claimed in the original B2T2 interface** | Typed field access and Lean arrays replace parts of the table/column-name API. Seven adaptations have runtime assertions; subtractive grouping is implemented without its own assertion. |
+| Error situations | **12 / 14 prevented in typed form; 2 remain expressible** | Structures reject missing or wrong fields and incorrect cell types. Row bounds need runtime checks; types alone do not identify an incorrect lookup helper. |
+
+The [coverage matrix](INVENTORY.md) lists every case. These counts describe our
+port and its limitations; they are not an overall B2T2 pass percentage.
+
+### Where the types help
+
+A gradebook has a `midterm` field. Accidentally asking for `mid` fails during
+compilation:
+
+```lean
+import B2T2
+
+open B2T2
+
+#check fun (g : Gradebook) => g.midterm
+#check_failure fun (g : Gradebook) => g.mid
+```
+
+The suite also checks that a string cannot be used as a filter's Boolean result,
+and that a query for students cannot receive a predicate for gradebook rows.
+These checks help when application code and database schemas evolve: a stale
+typed field reference becomes a compiler error.
+
+The guarantee depends on using the typed interface. The evaluation's helper for
+looking up a column by a string accepts `"mid"` as input, then returns an error
+listing the available columns at runtime. Plotting itself is outside this port;
+for B2T2's plotting errors, we test the invalid field access the plot would use.
+
+### Where the flexibility runs out
+
+The quiz-average adaptation explicitly reads `quiz1`, `quiz2`, `quiz3`, and
+`quiz4`. It returns the expected **8.25, 7.25, and 8.0**. B2T2 also asks for a
+program that discovers or constructs the quiz column names. Adding `quiz5`
+would require changing our adaptation; it would not be picked up automatically.
+
+Similarly, filtering, sorting, and inner joins have engine support, while adding
+or renaming columns generally requires declaring a new Lean type. Operations such
+as `pivotWider`, which turns cell values into new column names, remain unsupported
+in this evaluation. See the [representation notes](REPRESENTATION.md) for the
+underlying choices.
+
+## Why this matters for LeanDB
+
+LeanDB's promise is to connect Lean types to stored SQL data. B2T2 tests that
+promise against examples chosen outside this project, including awkward cases
+that a short demo can easily miss.
+
+For applications with declared tables—tickets, customers, orders—the results
+give concrete examples of the checks that typed queries provide. For exploratory
+data analysis with columns discovered from input data, the gaps are substantial.
+Supporting those programs would require a more flexible table abstraction.
+
+The findings also suggest practical improvements: clearer errors for string-based
+column lookup, an engine left join, and built-in sequence storage. Supporting
+computed column names is a larger design decision. These are proposals, not
+features included in the measured release.
+
+B2T2 does not assess LeanDB's overall database suitability: this run does not
+measure throughput, memory use, planner quality, concurrent writers, or migration
+safety. The [report's comparison](REPORT.md#comparison-with-other-table-systems)
+puts the results alongside other approaches to typed tables.
+
+## Run it yourself
+
+Install [elan](https://github.com/leanprover/elan), then run from the repository root:
 
 ```bash
+cd benchmarks/b2t2
 ./scripts/run.sh
 ```
 
-That writes `results/run.log` including `git rev-parse HEAD` of the
-engine tree. First build compiles bundled SQLite.
+The first build compiles bundled SQLite and can take several minutes. A successful
+run ends with:
 
-Manual:
-
-```bash
-lake build b2t2_tests
-./.lake/build/bin/b2t2_tests
+```text
+b2t2: fixture, operation, program, and error tests passed
 ```
 
-Fresh checkout: see [BASELINE.md](BASELINE.md).
+This means the implemented checks passed, including expected compilation failures.
+Unsupported operations are recorded in the inventory, not exercised by that command.
 
-## Layout
+The script **overwrites `results/run.log`** and records the current repository
+revision. The package uses the engine in this checkout, so a later checkout may
+produce different results. For a fresh checkout of the evaluated code, use the
+[baseline instructions](BASELINE.md#setup-from-a-fresh-checkout).
 
-| Path | Role |
+## Go deeper
+
+| File | Read it for |
 |---|---|
-| `PLAN.md` | Evaluation plan and tickets |
-| `BASELINE.md` | Pinned revisions |
-| `INVENTORY.md` | Every upstream case |
-| `REPRESENTATION.md` | How tables are encoded |
-| `DATASHEET.md` | Completed B2T2 datasheet |
-| `REPORT.md` | Results pinned to `ad8d7f3` |
-| `B2T2/` | Entities, fixtures, ops, programs |
-| `B2T2Tests.lean` | Suite |
-| `LICENSE-B2T2.txt` | Upstream MIT notice |
+| [Report](REPORT.md) | Detailed results, comparisons, and limits of the evidence |
+| [Coverage matrix](INVENTORY.md) | The status of every benchmark case |
+| [Table representations](REPRESENTATION.md) | Column names, missing values, row IDs, sequences, and child tables |
+| [Datasheet](DATASHEET.md) | Answers in B2T2's standard reporting format |
+| [Baseline](BASELINE.md) | Exact versions and reproduction instructions |
+| [Tests](B2T2Tests.lean) and [implementation](B2T2/) | The runnable evidence and helper code |
+| [Recorded log](results/run.log) | The original build, diagnostics, and test result |
+| [Evaluation plan](PLAN.md) | Scope and original work items |
 
-Example tables and case names are adapted from B2T2 (MIT, Brown PLT).
+Example tables and case names are adapted from B2T2, copyright Brown University
+PLT, under the [MIT license](LICENSE-B2T2.txt).

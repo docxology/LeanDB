@@ -8,15 +8,21 @@ No engine changes are in scope; this package only imports the released library.
 | Artifact | Version | Pin |
 |---|---|---|
 | LeanDB engine | v0.3.1 | `ad8d7f3de883176b7de0b6433cb8cd3fc25a8763` |
+| Evaluation package | Benchmark addition | `5cc3f642e1a0bb096feeec5f5025eba16e5bd820` |
 | B2T2 benchmark | v1.2 tag | `fd227efadf532a20aefd25c7a8580978c2d684a2` |
 | Lean toolchain | Lean 4 | `leanprover/lean4:v4.33.0` |
 | leansqlite | Lakefile pin | `0be4df908d1a8e75b58961041e2b4973692623df` |
 
 LeanDB v0.3.1 is commit `ad8d7f3` (`Complete documentation and release v0.3.1`).
-The package depends on it via `path = "../.."` while this repository is at
-that commit, or any later commit that does not change `LeanDb/` relative to
-it. The report records the exact `git rev-parse HEAD` of the tree that
-was measured.
+The evaluation was added in the next commit, `5cc3f64`, with no changes to the
+engine, its Lake configuration, or its Lean toolchain. The package uses
+`path = "../.."`, so it imports the engine from the current checkout rather
+than fetching the release pin automatically.
+
+The original log records `ad8d7f3`, the repository HEAD when the evaluation was
+run before its files were committed. Reproducing from `5cc3f64` records that
+newer repository SHA while using the same engine source. Checking out the engine
+release alone does not include `benchmarks/b2t2/`.
 
 B2T2 v1.2 is the annotated tag `v1.2`. `main` later moved to
 `eeebf5db7a5c1dbf1893b622ff7fffd63d5c3286` (a `selectMany` signature typo
@@ -43,14 +49,23 @@ adapted from that pin; they are not copied as a git submodule.
 ```bash
 git clone https://github.com/theoriclabs/LeanDB.git leandb
 cd leandb
-# engine pin (v0.3.1):
-git checkout ad8d7f3de883176b7de0b6433cb8cd3fc25a8763
-# then use the benchmarks/b2t2 tree from the evaluation commit
+# Evaluation package plus the unchanged v0.3.1 engine:
+git checkout 5cc3f642e1a0bb096feeec5f5025eba16e5bd820
 cd benchmarks/b2t2
 ./scripts/run.sh
 ```
 
-The first `lake build` compiles bundled SQLite (several minutes).
+Install [elan](https://github.com/leanprover/elan) first. The checked-in
+`lean-toolchain` selects Lean 4.33.0. The first `lake build` compiles bundled
+SQLite and can take several minutes.
 
-One-command reproduction from this directory: `./scripts/run.sh`.
-That command writes `results/run.log` with the measured engine SHA.
+The script overwrites `results/run.log`, recording the current repository HEAD
+as `engine_sha` and a dirty-tree indicator in `engine_describe`.
+
+To run the suite without replacing the historical log, use these commands from
+`benchmarks/b2t2/`:
+
+```bash
+lake build b2t2_tests
+./.lake/build/bin/b2t2_tests
+```

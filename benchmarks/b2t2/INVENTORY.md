@@ -62,7 +62,7 @@ Required/ensured constraints are those in TableAPI.md. Classification is for a *
 | api.hcat | specialized | compile on a pair type | Lean | not a dynamic header concat |
 | api.values | extra | compile | SQL `insert` | fixtures |
 | api.crossJoin | extra / direct | compile (disjoint types) | Lean product / `select [A,B]` | `crossJoin` 3×4 |
-| api.leftJoin | extra | runtime key match | Lean | Williams unmatched |
+| api.leftJoin | extra | runtime key match | Lean | Williams unmatched; helper keeps only the first right match |
 | api.nrows | extra | n/a | Lean (`COUNT` unused) | fixture sizes |
 | api.ncols | extra | n/a | Lean `Entity.spec` | students=3 |
 | api.header | extra | n/a | Lean identifiers | `favoriteColor` ≠ `"favorite color"` |
@@ -81,7 +81,7 @@ Required/ensured constraints are those in TableAPI.md. Classification is for a *
 | api.dropColumns | specialized | compile | Lean | `dropName` |
 | api.tfilter | direct | compile (`Bool`) | SQL+Lean | green students |
 | api.tsort | direct | compile (`Ord`) | SQL `SortBy` + Lean | age order |
-| api.sortByColumns | extra | compile | Lean / `.andThen` | not string names |
+| api.sortByColumns | extra | compile | Lean / `.andThen` | typed adaptation; no dedicated assertion |
 | api.orderBy | extra | compile | `SortBy.key` / `.cmp` | typed keys |
 | api.count | extra | compile | Lean | acne 5/5 |
 | api.bin | unsupported | n/a | — | no histogram op |
@@ -104,7 +104,13 @@ Required/ensured constraints are those in TableAPI.md. Classification is for a *
 | api.groupJoin | extra | assumed | Lean | not in suite |
 | api.join | extra / direct | compile | SQL inner `select` + Lean | 5 matches; drops Williams |
 
-**Counts:** 49 ops. Direct or extra with evidence: 27. Specialized (schema-static): 12. Unsupported: 8. Unrun extra (`find`, `groupJoin`): 2, implemented or trivial, marked extra without a dedicated assert.
+**Counts:** 49 entries: **31 direct or extra**, **12 specialized**, and
+**6 unsupported**. These are support classifications, not counts of passing API
+tests. The direct/extra total includes entries without dedicated assertions
+(`find`, `groupJoin`, `groupBySubtractive`, and `sortByColumns`); some other entries
+share fixture or query checks. A typed adaptation can also differ from the
+generic B2T2 operation. See the evidence/gap column before interpreting a count
+as tested behavior.
 
 ## Example programs
 
@@ -117,7 +123,7 @@ Required/ensured constraints are those in TableAPI.md. Classification is for a *
 | prog.quizScoreFilter | `startsWith "quiz"` | specialized | Hardcoded quiz1–4; averages 8.25/7.25/8 |
 | prog.quizScoreSelect | computed `quizN` names | specialized | Same as filter; does **not** type `concat("quiz", i)` |
 | prog.groupByRetentive | user-defined | extra | Lean groups, not table cells |
-| prog.groupBySubtractive | user-defined | extra | implemented |
+| prog.groupBySubtractive | user-defined | extra | implemented; no dedicated runtime assertion |
 
 ## Errors
 
@@ -136,7 +142,7 @@ Required/ensured constraints are those in TableAPI.md. Classification is for a *
 | err.getOnlyRow | index 1 of 1 | expressible | runtime | `row index 1 not in range(1)` | index 0 |
 | err.favoriteColor | String as pred | prevented | compile | `String` vs `Bool` | `== "green"` |
 | err.brownJellybeans | `"color"` | prevented | compile | `JellyAnon.color` missing | `j.brown` |
-| err.employeeToDepartment | wrong helper | extra | runtime | Williams: no department; Rafferty → Sales | corrected program |
+| err.employeeToDepartment | wrong helper | extra | runtime / application logic | corrected lookup tested: Williams has no department; Rafferty → Sales; wrong helper not rejected by types | corrected program |
 
 `scatterPlot` / `pieChart` (assumed in Errors.md) are **unsupported** (no Image type). The table-shaped mistakes they wrap are still tested.
 

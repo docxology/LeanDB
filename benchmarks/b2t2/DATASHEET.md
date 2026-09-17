@@ -110,8 +110,11 @@ Lean.
 
 > Q. Which operations’ expressibility is unknown? Why?
 
-None at the inventory level; `find` and `groupJoin` are extra Lean
-without a dedicated test.
+None is classified as unknown in the inventory, but classification is not
+verification. `find`, `groupJoin`, `groupBySubtractive`, and `sortByColumns`
+have no dedicated assertions; other entries share checks or use adaptations.
+The 49 API entries comprise 31 direct/extra, 12 specialized, and 6 unsupported
+classifications. See [INVENTORY.md](INVENTORY.md) for the evidence and gaps.
 
 > Q. Which operations can be expressed more precisely than in the benchmark? How?
 
@@ -131,7 +134,8 @@ The *generic* `quizScoreSelect` / `quizScoreFilter` (computed or
 
 > Q. Which examples’ expressibility is unknown? Why?
 
-None.
+None is left unclassified. All eight have adaptations; seven have direct runtime
+assertions. `groupBySubtractive` is implemented without its own runtime assertion.
 
 > Q. Which examples, or aspects thereof, can be expressed especially precisely? How?
 
@@ -158,7 +162,8 @@ names* those plots would consume are still inexpressible as fields
 
 `err.getOnlyRow` is runtime, not a type-level `Fin nrows`.
 `err.employeeToDepartment` is extra Lean; LeanDB does not type “this
-helper returns a department name.” String `getValue` can express the
+helper returns a department name.” Tests cover a corrected lookup and missing
+department data, not rejection of the original incorrect helper. String `getValue` can express the
 `"mid"` bug at runtime; field access prevents constructing it.
 
 > Q. Which error situations’ expressibility is unknown? Why?
@@ -184,8 +189,8 @@ Mechanism: structure fields + `select`’s `Rows ts → Bool`.
 Runtime `getValue "mid"`: `no such column "mid"; columns: [...]`.
 `getRow 1` of a 1-row table: `row index 1 not in range(1)`.
 `employeeToDepartment "Williams"`: `{name} has no department`.
-Messages name the operation (`getValue` / `getRow`) and the field or
-index.
+These messages identify the bad column, row index, or missing department.
+The column and row messages do not include the helper's function name.
 
 > Q. For each error situation that is prevented from being constructed, what is the quality of feedback to the programmer?
 
