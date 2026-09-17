@@ -687,7 +687,23 @@ def Conn.verify (conn : Conn) (specs : List TableSpec) (initialVersion : Nat := 
     | some stored =>
         if stored != fp then
           return .error (.schemaMismatch fp stored)
-    | none => pure ()
+    | none =>
+        -- a file with no fingerprint meta was not created by this engine.
+        -- Stamping the base's fingerprint onto a foreign file whose
+        -- physical tables contradict `specs` would make the metadata lie
+        -- (later verbs fail with raw SQL errors instead of a typed
+        -- mismatch, and `migrate` plans from a phantom baseline), so a
+        -- first open of a file that already carries user tables is
+        -- refused by name. Empty files (and files this engine's own DDL
+        -- has just created) pass.
+        let stmt ← db.prepare
+          "SELECT name FROM sqlite_master WHERE type = 'table' \
+AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_leandb\\_%' ESCAPE '\\'"
+        if ← stmt.step then
+          let existing ← stmt.columnText 0
+          return .error (.migrate s!"the file already carries tables (first: {String.quote existing}) \
+but records no LeanDB schema: it was not created by this base. Adopt it with \
+`leandb import-sqlite` instead of opening it as this base's instance")
     for spec in specs do
       db.exec spec.ddl
     -- Drift scan: stored closed-world values must still be in the vocabulary.

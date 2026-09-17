@@ -2965,6 +2965,32 @@ private def testStrictSchemaJson : IO Unit := do
     SQLite's affinity rules; a raw string comparison matches no version,
     the file is stamped at the head, and the migrations in between
     silently never run. -/
+private def foreignDbPath : System.FilePath := ".lake" / "leandb_test_foreign.sqlite"
+
+/-- A file no LeanDB engine ever created — user tables, no schema meta —
+    must be refused at open, not silently stamped as this base's
+    instance: the stamped metadata would lie, later verbs would fail with
+    raw SQL errors instead of a typed mismatch, and `migrate` would plan
+    from a phantom baseline. -/
+private def testForeignFileRefused : IO Unit := do
+  if ← foreignDbPath.pathExists then IO.FS.removeFile foreignDbPath
+  let db ← SQLite.open foreignDbPath
+  db.exec "CREATE TABLE user (weird_col BLOB NOT NULL)"
+  db.exec "INSERT INTO user VALUES (x'00')"
+  let r ← openDb foreignDbPath schema
+  expectErr r "migrate" "a foreign file with tables is refused, not adopted silently"
+  match r with
+  | .error e =>
+      check ((e.message.splitOn "import-sqlite").length > 1) s!"the refusal points at import-sqlite, got {e.message}"
+  | .ok _ => pure ()
+  let stamped ← (← SQLite.open foreignDbPath).prepare "SELECT COUNT(*) FROM _leandb_meta"
+  discard <| stamped.step
+  check ((← stamped.columnInt64 0) == 0) "no meta was stamped onto the foreign file"
+  -- a fresh file still opens and stamps normally
+  if ← foreignDbPath.pathExists then IO.FS.removeFile foreignDbPath
+  discard <| expectOk (← withDb foreignDbPath schema do discard <| insert Author ⟨"Ada", 36⟩)
+    "a fresh file opens and stamps"
+
 private def testAdoptAffinity : IO Unit := do
   if ← adoptDbPath.pathExists then IO.FS.removeFile adoptDbPath
   let colX : ColumnSpec := { name := "x", sqlType := .integer, nullable := false, fkTable := none }
@@ -3127,6 +3153,7 @@ def main : IO UInt32 := do
   testImportNotCarried
   testQuotedEndToEnd
   testAdoptAffinity
+  testForeignFileRefused
   testImportUnusableNames
   Lep3.run
   EnumSetA.run
