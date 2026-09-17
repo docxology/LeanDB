@@ -120,8 +120,43 @@ private def authorized (auth : Auth) (req : Request Body.Stream) : Bool :=
       | some v => toString v == s!"Bearer {token}"
       | none => false
 
+/-- Default request-body budget for both standalone and hosted bases: 2 MiB. -/
+def defaultMaxBodyBytes : Nat := 2 * 1024 * 1024
+
+/-- Parse the startup setting; an invalid value must not silently disable the limit. -/
+def bodyLimitOf (value : Option String) : Except String Nat := do
+  match value with
+  | none => return defaultMaxBodyBytes
+  | some s =>
+      let some n := s.toNat? | throw "LEANDB_HTTP_MAX_BODY_BYTES must be a positive integer"
+      if n == 0 then throw "LEANDB_HTTP_MAX_BODY_BYTES must be a positive integer"
+      return n
+
+/-- Keep the framing parser's chunk budget. Leave room for the handler to
+    observe the first chunk over its payload budget: Std closes the body
+    stream on a framing error without distinguishing that from normal EOF. -/
+def serverConfig (maxBodyBytes : Nat) : Std.Http.Config :=
+  let defaults : Std.Http.Config := {}
+  { generateDate := false,
+    maxBodySize := max defaults.maxBodySize (maxBodyBytes + defaults.maxChunkSize) }
+
+/-- Stop before appending a chunk that would exceed the budget. This also
+    protects callers that use the handler with their own HTTP configuration. -/
+private partial def readBody (stream : Body.Stream) (limit : Nat) :
+    ContextAsync (Option ByteArray) := do
+  if let some (.fixed n) ← stream.getKnownSize then
+    if n > limit then return none
+  let rec loop (bytes : ByteArray) : ContextAsync (Option ByteArray) := do
+    match ← Body.Stream.NextChunk.nextChunk stream with
+    | none => return some bytes
+    | some chunk =>
+        if bytes.size + chunk.data.size > limit then return none
+        loop (bytes ++ chunk.data)
+  loop ByteArray.empty
+
 /-- One request through the resolver. -/
-def handleRequest (auth : Auth) (resolve : Resolver) (req : Request Body.Stream) :
+def handleRequestWithLimit (maxBodyBytes : Nat) (auth : Auth) (resolve : Resolver)
+    (req : Request Body.Stream) :
     ContextAsync (Response Body.Any) := do
   let method := (toString req.line.method).toUpper
   let segs := (req.line.uri.path.toDecodedSegments.toList).filter (!·.isEmpty)
@@ -134,7 +169,8 @@ def handleRequest (auth : Auth) (resolve : Resolver) (req : Request Body.Stream)
   let query := req.line.uri.query.toList.filterMap fun (k, v) => do
     let k ← k.decode
     some (k, (v.bind (·.decode)).getD "")
-  let bytes : ByteArray ← Body.Stream.readAll req.body
+  let some bytes ← readBody req.body maxBodyBytes |
+    return ← respond .payloadTooLarge (errJson "usage" "request body too large")
   let body := if bytes.isEmpty then none else String.fromUTF8? bytes
   match ← resolve segs with
   | .error (404, m) => respond .notFound (errJson "usage" m)
@@ -151,6 +187,11 @@ def handleRequest (auth : Auth) (resolve : Resolver) (req : Request Body.Stream)
           let j ← dispatch argv
           respond (statusOf j) j
 
+/-- One request with the default body budget, for direct handler callers. -/
+def handleRequest (auth : Auth) (resolve : Resolver) (req : Request Body.Stream) :
+    ContextAsync (Response Body.Any) :=
+  handleRequestWithLimit defaultMaxBodyBytes auth resolve req
+
 private def parseHost (host : String) : Except String Net.IPv4Addr :=
   match host.splitOn "." |>.map (·.toNat?) with
   | [some a, some b, some c, some d] =>
@@ -161,13 +202,19 @@ private def parseHost (host : String) : Except String Net.IPv4Addr :=
 
 /-- Serve a resolver on `host:port` until shutdown. -/
 def serveResolver (host : String) (port : UInt16) (auth : Auth) (resolve : Resolver) (banner : Json) : IO UInt32 := do
+  let maxBodyBytes ← match bodyLimitOf (← IO.getEnv "LEANDB_HTTP_MAX_BODY_BYTES") with
+    | .ok n => pure n
+    | .error m =>
+        IO.eprintln (errJson "usage" m).compress
+        return 3
   let ip ← match parseHost host with
     | .ok ip => pure ip
     | .error m =>
         IO.eprintln (errJson "usage" m).compress
         return 3
   let addr : Net.SocketAddress := .v4 { addr := ip, port }
-  let handler := Std.Http.Server.Handler.ofFn (handleRequest auth resolve)
+  let handler := Std.Http.Server.Handler.ofFn (handleRequestWithLimit maxBodyBytes auth resolve)
+  let banner := banner.mergeObj (Json.mkObj [("max_body_bytes", Lean.toJson maxBodyBytes)])
   let banner := match auth with
     | .open => banner.mergeObj (Json.mkObj [("auth", Json.str "open")])
     | .bearer _ => banner.mergeObj (Json.mkObj [("auth", Json.str "bearer")])
@@ -175,7 +222,7 @@ def serveResolver (host : String) (port : UInt16) (auth : Auth) (resolve : Resol
   -- No `Date` header: the server would compute it through `Std.Time`,
   -- which needs zoneinfo, and a minimal container has none — every
   -- response then dies before its first byte. An API needs no Date.
-  let config : Std.Http.Config := { generateDate := false }
+  let config := serverConfig maxBodyBytes
   Async.block do
     let server ← Std.Http.Server.serve addr handler config
     server.waitShutdown
