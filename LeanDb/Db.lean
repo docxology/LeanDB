@@ -63,7 +63,13 @@ private def constraintError (table : String) (fkError : DbError) (e : IO.Error) 
   | .otherError code details =>
       if code % 256 != 19 then .sqlite (toString e) else
       let msg := details.toLower
-      if code == 787 || hasSub msg "foreign key" then fkError
+      -- the full phrase, not any occurrence of "foreign key": escaped
+      -- identifiers may carry spaces, so a column literally named
+      -- «foreign key» puts that substring inside "UNIQUE constraint
+      -- failed: t.foreign key" — the bare substring would misroute a
+      -- UNIQUE violation to `.missingRef`. SQLite's FK violations read
+      -- exactly "FOREIGN KEY constraint failed" (no table/column names).
+      if code == 787 || hasSub msg "foreign key constraint failed" then fkError
       -- _UNIQUE and _PRIMARYKEY both read "UNIQUE constraint failed: t.c".
       else if code == 2067 || code == 1555 || hasSub msg "unique" || hasSub msg "primary key" then
         .duplicate table details
