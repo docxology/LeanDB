@@ -170,6 +170,15 @@ Commands return JSON. Quote JSON arguments in your shell.
 Exit codes: `0` for success, `2` for database errors, `3` for usage errors,
 and `4` for schema or migration history mismatches.
 
+HTTP servers (`serve --http` and `leandb host`) accept request bodies up to
+**2 MiB** by default. Set `LEANDB_HTTP_MAX_BODY_BYTES` to a positive byte count
+before starting the server to change this limit. The startup JSON reports
+`max_body_bytes`; an invalid setting stops startup with exit code `3`.
+Oversized bodies receive HTTP `413`. The limit applies while receiving both
+Content-Length and chunked requests, before JSON parsing or database dispatch.
+Authentication still runs before the handler reads a body; `/healthz` remains
+available without a token.
+
 ## Examples
 
 | Example | Shows |

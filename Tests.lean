@@ -1,4 +1,5 @@
 import LeanDb
+import Std.Http.Test.Helpers
 
 /-! Engine tests: codecs, deriving, the dependent select against a real
 SQLite file, CAS staleness, FK restriction. Fixture types live here — the
@@ -2921,7 +2922,39 @@ private def testFootprints : IO Unit := do
       && (i.getObjValAs? Nat "logged_runs").toOption == some 1) s!"impact names the query and its run: {st}"
   check (((st.getObjValAs? (Array String) "changed").toOption.getD #[]).contains "book.*") s!"changed lists book.*: {st}"
 
+private def testHttpBodyLimits : IO Unit := do
+  check ((Http.bodyLimitOf none).toOption == some (2 * 1024 * 1024)) "HTTP default body limit"
+  check ((Http.bodyLimitOf (some "4096")).toOption == some 4096) "HTTP body limit override"
+  for s in ["", "0", "-1", "1.5", "oops"] do
+    check ((Http.bodyLimitOf (some s)).toOption.isNone) s!"invalid HTTP limit {s}"
+  let calls ← IO.mkRef (0 : Nat)
+  let resolve : Http.Resolver := fun segs => return .ok (segs, "test", fun _ => do
+    calls.modify (· + 1)
+    return Lean.Json.mkObj [("ok", .bool true)])
+  let handler := Http.handleRequestWithLimit 8 (.bearer "test-token") resolve
+  let config := Http.serverConfig 8
+  let reqPrefix := "POST /rpc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+  let auth := "Authorization: Bearer test-token\r\n"
+  let run := fun (name raw status : String) (cfg : Std.Http.Config) => do
+    Std.Http.Internal.Test.checkClose name raw handler
+      (fun bytes => Std.Http.Internal.Test.assertStatus bytes s!"HTTP/1.1 {status}") cfg
+  -- A valid JSON body exactly at the boundary still dispatches.
+  run "body at limit" (reqPrefix ++ auth ++ "Content-Length: 8\r\n\r\n[\"help\"]") "200" config
+  check ((← calls.get) == 1) "accepted body dispatched once"
+  -- Reject from the headers, without waiting for or allocating the body.
+  run "oversized content length" (reqPrefix ++ auth ++ "Content-Length: 9\r\n\r\n") "413" config
+  -- Each chunk fits, but the sum does not.
+  run "cumulative chunk limit" (reqPrefix ++ auth ++ "Transfer-Encoding: chunked\r\n\r\n5\r\n[\"hel\r\n4\r\np\"] \r\n0\r\n\r\n") "413" config
+  run "valid prefix of rejected body" (reqPrefix ++ auth ++ "Transfer-Encoding: chunked\r\n\r\n8\r\n[\"help\"]\r\n1\r\n \r\n0\r\n\r\n") "413" config
+  run "oversized chunk header" (reqPrefix ++ auth ++ "Transfer-Encoding: chunked\r\n\r\n800001\r\n") "413" config
+  -- Direct handler users can supply a looser parser configuration. The
+  -- handler still refuses before parsing or dispatching the oversized body.
+  run "handler body budget" (reqPrefix ++ auth ++ "Content-Length: 9\r\n\r\n[\"help\"] ") "413" (Http.serverConfig 32)
+  run "auth before JSON parsing" (reqPrefix ++ "Content-Length: 8\r\n\r\nnot-json") "401" config
+  check ((← calls.get) == 1) "rejected requests never dispatched"
+
 def main : IO UInt32 := do
+  testHttpBodyLimits
   testCodecs
   testBaseSpecs
   testSession
