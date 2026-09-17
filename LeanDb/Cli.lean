@@ -538,6 +538,11 @@ private def freezeJson (b : Base) (flags : List String) : IO Json := do
       -- which has no exact literal — must be refused, not frozen
       if let .error e := validateSchema cur then
         return e.toJson
+      -- the freeze text renderer cannot emit every name the derive
+      -- accepts; refuse those before any IO instead of writing an
+      -- uncompilable (or injectable) file
+      if let .error e := Freeze.checkNames cur then
+        return (DbError.migrate e).toJson
       let (n, prev) ← match b.chain with
         | some c =>
             if fingerprint c.head == fingerprint cur then

@@ -3143,10 +3143,35 @@ private def testModuleNameOk : IO Unit := do
             "a b", "a-/x", "a\nb", "", ".", "a.", ".a", "a b.Migrations"] do
     check (!Freeze.moduleNameOk s) s!"a non-identifier module is refused: {s}"
 
+/-- An inline field with a space in the name: legal for the derive, which
+    builds syntax; the freeze text renderer would emit the binder
+    with two tokens. -/
+structure Sp where
+  «a b» : Int64
+  deriving Repr, LeanDb.Entity
+private def testFreezeNames : IO Unit := do
+  -- plain identifiers and keywords (for columns) are accepted
+  for s in ["user", "user_profile", "M1", "a_b'c"] do
+    check (Freeze.freezeNameOk s false) s!"a plain identifier is accepted: {s}"
+  for s in ["end", "structure", "rec"] do
+    check (Freeze.freezeNameOk s true) s!"a keyword column is accepted: {s}"
+  -- the shapes the freeze renderer cannot emit, from issue #35
+  for s in ["1foo", "a b", "a b_w", "a-/x", "a\nb", "", "a.b", "«quoted»"] do
+    check (!Freeze.freezeNameOk s false) s!"a non-identifier table name is refused: {s}"
+  for s in ["1foo", "a b_w", "a\nb"] do
+    check (!Freeze.freezeNameOk s true) s!"a non-identifier, non-keyword column is refused: {s}"
+  -- end to end: a schema with a space-named column is refused by freeze
+  let r := Freeze.checkNames [Entity.spec Sp]
+  check (r.isOk == false) "a schema with a composite guillemet column is refused"
+  match r with
+  | .error m => check ((m.splitOn "a b").length > 1) s!"the refusal names the column, got {m}"
+  | .ok _ => pure ()
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
   testRowsLimitPushdown
+  testFreezeNames
   testPortOf
   testModuleNameOk
   testHttpBodyLimits
