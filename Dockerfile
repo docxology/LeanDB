@@ -27,8 +27,11 @@ RUN cd examples/${BASE} && lake build ${BASE}
 FROM ubuntu:24.04
 ARG BASE=tickets
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgmp10 curl tzdata \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --shell /usr/sbin/nologin leandb
 COPY --from=build /src/examples/${BASE}/.lake/build/bin/${BASE} /usr/local/bin/base
+RUN mkdir -p /data && chown leandb:leandb /data
+USER leandb
 VOLUME /data
 ENV LEANDB_DB=/data/base.sqlite
 EXPOSE 7411

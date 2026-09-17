@@ -1147,6 +1147,27 @@ private def testUniqueConstraint : IO Unit := do
   expectErr (← withDb uniqDbPath schema do discard <| insert Author ⟨"Ada", 41⟩)
     "duplicate" "uniqueness violation is typed, not a raw sqlite error"
 
+/-- A column literally named `foreign key` — legal as the escaped Lean
+    field «foreign key», and the one name that puts the FK classifier's
+    bare substring inside a UNIQUE-violation message. -/
+structure FkName where
+  «foreign key» : String
+  deriving Repr, LeanDb.Entity
+
+private def fkDbPath : System.FilePath := ".lake" / "leandb_test_fk_name.sqlite"
+
+/-- `constraintError` must match SQLite's full FK phrase, not any
+    occurrence of "foreign key": a UNIQUE violation on the column above
+    reads "UNIQUE constraint failed: fk_name.foreign key" and must stay
+    `.duplicate`, not become `.missingRef`. -/
+private def testConstraintClassify : IO Unit := do
+  if ← fkDbPath.pathExists then IO.FS.removeFile fkDbPath
+  discard <| expectOk (← withDb fkDbPath [Entity.spec FkName] do
+    discard <| insert FkName ⟨"same"⟩) "seed before the unique index"
+  let db ← SQLite.open fkDbPath
+  db.exec "CREATE UNIQUE INDEX u_fk_name_fk ON \"fk_name\" (\"foreign key\")"
+  expectErr (← withDb fkDbPath [Entity.spec FkName] do discard <| insert FkName ⟨"same"⟩)
+    "duplicate" "a UNIQUE violation on «foreign key» is .duplicate, not .missingRef"
 private def nanDbPath : System.FilePath := ".lake" / "leandb_test_nan.sqlite"
 
 /-- A NaN Float has no SQLite representation: bound, it becomes NULL, so a
@@ -2984,8 +3005,16 @@ private def testCliLimits : IO Unit := do
     check ((Cli.limitOf s).toOption.isNone) s!"a limit beyond Int64 range is refused: {s}"
   check ((Cli.limitOf "oops").toOption.isNone) "a non-numeric limit is refused"
 
+private def testPortOf : IO Unit := do
+  check ((Cli.portOf "7411").toOption == some 7411) "ordinary port parses"
+  check ((Cli.portOf "1").toOption == some 1) "lowest port parses"
+  check ((Cli.portOf "65535").toOption == some 65535) "highest port parses"
+  for s in ["0", "65536", "70000", "-1", "oops", ""] do
+    check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
+
 def main : IO UInt32 := do
   testCliLimits
+  testPortOf
   testHttpBodyLimits
   testCodecs
   testBaseSpecs
@@ -3011,6 +3040,7 @@ def main : IO UInt32 := do
   testEmptyEntity
   testBlobColumn
   testUniqueConstraint
+  testConstraintClassify
   testImportNotCarried
   testQuotedEndToEnd
   testAdoptAffinity
