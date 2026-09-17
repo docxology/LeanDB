@@ -2935,6 +2935,30 @@ where
 
 private def adoptDbPath : System.FilePath := ".lake" / "leandb_test_adopt.sqlite"
 
+private def colRating : ColumnSpec := (Entity.spec Book).columns.getD 2 default
+
+private def testStrictSchemaJson : IO Unit := do
+  -- a valid spec still round-trips byte for byte
+  let c := Entity.spec Book
+  for col in c.columns do
+    check ((ColumnSpec.fromJson? col.toJson).toOption == some col) s!"ColumnSpec round trip: {col.name}"
+  -- a present-but-malformed optional is an ERROR, not an absence: the
+  -- lossy decode would make migrate diff a schema that was never stored
+  let bad : List (String × Lean.Json) := [
+    ("references", Lean.Json.num 3),
+    ("enum", Lean.Json.arr #[Lean.Json.str "a", Lean.Json.num 1]),
+    ("enumSet", Lean.Json.arr #[Lean.Json.bool true]),
+    ("default", Lean.Json.str "junk"),
+    ("shape", Lean.Json.num 7),
+    ("group", Lean.Json.arr #[]),
+    ("cascade", Lean.Json.str "yes")]
+  for (key, v) in bad do
+    let j := (colRating.toJson).mergeObj (Lean.Json.mkObj [(key, v)])
+    check ((ColumnSpec.fromJson? j).isOk == false) s!"malformed \"{key}\" is refused, not dropped"
+  -- an ABSENT optional is still fine, and the untouched spec round-trips
+  check ((ColumnSpec.fromJson? colRating.toJson).toOption == some colRating)
+    "the untouched spec decodes"
+
 /-- An adopted file keeps whatever declared types it was created with:
     BIGINT, VARCHAR — affinity synonyms of INTEGER and TEXT. The snapshot
     records the canonical spelling, so `matchesSnapshot` must normalize by
@@ -3071,6 +3095,7 @@ private def testPortOf : IO Unit := do
 
 def main : IO UInt32 := do
   testCliLimits
+  testStrictSchemaJson
   testPortOf
   testHttpBodyLimits
   testCodecs
