@@ -212,7 +212,10 @@ instance : ColCodec Float where
   sqlType := .real
   toCol := .real
   fromCol
-    | .real v => .ok v
+    -- a non-finite REAL cannot round-trip as a REAL (the JSON surfaces
+    -- render it as the string "Infinity"/"NaN"); refuse it like any
+    -- other value outside the column's closed world
+    | .real v => if v.isNaN || v.isInf then .error s!"expected a finite REAL, found {v}" else .ok v
     | .int v => .ok v.toFloat
     | c => expected "REAL" c
 

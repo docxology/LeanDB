@@ -1169,6 +1169,29 @@ private def testNanReal : IO Unit := do
   check ((← expectOk count "rows after the refused NaN write") == 0)
     "nothing was stored for the refused write"
 
+private def testInfReal : IO Unit := do
+  if ← nanDbPath.pathExists then IO.FS.removeFile nanDbPath
+  -- the bind boundary refuses infinities like NaN (issue: Infinity
+  -- binds, stores, and then leaves every JSON surface as the string
+  -- "Infinity")
+  let r ← withDb nanDbPath schema do
+    discard <| insert Author ⟨"Ada", 36⟩
+    discard <| insert Book ⟨"Inf", ⟨1⟩, some (1.0 / 0.0)⟩
+  expectErr r "sqlite" "Infinity into a REAL column is refused at the bind boundary"
+  -- the JSON decode boundary refuses non-finite REALs too (a raw 1e999
+  -- overflows to inf; Lean renders non-finite floats as strings, so the
+  -- column would stop being a REAL the moment it is read back)
+  let realSpec := (Entity.spec Book).columns.getD 2 default
+  check (((Col.fromJson realSpec (Lean.Json.num 1e999)).toOption.map (·.describe)) == none)
+    "a JSON 1e999 for a REAL column is refused"
+  check (((Col.fromJson realSpec (Lean.Json.str "Infinity")).isOk == false)
+    && ((Col.fromJson realSpec (Lean.Json.str "-Infinity")).isOk == false))
+    "the Infinity strings are not REALs"
+  check (((fromCol (α := Float) (.real (1.0 / 0.0))).isOk == false)
+    && ((fromCol (α := Float) (.real (0.0 / 0.0))).isOk == false))
+    "the Float codec refuses non-finite stored values"
+
+
 /-! ## Importer: what it reports as not carried (§5.3 — partial support is
 fine, *silent* partiality is not). `planOf` is pure, so this drives it
 over a hand-built schema rather than a database file. -/
@@ -2979,7 +3002,8 @@ def main : IO UInt32 := do
   testDefaults
   testJson
   testEndToEnd
-  testClosedEndToEnd
+  testNanReal
+  testInfReal
   testParamSplitEndToEnd
   testQuantifiersEndToEnd
   testMigrations
@@ -2987,7 +3011,6 @@ def main : IO UInt32 := do
   testEmptyEntity
   testBlobColumn
   testUniqueConstraint
-  testNanReal
   testImportNotCarried
   testQuotedEndToEnd
   testAdoptAffinity

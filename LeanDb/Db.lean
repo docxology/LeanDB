@@ -78,9 +78,15 @@ def bindCol (stmt : SQLite.Stmt) (idx : Int32) : Col → IO Unit
          column the write fails with a misleading constraint error, and
          against a nullable one it "succeeds" but the value silently
          reads back `none`. Refuse it at the write boundary instead —
-         a NaN has no SQLite representation that survives a round trip. -/
-      if v.isNaN then
-        throw <| IO.userError "REAL value is NaN (SQLite stores NaN as NULL; the value would not survive a round trip)"
+         a NaN has no SQLite representation that survives a round trip.
+         The same refusal covers the infinities: they bind and store,
+         but every JSON surface renders them as the *strings*
+         "Infinity"/"-Infinity", so the column stops being a REAL the
+         moment it is read back as JSON (see `Col.fromJson`). A REAL
+         value that cannot round-trip as a REAL is refused at the
+         boundary. -/
+      if v.isNaN || v.isInf then
+        throw <| IO.userError s!"REAL value is {if v.isNaN then "NaN" else "infinite"} (it has no SQLite representation that survives a round trip as a REAL)"
       else stmt.bindFloat idx v
   | .null => stmt.bindNull idx
 

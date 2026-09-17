@@ -62,7 +62,13 @@ def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
             throw s!"{spec.name}: {i} out of INTEGER range"
           return .int (Int64.ofInt i)
       | .text => .text <$> j.getStr?
-      | .real => .real <$> (j.getNum? <&> (·.toFloat))
+      | .real => do
+          let v ← (j.getNum? <&> (·.toFloat))
+          -- as at the bind boundary (`Db.bindCol`): a NaN would store as
+          -- NULL and an infinity would leave every JSON surface a string
+          if v.isNaN || v.isInf then
+            throw s!"{spec.name}: REAL value is non-finite ({if v.isNaN then "NaN" else "infinite"})"
+          return .real v
 
 /-- A nested value type that lives in one JSON TEXT column: its JSON
     encoding both ways plus its declared shape. Instances come from
