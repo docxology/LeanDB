@@ -263,19 +263,78 @@ private def backupJson (b : Base) (inst : Instance) (sess : Session) : IO Json :
   catch e =>
     return (DbError.sqlite s!"backup failed: {e}").toJson
 
-/-- Replace the instance file with `src` and reopen: the old handle is
-    released first (its finalizer closes it), the copy lands under a
-    temporary name and is renamed into place so no reader ever sees a
-    half-written file, and stale `-wal`/`-shm` siblings go with the old
-    file. Assumes this process is the only writer. -/
+/-! ### Restore safety: validate first, swap last
+
+Issue #25: `restore <garbage>` used to drop the live connection and
+overwrite the instance before validating the source, so a failed restore
+destroyed user data and left the session silently serving an empty
+in-memory database; `restore /dev/zero` read the whole source into
+memory. -/
+
+/-- The 16-byte magic string every SQLite 3 file begins with. -/
+def Restore.magic : ByteArray := "SQLite format 3\u0000".toUTF8
+
+/-- Do these leading bytes carry the SQLite 3 magic header? -/
+def Restore.headerOk (bytes : ByteArray) : Bool :=
+  bytes.size >= Restore.magic.size &&
+    (List.range Restore.magic.size).all fun i => bytes[i]! == Restore.magic[i]!
+
+/-- Validate a restore source before anything destructive happens: the
+    magic header refuses text files and directories cheaply, then the
+    source must open as a database and pass `PRAGMA quick_check`. -/
+private def Restore.validate (src : System.FilePath) : IO (Except DbError Unit) := do
+  let head ← try
+      let h ← IO.FS.Handle.mk src .read
+      let bytes ← h.read Restore.magic.size.toUSize
+      pure bytes
+    catch e => return .error (.migrate s!"restore source cannot be read: {src} ({e})")
+  unless Restore.headerOk head do
+    return .error (.migrate s!"restore source is not a SQLite database: {src}")
+  try
+    let db ← SQLite.open src
+    let stmt ← db.prepare "PRAGMA quick_check"
+    if ← stmt.step then
+      let verdict ← stmt.columnText 0
+      if verdict == "ok" then return .ok ()
+      return .error (.migrate s!"restore source failed quick_check: {src} ({verdict})")
+    return .error (.migrate s!"restore source failed quick_check: {src}")
+  catch e =>
+    return .error (.migrate s!"restore source is not a valid SQLite database: {src} ({e})")
+
+/-- Bounded-memory file copy: 1 MiB reads, so the source's size never
+    sets the process's memory use. -/
+private def Restore.copyChunked (src dest : System.FilePath) : IO Unit := do
+  let chunk : USize := 1024 * 1024
+  let input ← IO.FS.Handle.mk src .read
+  let output ← IO.FS.Handle.mk dest .write
+  repeat
+    let bytes ← input.read chunk
+    if bytes.isEmpty then break
+    output.write bytes
+
+/-- Replace the instance file with `src` and reopen. Validation runs
+    BEFORE anything destructive; the copy lands under a temporary name
+    and is renamed into place so no reader ever sees a half-written file,
+    and stale `-wal`/`-shm` siblings go with the old file. The old
+    connection stays open until the rename has succeeded and the new
+    file has opened cleanly; a failure past the swap sets the gate (so
+    verbs are refused loudly instead of silently hitting an empty
+    database) and reopens the instance file. Assumes this process is the
+    only writer. -/
 private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
     IO (Except DbError Unit) := do
   unless ← src.pathExists do
     return .error (.migrate s!"restore source does not exist: {src}")
+  match ← Restore.validate src with
+  | .error e => return .error e
+  | .ok () => pure ()
   try
-    sess.conn.set (← Conn.ofRaw (← SQLite.open ":memory:"))
     let tmp : System.FilePath := inst.path.toString ++ ".restore"
-    IO.FS.writeBinFile tmp (← IO.FS.readBinFile src)
+    try
+      Restore.copyChunked src tmp
+    catch e =>
+      try IO.FS.removeFile tmp catch _ => pure ()
+      throw e
     for suffix in ["-wal", "-shm", "-journal"] do
       let side : System.FilePath := inst.path.toString ++ suffix
       if ← side.pathExists then IO.FS.removeFile side
@@ -283,11 +342,14 @@ private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : Sys
   catch e =>
     return .error (.sqlite s!"restore failed: {e}")
   match ← openDbRaw inst.path with
-  | .error e => return .error e
   | .ok conn =>
       sess.conn.set conn
       sess.gate.set (← gateOf b conn)
       return .ok ()
+  | .error e =>
+      sess.gate.set (some e)
+      if let .ok conn ← openDbRaw inst.path then sess.conn.set conn
+      return .error e
 
 private def restoreJson (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
     IO Json := do
