@@ -659,6 +659,62 @@ def exitCodeOf (j : Json) : UInt32 :=
     | some "schema_mismatch" | some "unknown_lineage" => 4
     | _ => 2
 
+/-- Max bytes of one request line on the stdio transports — the stdio
+    analogue of the HTTP body cap (#21/#23). -/
+def defaultMaxLineBytes : Nat := 2 * 1024 * 1024
+
+/-- One request line from a stdio peer. -/
+inductive StdLine where
+  | /-- EOF with no bytes buffered. -/
+    eof
+  | /-- A complete line (the newline dropped). -/
+    line (s : String)
+  | /-- The line exceeded the budget: it was drained, not buffered. -/
+    tooLong
+
+private partial def readLineLoop (h : IO.FS.Stream) (cap : Nat) (chunkSize : USize)
+    (pending : IO.Ref ByteArray) (acc : ByteArray) (over : Bool) : IO StdLine := do
+  let mut chunk ← pending.get
+  pending.set ByteArray.empty
+  if chunk.isEmpty then chunk ← h.read chunkSize
+  if chunk.isEmpty then
+    if over then return .tooLong
+    if acc.isEmpty then return .eof
+    return .line (String.fromUTF8? acc |>.getD "")
+  match chunk.findIdx? (· == 10) with
+  | some i =>
+      -- the rest of the chunk is the next request's first bytes: never
+      -- discard it (a peer may pipeline)
+      pending.set (chunk.extract (i + 1) chunk.size)
+      if over || acc.size + i > cap then return .tooLong
+      return .line (String.fromUTF8? (acc ++ chunk.extract 0 i) |>.getD "")
+  | none =>
+      -- no newline: keep going, but once the budget is gone, drain and
+      -- discard — the bytes are never buffered past `cap`
+      if acc.size + chunk.size > cap then readLineLoop h cap chunkSize pending ByteArray.empty true
+      else readLineLoop h cap chunkSize pending (acc ++ chunk) over
+
+/-- A line reader over a stdio peer, with a byte budget per request line —
+    the stdio analogue of the HTTP body cap (#21/#23). Chunked reads with
+    one chunk of pushback, so a pipelined peer's following lines survive;
+    a misbehaving peer that emits a newline-less megabyte stream gets
+    `tooLong` instead of an OOM. -/
+structure LineReader where
+  stream : IO.FS.Stream
+  cap : Nat := defaultMaxLineBytes
+  pending : IO.Ref ByteArray
+
+/-- Open a reader over a stream. -/
+def LineReader.new (stream : IO.FS.Stream) (cap : Nat := defaultMaxLineBytes) :
+    IO LineReader := do
+  let pending ← IO.mkRef ByteArray.empty
+  return { stream, cap, pending }
+
+/-- The next request line. EOF right after bytes is that (unterminated)
+    line, like `Handle.getLine` would return it. -/
+def LineReader.next (r : LineReader) : IO StdLine :=
+  readLineLoop r.stream r.cap 4096 r.pending ByteArray.empty false
+
 /-- Served mode: JSON-lines over stdio against one persistent connection.
     Each request line is a JSON array of argv strings; each response is one
     JSON object line. EOF ends the session. A drifted instance is served
@@ -671,20 +727,25 @@ def serve (b : Base) (inst : Instance) : IO UInt32 := do
   | .ok sess =>
       let stdin ← IO.getStdin
       let out ← IO.getStdout
+      let reader ← LineReader.new stdin
       repeat
-        let line ← stdin.getLine
-        if line.isEmpty then break
-        let line := line.trimAscii.toString
-        if line.isEmpty then continue
-        let argv? := Lean.Json.parse line >>= fun j => do
-          let arr ← j.getArr?
-          arr.toList.mapM (·.getStr?)
-        match argv? with
-        | .error m =>
-            out.putStrLn (usageErr s!"expected a JSON array of argv strings: {m}").compress
-        | .ok argv =>
-            out.putStrLn (← b.handle inst sess argv).compress
-        out.flush
+        match ← reader.next with
+        | .eof => break
+        | .tooLong =>
+            out.putStrLn (usageErr s!"request line exceeds {defaultMaxLineBytes} bytes").compress
+            out.flush
+        | .line rawLine =>
+          let line := rawLine.trimAscii.toString
+          if line.isEmpty then continue
+          let argv? := Lean.Json.parse line >>= fun j => do
+            let arr ← j.getArr?
+            arr.toList.mapM (·.getStr?)
+          match argv? with
+          | .error m =>
+              out.putStrLn (usageErr s!"expected a JSON array of argv strings: {m}").compress
+          | .ok argv =>
+              out.putStrLn (← b.handle inst sess argv).compress
+          out.flush
       return 0
 
 /-- The HTTP server, registered by `LeanDb.Http` at initialization so the
