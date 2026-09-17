@@ -121,6 +121,18 @@ private def parseId (s : String) : Except String Int64 :=
       else .ok (Int64.ofNat n)
   | none => .error s!"expected a row id, got {String.quote s}"
 
+/-- Parse a `log`/`history`/`--limit` count. Like row ids (`parseId`), a
+    limit that exceeds `Int64` range is refused loudly: a bare
+    `Int64.ofNat` would wrap `2^63` to a negative LIMIT, and SQLite reads
+    a negative LIMIT as *no limit* — the caller's own cap silently gone. -/
+def limitOf (s : String) : Except String Nat :=
+  match s.toNat? with
+  | some n =>
+      if n > Int64.maxValue.toNatClampNeg then
+        .error s!"limit out of Int64 range: {s}"
+      else .ok n
+  | none => .error s!"expected a limit, got {String.quote s}"
+
 private def parseJson (s : String) : Except String Json := Json.parse s
 
 private def table? (b : Base) (name : String) : Except String CliTable :=
@@ -144,13 +156,14 @@ private def parseRowFlags : List String → List (String × String) → Nat →
       | k :: v :: vs => parseRowFlags rest ((k, String.intercalate "=" (v :: vs)) :: eqs) limit
       | _ => .error s!"--eq expects col=value, got {String.quote kv}"
   | "--limit" :: n :: rest, eqs, _ =>
-      match n.toNat? with
-      | some limit => parseRowFlags rest eqs limit
-      | none => .error s!"--limit expects a number, got {String.quote n}"
+      match limitOf n with
+      | .ok limit => parseRowFlags rest eqs limit
+      | .error m => .error m
   | [n], eqs, _ =>
-      match n.toNat? with
-      | some limit => .ok (eqs.reverse, limit)
-      | none => .error s!"unrecognized rows argument {String.quote n}"
+      if n.toNat?.isNone then .error s!"unrecognized rows argument {String.quote n}"
+      else do
+        let limit ← limitOf n
+        .ok (eqs.reverse, limit)
   | arg :: _, _, _ => .error s!"unrecognized rows argument {String.quote arg}"
 
 private def queryNames (b : Base) : List String :=
@@ -165,8 +178,7 @@ private def command (b : Base) : List String → Except String (DbM Json)
   | ["delete", t, i] => do pure ((← table? b t).deleteRow (← parseId i))
   | ["log"] => .ok (logJson 50)
   | ["log", n] => do
-      let some limit := n.toNat? | throw s!"expected a limit, got {String.quote n}"
-      pure (logJson limit)
+      pure (logJson (← limitOf n))
   | "rows" :: t :: flags => do
       let tbl ← table? b t
       let (eqs, limit) ← parseRowFlags flags [] 100
@@ -535,9 +547,9 @@ private def migrateJson (b : Base) (inst : Instance) (sess : Session) (rest : Li
   | ["rollback"] => rollbackJson b inst sess
   | ["history"] => historyJson sess 50
   | ["history", n] =>
-      match n.toNat? with
-      | some limit => historyJson sess limit
-      | none => return usageErr s!"expected a limit, got {String.quote n}"
+      match limitOf n with
+      | .ok limit => historyJson sess limit
+      | .error m => return usageErr m
   | "freeze" :: flags => freezeJson b flags
   | ["status"] => runMigrate false false true
   | "apply" :: flags =>
