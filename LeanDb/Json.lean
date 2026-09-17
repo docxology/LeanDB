@@ -127,19 +127,43 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
   let name ← j.getObjVal? "name" >>= (·.getStr?)
   let sqlType ← SqlType.fromJson? (← j.getObjVal? "type")
   let nullable ← j.getObjVal? "nullable" >>= (·.getBool?)
-  let fkTable := (j.getObjVal? "references").toOption.bind (·.getStr?.toOption)
-  let enum := (j.getObjVal? "enum").toOption.bind fun a =>
-    (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
-  let enumSet := (j.getObjVal? "enumSet").toOption.bind fun a =>
-    (a.getArr?.toOption).map fun vs => vs.filterMap (·.getStr?.toOption)
-  let partial_ : ColumnSpec := { name, sqlType, nullable, fkTable, enum, enumSet }
+  -- every optional field decodes STRICTLY: a present-but-malformed value
+  -- is an error, not an absence. The stored `schema_json` is diffed
+  -- against the code's specs by `migrate`, so a lossy decode (silently
+  -- dropping a malformed field) would make the instance "remember" a
+  -- schema that was never stored — the phantom diff the round-trip rule
+  -- below forbids. Only the KEY's absence means absent.
+  let optStr (key : String) : Except String (Option String) :=
+    match j.getObjVal? key with
+    | .ok v => some <$> (v.getStr? |>.mapError fun m => s!"{name}: malformed \"{key}\": {m}")
+    | .error _ => pure none
+  let optStrArr (key : String) : Except String (Option (Array String)) :=
+    match j.getObjVal? key with
+    | .ok v => do
+        let a ← v.getArr? |>.mapError fun m => s!"{name}: malformed \"{key}\": {m}"
+        let mut vs : Array String := #[]
+        for x in a do
+          match x.getStr? with
+          | .ok str => vs := vs.push str
+          | .error _ => throw s!"{name}: \"{key}\" must be an array of strings"
+        pure (some vs)
+    | .error _ => pure none
+  let fkTable ← optStr "references"
+  let enum ← optStrArr "enum"
+  let enumSet ← optStrArr "enumSet"
+  let partial_ : ColumnSpec :=
+    { name := name, sqlType := sqlType, nullable := nullable,
+      fkTable := fkTable, enum := enum, enumSet := enumSet }
   -- default roundtrips through the column's own type (stored schema JSON
   -- must decode identically or migrations would see phantom diffs)
-  let dflt := (j.getObjVal? "default").toOption.bind fun v =>
-    (Col.fromJson partial_ v).toOption
-  let shape := (j.getObjVal? "shape").toOption.bind (·.getStr?.toOption)
-  let group := (j.getObjVal? "group").toOption.bind (·.getStr?.toOption)
-  let cascade := ((j.getObjVal? "cascade").toOption.bind (·.getBool?.toOption)).getD false
+  let dflt ← match j.getObjVal? "default" with
+    | .ok v => some <$> (Col.fromJson partial_ v |>.mapError fun m => s!"{name}: malformed \"default\": {m}")
+    | .error _ => pure none
+  let shape ← optStr "shape"
+  let group ← optStr "group"
+  let cascade ← match j.getObjVal? "cascade" with
+    | .ok v => (v.getBool? |>.mapError fun m => s!"{name}: malformed \"cascade\": {m}")
+    | .error _ => pure false
   return { partial_ with dflt, shape, group, cascade }
 
 def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
