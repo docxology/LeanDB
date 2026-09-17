@@ -522,6 +522,11 @@ private def freezeJson (b : Base) (flags : List String) : IO Json := do
         return usageErr "freeze needs the base's Lean module: set `module` on the base or pass --module <Module>"
       let t := Freeze.Target.ofModule module (if imports.isEmpty then b.freezeImports else imports)
       let cur := b.specs
+      -- freeze renders the schema as source (DDL defaults, snapshot
+      -- literals); an invalid schema — e.g. a non-finite REAL default,
+      -- which has no exact literal — must be refused, not frozen
+      if let .error e := validateSchema cur then
+        return e.toJson
       let (n, prev) ← match b.chain with
         | some c =>
             if fingerprint c.head == fingerprint cur then
