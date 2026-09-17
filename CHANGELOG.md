@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `restore` (and `migrate rollback`, which shares the code path) validates
+  its source before touching the instance: a non-SQLite source is refused
+  by the SQLite magic header plus `PRAGMA quick_check`, the copy streams
+  in bounded 1 MiB chunks instead of reading the whole file into memory,
+  and the session connection is swapped only after the renamed file opens
+  cleanly. A failed restore no longer destroys the instance file or leaves
+  the session silently serving an empty in-memory database.
+
 ## 0.3.1 - 2026-09-14
 
 - Add a core concepts guide, terminology glossary, and current roadmap.

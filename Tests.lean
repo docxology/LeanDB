@@ -2670,6 +2670,63 @@ private def testSession : IO Unit := do
   check ((rs.getObjValAs? Bool "in_sync").toOption == some true) "restore of a current backup stays in sync"
   check ((← b.handle inst sess ["rows", "author"] |>.map code) == "") "verbs admitted after restore"
 
+/-! ## Restore safety: a bad source is refused before the instance is touched
+
+Issue #25: `restore` used to overwrite the instance before validating the
+source, destroying user data on failure and leaving the session silently
+serving an empty in-memory database. -/
+
+structure Probe where
+  label : String
+  deriving Repr, LeanDb.Entity
+
+private def restoreDbPath : System.FilePath := ".lake" / "leandb_test_restore.sqlite"
+
+private def testRestoreSafety : IO Unit := do
+  if ← restoreDbPath.pathExists then IO.FS.removeFile restoreDbPath
+  let garbage : System.FilePath := ".lake" / "leandb_test_restore_garbage.txt"
+  IO.FS.writeFile garbage "dear instance, I am not a database"
+  let dir : System.FilePath := ".lake" / "leandb_test_restore_dir"
+  unless ← dir.pathExists do IO.FS.createDir dir
+  -- the magic check, pure: text, a truncated header, the real magic
+  check (!Cli.Restore.headerOk "definitely not sqlite".toUTF8) "magic check rejects text"
+  check (!Cli.Restore.headerOk "SQLite format 3".toUTF8) "magic check rejects a truncated header"
+  check (Cli.Restore.headerOk Cli.Restore.magic) "magic check accepts the magic"
+  discard <| expectOk (← withDb restoreDbPath [Entity.spec Probe] (pure ()))
+    "create the restore probe"
+  let head ← IO.FS.readBinFile restoreDbPath
+  check (Cli.Restore.headerOk (head.extract 0 16)) "a real instance carries the magic header"
+  let b : Base := { name := "r", tables := [CliTable.of Probe] }
+  let inst := Instance.ofPath restoreDbPath
+  let sess ← expectOk (← Cli.Session.open b inst) "open the probe"
+  discard <| b.handle inst sess ["insert", "probe", "{\"label\":\"keep\"}"]
+  let before ← IO.FS.readBinFile restoreDbPath
+  -- a garbage source: refused with a typed error, the live session and
+  -- the instance file untouched
+  let refused ← b.handle inst sess ["restore", garbage.toString]
+  check ((refused.getObjValAs? Bool "ok").toOption == some false) s!"garbage restore refused: {refused}"
+  check ((refused.getObjValAs? String "code").toOption == some "migrate")
+    s!"garbage restore is a typed migrate error: {refused}"
+  let rows ← b.handle inst sess ["rows", "probe"]
+  check ((rows.getObjValAs? Nat "count").toOption == some 1) s!"session still serves the live data: {rows}"
+  check ((← IO.FS.readBinFile restoreDbPath) == before) "garbage restore left the instance file untouched"
+  -- a directory as source: refused the same way
+  let refusedDir ← b.handle inst sess ["restore", dir.toString]
+  check ((refusedDir.getObjValAs? Bool "ok").toOption == some false)
+    s!"directory restore refused: {refusedDir}"
+  let rowsDir ← b.handle inst sess ["rows", "probe"]
+  check ((rowsDir.getObjValAs? Nat "count").toOption == some 1)
+    "session still serves the live data after a directory source"
+  check ((← IO.FS.readBinFile restoreDbPath) == before) "directory restore left the instance file untouched"
+  -- the happy path is unchanged: backup, insert more, restore back
+  let bk ← b.handle inst sess ["backup"]
+  let bkPath := (bk.getObjValAs? String "backup").toOption.getD ""
+  discard <| b.handle inst sess ["insert", "probe", "{\"label\":\"extra\"}"]
+  let rs ← b.handle inst sess ["restore", bkPath]
+  check ((rs.getObjValAs? Bool "ok").toOption == some true) s!"restore of a valid backup succeeds: {rs}"
+  let rows ← b.handle inst sess ["rows", "probe"]
+  check ((rows.getObjValAs? Nat "count").toOption == some 1) "the restored instance holds the backup's rows"
+
 /-! ## Chains: a typed transform carries rows the mechanical diff refuses -/
 
 /-- `author` as stored at V0 (what `migrate freeze` would generate). -/
@@ -2815,6 +2872,7 @@ def main : IO UInt32 := do
   testCodecs
   testBaseSpecs
   testSession
+  testRestoreSafety
   testChain
   testFootprints
   testDerivedSpec
