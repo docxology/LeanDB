@@ -3545,6 +3545,20 @@ private def testStdioInvalidUtf8 : IO Unit := do
   let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf)
   check ((← r.next) matches .undecodable) "a valid prefix does not rescue bad bytes"
 
+-- #96: `Handle.read n` on a pipe is `fread` and blocks until *n* bytes or
+-- EOF, so a peer whose line is shorter than the read chunk wedged `serve`.
+-- Byte-wise reads fix it; model the pipe deterministically by clamping
+-- every read to one byte and asserting lines still assemble.
+private def testStdioShortReads : IO Unit := do
+  let buf ← lineStream "[\"version\"]\n[\"ping\"]\ntail"
+  let slow := IO.FS.Stream.ofBuffer buf
+  let s := { slow with read := fun _ => slow.read 1 }
+  let r ← Cli.LineReader.new s
+  check ((← r.next) matches .line "[\"version\"]") "a line assembles across one-byte reads"
+  check ((← r.next) matches .line "[\"ping\"]") "pushback still works with one-byte reads"
+  check ((← r.next) matches .line "tail") "an unterminated line still assembles"
+  check ((← r.next) matches .eof) "eof still surfaces"
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
@@ -3554,6 +3568,7 @@ def main : IO UInt32 := do
   testModuleNameOk
   testStdioLineCap
   testStdioInvalidUtf8
+  testStdioShortReads
   testHttpBodyLimits
   testWalOpen
   testLogPolicy
