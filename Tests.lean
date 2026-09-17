@@ -2968,9 +2968,34 @@ private def testPortOf : IO Unit := do
   for s in ["0", "65536", "70000", "-1", "oops", ""] do
     check ((Cli.portOf s).toOption.isNone) s!"port outside 1..65535 is refused: {s}"
 
+private def lineStream (s : String) : IO (IO.Ref IO.FS.Stream.Buffer) := do
+  IO.mkRef { data := s.toUTF8, pos := 0 }
+
+private def testStdioLineCap : IO Unit := do
+  -- ordinary lines, then EOF
+  let buf ← lineStream "ping\npong\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf)
+  check ((← r.next) matches .line "ping") "first line"
+  check ((← r.next) matches .line "pong") "second line (pushback survives the chunk boundary)"
+  check ((← r.next) matches .eof) "eof after the last newline"
+  -- EOF right after bytes: the unterminated line is still delivered
+  let buf ← lineStream "tail"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf)
+  check ((← r.next) matches .line "tail") "unterminated final line"
+  -- over the budget: drained, not buffered; the next line still reads
+  let buf ← lineStream "abcdef\nok\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf) 3
+  check ((← r.next) matches .tooLong) "a line beyond the budget is refused"
+  check ((← r.next) matches .line "ok") "the next line still reads"
+  -- exactly at the budget is accepted
+  let buf ← lineStream "abcd\n"
+  let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf) 4
+  check ((← r.next) matches .line "abcd") "a line at the budget reads"
+
 def main : IO UInt32 := do
   testCliLimits
   testPortOf
+  testStdioLineCap
   testHttpBodyLimits
   testCodecs
   testBaseSpecs
