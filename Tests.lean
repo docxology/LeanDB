@@ -25,6 +25,13 @@ structure Book where
 structure Marker where
   deriving Repr, LeanDb.Entity
 
+/-- A column name with an embedded quote — legal as a Lean field under
+    guillemets, legal SQL inside a quoted identifier, and the one name
+    where the DDL's quoting and the plan renderer's quoting could disagree. -/
+structure Quoted where
+  «a"b» : Int64
+deriving Repr, LeanDb.Entity
+
 def schema : List TableSpec := [Entity.spec Author, Entity.spec Book]
 
 /-! ## Pure tests -/
@@ -527,6 +534,14 @@ private def testTypedPred : IO Unit := do
     "render text, pinned"
   check (mixed.describe == "pushed: t0.\"age\" >= ?, residual conjuncts: 1")
     s!"describe format, got {mixed.describe}"
+  -- a column name with an embedded quote: the render must quote it the way
+  -- the DDL does (`quoteIdent`), or the SQL it emits addresses nothing
+  let qp : Pred [Quoted] := .eq (.here Quoted.Field.«a"b») .eq 5
+  check (qp.renderT == ("t0.\"«a\"\"b»\" IS ?", #[.int 5]))
+    s!"quoted-name render, got {repr (qp.renderT)}"
+  check ((Entity.spec Quoted).ddl.contains "\"«a\"\"b»\" INTEGER NOT NULL")
+    s!"DDL and render quote the name identically, got {(Entity.spec Quoted).ddl}"
+  check (qp.render (fun _ => "t0") == qp.renderT) "quoted name under the single-table alias"
   -- plan surface
   check (joinP.hasJoin && !ageP.hasJoin) "hasJoin"
   check (joinP.tables == [0, 1] && ageP.tables == [0]) "tables"
@@ -547,6 +562,21 @@ private def testTypedPred : IO Unit := do
   check (priceP.renderT == ("t0.\"price\" <= ?", #[.int 500]))
     s!"via renders the underlying column, got {repr (priceP.renderT)}"
   check (priceP.denote .empty cheap == true && priceP.denote .empty dear == false) "via denotes through the projection"
+
+private def quotedDbPath : System.FilePath := ".lake" / "leandb_test_quoted.sqlite"
+
+/-- The quoted column, end to end: the DDL created the quoted identifier,
+    the rendered WHERE addresses the same identifier, and SQLite agrees. -/
+private def testQuotedEndToEnd : IO Unit := do
+  if ← quotedDbPath.pathExists then IO.FS.removeFile quotedDbPath
+  let r ← withDb quotedDbPath [Entity.spec Quoted] do
+    discard <| insert Quoted ⟨5⟩
+    discard <| insert Quoted ⟨7⟩
+    let p : Pred [Quoted] := .eq (.here Quoted.Field.«a"b») .eq 5
+    return (← selectP [Quoted] p).map (·.val.«a"b»)
+  match r with
+  | .ok xs => check (xs == #[5]) s!"quoted column filters, got {repr xs}"
+  | .error e => throw <| IO.userError s!"FAIL: quoted column e2e: {e}"
 
 /-! ### Coherence of the tactic's plans
 
@@ -2836,6 +2866,7 @@ def main : IO UInt32 := do
   testBlobColumn
   testUniqueConstraint
   testImportNotCarried
+  testQuotedEndToEnd
   Lep3.run
   EnumSetA.run
   testOptionalParamPlans
