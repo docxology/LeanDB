@@ -2953,7 +2953,16 @@ private def testHttpBodyLimits : IO Unit := do
   run "auth before JSON parsing" (reqPrefix ++ "Content-Length: 8\r\n\r\nnot-json") "401" config
   check ((← calls.get) == 1) "rejected requests never dispatched"
 
+private def testCliLimits : IO Unit := do
+  check ((Cli.limitOf "50").toOption == some 50) "ordinary limit parses"
+  check ((Cli.limitOf "9223372036854775807").toOption == some 9223372036854775807)
+    "the largest Int64 limit is accepted as-is"
+  for s in ["9223372036854775808", "18446744073709551615"] do
+    check ((Cli.limitOf s).toOption.isNone) s!"a limit beyond Int64 range is refused: {s}"
+  check ((Cli.limitOf "oops").toOption.isNone) "a non-numeric limit is refused"
+
 def main : IO UInt32 := do
+  testCliLimits
   testHttpBodyLimits
   testCodecs
   testBaseSpecs
