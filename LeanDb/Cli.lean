@@ -798,7 +798,12 @@ private partial def readLineLoop (h : IO.FS.Stream) (cap : Nat) (chunkSize : USi
     (pending : IO.Ref ByteArray) (acc : ByteArray) (over : Bool) : IO StdLine := do
   let mut chunk ← pending.get
   pending.set ByteArray.empty
-  if chunk.isEmpty then chunk ← h.read chunkSize
+  -- WHY byte-wise: `Handle.read n` is stdio `fread` — on a pipe it blocks
+  -- until *n* bytes or EOF, so chunked reads wedge against piped peers
+  -- whose line is shorter than the chunk (#96). One byte per read returns
+  -- as soon as a byte is available; correctness-first for a line protocol
+  -- and the cap bounds the drain cost.
+  if chunk.isEmpty then chunk ← h.read 1
   if chunk.isEmpty then
     if over then return .tooLong
     if acc.isEmpty then return .eof
@@ -821,10 +826,10 @@ private partial def readLineLoop (h : IO.FS.Stream) (cap : Nat) (chunkSize : USi
       else readLineLoop h cap chunkSize pending (acc ++ chunk) over
 
 /-- A line reader over a stdio peer, with a byte budget per request line —
-    the stdio analogue of the HTTP body cap (#21/#23). Chunked reads with
-    one chunk of pushback, so a pipelined peer's following lines survive;
-    a misbehaving peer that emits a newline-less megabyte stream gets
-    `tooLong` instead of an OOM. -/
+    the stdio analogue of the HTTP body cap (#21/#23). Byte-wise reads
+    (#96) with one chunk of pushback, so a pipelined peer's following
+    lines survive; a misbehaving peer that emits a newline-less megabyte
+    stream gets `tooLong` instead of an OOM. -/
 structure LineReader where
   stream : IO.FS.Stream
   cap : Nat := defaultMaxLineBytes
@@ -839,7 +844,7 @@ def LineReader.new (stream : IO.FS.Stream) (cap : Nat := defaultMaxLineBytes) :
 /-- The next request line. EOF right after bytes is that (unterminated)
     line, like `Handle.getLine` would return it. -/
 def LineReader.next (r : LineReader) : IO StdLine :=
-  readLineLoop r.stream r.cap 4096 r.pending ByteArray.empty false
+  readLineLoop r.stream r.cap 1 r.pending ByteArray.empty false
 
 /-- Served mode: JSON-lines over stdio against one persistent connection.
     Each request line is a JSON array of argv strings; each response is one
