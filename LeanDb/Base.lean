@@ -138,6 +138,10 @@ structure Base where
   /-- Audit retention and migration impact budget; environment settings
       override these defaults when a connection opens. -/
   log : LogConfig := {}
+  /-- Open-time pragmas (LDB-02). Environment variables override these. -/
+  openConfig : OpenConfig := {}
+  /-- Declared auxiliary objects (LDB-11): FTS5 tables and their triggers. -/
+  auxiliary : List Auxiliary := []
 
 /-- Dedup by table name (first occurrence wins) and order so that every
     foreign-key target precedes its referrer. The sort is stable: among
@@ -172,9 +176,26 @@ def orderSpecs (specs : List TableSpec) : List TableSpec := Id.run do
     | none => pure ()
   return out.toList ++ pending
 
-/-- The schema this base's tables imply, in dependency order. -/
+/-- Every table this base declares, including a child listed both via its
+    parent and as its own `CliTable`. Collisions are still present here;
+    `validateSchema` / `Base.check` refuse unequal ones before open. -/
+def Base.declaredSpecs (b : Base) : List TableSpec :=
+  b.tables.flatMap (·.specs)
+
+/-- The schema this base's tables imply, in dependency order. Equal
+    repeats collapse; unequal name collisions are `Base.check`'s job. -/
 def Base.specs (b : Base) : List TableSpec :=
-  orderSpecs (b.tables.flatMap (·.specs))
+  orderSpecs b.declaredSpecs
+
+/-- Refuse a base whose declared tables collide (same name, or the same
+    name after case folding) but are not the same spec. Equal repeats
+    (a child listed via its parent and on its own) are allowed; the
+    remaining invariants run on the collapsed `specs`. -/
+def Base.check (b : Base) : Except DbError Unit := do
+  if let some (a, c) := collidingTable? b.declaredSpecs then
+    throw (.schemaInvalid s!"table {String.quote c} collides with {String.quote a} \
+(duplicate or case-folded name); the second entity would have been silently dropped")
+  validateSchema b.specs
 
 def Base.defaultInstance (b : Base) : System.FilePath :=
   b.defaultDb.getD ("data" / s!"{b.name}.sqlite")
@@ -189,21 +210,33 @@ structure Instance where
 def Instance.ofPath (path : System.FilePath) : Instance :=
   { path, backups := (path.parent.getD ".") / "backups" }
 
-/-- Resolve the instance for a CLI invocation: `--db <path>` anywhere in
-    argv (removed from the returned argv) beats `LEANDB_DB`, which beats
-    the base's default. -/
+/-- Resolve the instance for a CLI invocation: `--db <path>` only before
+    the verb (and before `--`) beats `LEANDB_DB`, which beats the base's
+    default. A `--db` after the verb is a positional argument, not a
+    path; `--` ends option scanning. -/
 def Instance.resolve (b : Base) (args : List String) :
     IO (Except String (Instance × List String)) := do
-  let rec strip : List String → Except String (Option String × List String)
+  let rec takeFlags (xs : List String) : Except String (Option String × List String) :=
+    match xs with
     | [] => .ok (none, [])
+    | "--" :: rest => .ok (none, rest)
     | "--db" :: [] => .error "--db expects a path"
-    | "--db" :: p :: rest => do
-        let (_, rest) ← strip rest
-        return (some p, rest)
-    | a :: rest => do
-        let (p, rest) ← strip rest
-        return (p, a :: rest)
-  match strip args with
+    | "--db" :: p :: rest =>
+        if p.startsWith "-" && p != "-" then
+          .error s!"--db expects a path, got {String.quote p}"
+        else
+          match takeFlags rest with
+          | .error m => .error m
+          | .ok (some _, _) => .error "duplicate --db"
+          | .ok (none, rest) => .ok (some p, rest)
+    | a :: rest =>
+        if a.startsWith "--" then
+          match takeFlags rest with
+          | .error m => .error m
+          | .ok (flag, rest) => .ok (flag, a :: rest)
+        else
+          .ok (none, a :: rest)
+  match takeFlags args with
   | .error m => return .error m
   | .ok (flag, rest) =>
       let env ← IO.getEnv "LEANDB_DB"
@@ -241,14 +274,18 @@ def Base.headVersion (b : Base) : Nat :=
 /-- Open the instance for this base and run an action — the whole
     lifecycle for another program that imports the base. -/
 def Base.withInstance (b : Base) (i : Instance) (act : DbM α) : IO (Except DbError α) := do
+  if let .error e := b.check then return .error e
   if let some parent := i.path.parent then
     IO.FS.createDirAll parent
-  match ← openDbRaw i.path with
+  match ← openDbRaw i.path b.log b.openConfig with
   | .error e => return .error e
   | .ok conn =>
       if let some c := b.chain then discard <| c.adopt conn
       match ← conn.verify b.specs b.headVersion with
       | .error e => return .error e
-      | .ok () => act.run conn
+      | .ok () =>
+          try applyAuxiliary conn.raw b.auxiliary
+          catch e => return .error (.sqlite (toString e))
+          act.run conn
 
 end LeanDb

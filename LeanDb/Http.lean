@@ -28,6 +28,8 @@ def statusOf (j : Json) : Status :=
     | some "not_found" => .notFound
     | some "stale" | some "restricted" | some "duplicate" | some "missing_ref"
     | some "schema_mismatch" | some "unknown_lineage" | some "migrate" => .conflict
+    | some "read_only" => .forbidden
+    | some "poisoned" => .internalServerError
     | _ => .internalServerError
 
 private def usage (m : String) : Nat × String := (400, m)
@@ -120,6 +122,52 @@ private def authorized (auth : Auth) (req : Request Body.Stream) : Bool :=
       | some v => toString v == s!"Bearer {token}"
       | none => false
 
+/-- Loopback bind or Host/Origin name: tokenless CSRF and DNS-rebinding
+    only make sense to pin against these. -/
+def isLoopbackHost (host : String) : Bool :=
+  let h := host.trimAscii.toString.toLower
+  h == "localhost" || h == "127.0.0.1" || h.startsWith "127."
+
+/-- Strip an optional `:port` from a Host header. -/
+def hostName (header : String) : String :=
+  let s := header.trimAscii.toString
+  match s.splitOn ":" with
+  | h :: _ => h
+  | [] => s
+
+/-- `application/json` or `application/json; charset=…`. -/
+def isJsonContentType (header : String) : Bool :=
+  let s := header.trimAscii.toString.toLower
+  s == "application/json" || s.startsWith "application/json;"
+
+/-- Routes whose body is parsed as JSON. -/
+def jsonBodyRoute (method : String) (segs : List String) : Bool :=
+  match method, segs with
+  | "POST", ["tables", _] => true
+  | "PATCH", ["tables", _, _] | "PUT", ["tables", _, _] => true
+  | "POST", ["query", _] => true
+  | "POST", ["restore"] => true
+  | "POST", ["rpc"] => true
+  | _, _ => false
+
+/-- Host header is required; when the server is bound to loopback the
+    name must also be loopback (`localhost` / `127.0.0.1`), so a
+    DNS-rebound page cannot become same-origin with the server. -/
+def hostAllowed (boundHost header : String) : Bool :=
+  let name := hostName header
+  if isLoopbackHost boundHost then isLoopbackHost name else !name.isEmpty
+
+/-- An `Origin` header, when present, must agree with a loopback bind.
+    Absent Origin (curl, agent harnesses) is allowed. -/
+def originAllowed (boundHost : String) : Option String → Bool
+  | none => true
+  | some origin =>
+      if !isLoopbackHost boundHost then true
+      else
+        let o := origin.trimAscii.toString.toLower
+        o.startsWith "http://127.0.0.1" || o.startsWith "https://127.0.0.1" ||
+          o.startsWith "http://localhost" || o.startsWith "https://localhost"
+
 /-- Default request-body budget for both standalone and hosted bases: 2 MiB. -/
 def defaultMaxBodyBytes : Nat := 2 * 1024 * 1024
 
@@ -154,15 +202,30 @@ private partial def readBody (stream : Body.Stream) (limit : Nat) :
         loop (bytes ++ chunk.data)
   loop ByteArray.empty
 
-/-- One request through the resolver. -/
+/-- One request through the resolver. `boundHost` is the bind address
+    (`127.0.0.1` by default): Host/Origin are pinned to loopback when
+    that is where the server listens. `/healthz` stays open. -/
 def handleRequestWithLimit (maxBodyBytes : Nat) (auth : Auth) (resolve : Resolver)
-    (req : Request Body.Stream) :
+    (req : Request Body.Stream) (boundHost : String := "127.0.0.1") :
     ContextAsync (Response Body.Any) := do
   let method := (toString req.line.method).toUpper
   let segs := (req.line.uri.path.toDecodedSegments.toList).filter (!·.isEmpty)
   -- liveness, before the secret: nothing about the base is revealed
   if segs == ["healthz"] then
     return ← respond .ok (Json.mkObj [("ok", Json.bool true)])
+  -- Host / Origin: pin a loopback server so a rebound page cannot
+  -- become same-origin with it. Tokenless CSRF is further blocked by
+  -- requiring `Content-Type: application/json` on JSON-body routes
+  -- (that is not a "simple" type, so browsers preflight).
+  match req.line.headers.get? (Header.Name.ofString! "host") with
+  | none =>
+      return ← respond .badRequest (errJson "usage" "Host header required")
+  | some host =>
+      unless hostAllowed boundHost (toString host) do
+        return ← respond .forbidden (errJson "usage" s!"Host {String.quote (toString host)} is not this server")
+  if let some origin := req.line.headers.get? (Header.Name.ofString! "origin") then
+    unless originAllowed boundHost (some (toString origin)) do
+      return ← respond .forbidden (errJson "usage" s!"Origin {String.quote (toString origin)} is not this server")
   unless authorized auth req do
     let r ← respond .unauthorized (errJson "unauthorized" "bearer token required (Authorization: Bearer <token>)")
     return { r with line := { r.line with headers := r.line.headers.insert (Header.Name.ofString! "www-authenticate") (Header.Value.ofString! "Bearer") } }
@@ -172,6 +235,15 @@ def handleRequestWithLimit (maxBodyBytes : Nat) (auth : Auth) (resolve : Resolve
   let some bytes ← readBody req.body maxBodyBytes |
     return ← respond .payloadTooLarge (errJson "usage" "request body too large")
   let body := if bytes.isEmpty then none else String.fromUTF8? bytes
+  if jsonBodyRoute method segs && body.isSome then
+    match req.line.headers.get? (Header.Name.ofString! "content-type") with
+    | some ct =>
+        unless isJsonContentType (toString ct) do
+          return ← respond .unsupportedMediaType
+            (errJson "usage" "Content-Type must be application/json")
+    | none =>
+        return ← respond .unsupportedMediaType
+          (errJson "usage" "Content-Type must be application/json")
   match ← resolve segs with
   | .error (404, m) => respond .notFound (errJson "usage" m)
   | .error (_, m) => respond .badRequest (errJson "usage" m)
@@ -202,6 +274,15 @@ private def parseHost (host : String) : Except String Net.IPv4Addr :=
 
 /-- Serve a resolver on `host:port` until shutdown. -/
 def serveResolver (host : String) (port : UInt16) (auth : Auth) (resolve : Resolver) (banner : Json) : IO UInt32 := do
+  -- tokenless mode is loopback-dev-only: a non-loopback bind with no
+  -- token is the CSRF/DNS-rebinding surface (#40)
+  match auth with
+  | .open =>
+      unless isLoopbackHost host do
+        IO.eprintln (errJson "usage"
+          "tokenless HTTP is loopback-only; pass --auth-token / $LEANDB_TOKEN, or --bind 127.0.0.1").compress
+        return 3
+  | .bearer _ => pure ()
   let maxBodyBytes ← match bodyLimitOf (← IO.getEnv "LEANDB_HTTP_MAX_BODY_BYTES") with
     | .ok n => pure n
     | .error m =>
@@ -213,7 +294,8 @@ def serveResolver (host : String) (port : UInt16) (auth : Auth) (resolve : Resol
         IO.eprintln (errJson "usage" m).compress
         return 3
   let addr : Net.SocketAddress := .v4 { addr := ip, port }
-  let handler := Std.Http.Server.Handler.ofFn (handleRequestWithLimit maxBodyBytes auth resolve)
+  let handler := Std.Http.Server.Handler.ofFn (fun req =>
+    handleRequestWithLimit maxBodyBytes auth resolve req host)
   let banner := banner.mergeObj (Json.mkObj [("max_body_bytes", Lean.toJson maxBodyBytes)])
   let banner := match auth with
     | .open => banner.mergeObj (Json.mkObj [("auth", Json.str "open")])

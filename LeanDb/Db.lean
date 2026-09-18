@@ -1,5 +1,6 @@
 import SQLite
 import Std.Data.HashMap
+import Std.Data.HashSet
 import LeanDb.Select
 import LeanDb.PlanElab
 import LeanDb.Json
@@ -17,11 +18,16 @@ Backed by `leansqlite` (bundled SQLite). SQL text appears only in this file
 structure LogConfig where
   maxEntries : Option Nat := none
   impactLimit : Nat := 1000
+  verbs : LogVerbs := .all
+  sampleEvery : Nat := 1
+  batch : Bool := false
+  registeredOnly : Bool := false
   deriving Repr
 
 /-- Environment settings override the base's policy. Zero retains no logs
     (or skips historical impact scanning); `unlimited` disables retention. -/
-def LogConfig.ofSettings (config : LogConfig) (maxEntries impactLimit : Option String) :
+def LogConfig.ofSettings (config : LogConfig) (maxEntries impactLimit : Option String)
+    (verbs sample batch : Option String := none) :
     Except String LogConfig := do
   let parse := fun (name s : String) => do
     let some n := s.toNat? | throw s!"{name} must be a nonnegative integer"
@@ -36,30 +42,121 @@ def LogConfig.ofSettings (config : LogConfig) (maxEntries impactLimit : Option S
     | some s => parse "LEANDB_LOG_IMPACT_LIMIT" s
   if maxEntries.any (· >= Int64.maxValue.toNatClampNeg) || impactLimit >= Int64.maxValue.toNatClampNeg then
     throw "log limits must be smaller than Int64.maxValue"
-  return { maxEntries, impactLimit }
+  let verbs ← match verbs with
+    | none => pure config.verbs
+    | some s =>
+        let some v := LogVerbs.ofString? s | throw s!"LEANDB_LOG_VERBS must be all|failuresAndPlans|failuresOnly|none"
+        pure v
+  let sampleEvery ← match sample with
+    | none => pure config.sampleEvery
+    | some s =>
+        let n ← parse "LEANDB_LOG_SAMPLE" s
+        if n == 0 then throw "LEANDB_LOG_SAMPLE must be at least 1"
+        pure n
+  let batch ← match batch with
+    | none => pure config.batch
+    | some "1" | some "true" | some "yes" => pure true
+    | some "0" | some "false" | some "no" => pure false
+    | some s => throw s!"LEANDB_LOG_BATCH must be true or false, got {s}"
+  return { maxEntries, impactLimit, verbs, sampleEvery, batch, registeredOnly := config.registeredOnly }
+
+/-- Apply environment overrides to an `OpenConfig`. Invalid values fail
+    before the database is opened (exit code 3 at the CLI). -/
+def OpenConfig.ofEnv (c : OpenConfig) : IO (Except String OpenConfig) := do
+  if let .error e := c.checkExtra then return .error e
+  let mut c := c
+  if let some s ← IO.getEnv "LEANDB_SYNCHRONOUS" then
+    let some v := Synchronous.ofString? s | return .error s!"LEANDB_SYNCHRONOUS is not off|normal|full|extra"
+    c := { c with synchronous := v }
+  if let some s ← IO.getEnv "LEANDB_BUSY_TIMEOUT_MS" then
+    let some n := s.toNat? | return .error "LEANDB_BUSY_TIMEOUT_MS must be a nonnegative integer"
+    c := { c with busyTimeoutMs := n }
+  if let some s ← IO.getEnv "LEANDB_CACHE_SIZE_KIB" then
+    let some n := s.toNat? | return .error "LEANDB_CACHE_SIZE_KIB must be a nonnegative integer"
+    c := { c with cacheSizeKiB := some n }
+  if let some s ← IO.getEnv "LEANDB_MMAP_BYTES" then
+    let some n := s.toNat? | return .error "LEANDB_MMAP_BYTES must be a nonnegative integer"
+    c := { c with mmapBytes := some n }
+  if let some s ← IO.getEnv "LEANDB_WAL_AUTOCHECKPOINT" then
+    let some n := s.toNat? | return .error "LEANDB_WAL_AUTOCHECKPOINT must be a nonnegative integer"
+    c := { c with walAutocheckpoint := some n }
+  return .ok c
+
+def OpenConfig.apply (db : SQLite) (c : OpenConfig) : IO Unit := do
+  db.exec s!"PRAGMA busy_timeout = {c.busyTimeoutMs}"
+  db.exec s!"PRAGMA synchronous = {c.synchronous.toSql}"
+  if let some n := c.cacheSizeKiB then
+    db.exec s!"PRAGMA cache_size = -{n}"
+  if let some n := c.mmapBytes then
+    db.exec s!"PRAGMA mmap_size = {n}"
+  if let some n := c.walAutocheckpoint then
+    db.exec s!"PRAGMA wal_autocheckpoint = {n}"
+  if c.tempStoreMemory then
+    db.exec "PRAGMA temp_store = MEMORY"
+  for (name, value) in c.extraPragmas do
+    db.exec s!"PRAGMA {name} = {value}"
 
 structure Conn where
   raw : SQLite
-  /-- The registered query being run, if any: `query <name>` sets it so
-      the log can attribute the plans it records. -/
   queryName : IO.Ref (Option String)
   logConfig : LogConfig := {}
-  /-- Writes since the last retention pass on this connection. -/
   logWrites : IO.Ref Nat
+  txDepth : IO.Ref Nat
+  poisoned : IO.Ref (Option String)
+  /-- Set on a `SQLITE_OPEN_READONLY` / `query_only` connection (LDB-09). -/
+  readOnly : Bool := false
+  /-- Effective open-time pragmas, for `Runtime.status` / HTTP startup. -/
+  openConfig : OpenConfig := {}
+  /-- Plan hashes seen since open (`failuresAndPlans` dedupe). -/
+  seenPlans : IO.Ref (Std.HashSet String)
+  /-- Sample counter for successful ops. -/
+  logSample : IO.Ref Nat
 
-def Conn.ofRaw (raw : SQLite) (logConfig : LogConfig := {}) : IO Conn := do
-  return { raw, queryName := ← IO.mkRef none, logConfig, logWrites := ← IO.mkRef 0 }
+def Conn.ofRaw (raw : SQLite) (logConfig : LogConfig := {}) (openConfig : OpenConfig := {})
+    (readOnly : Bool := false) : IO Conn := do
+  let queryName ← IO.mkRef none
+  let logWrites ← IO.mkRef (0 : Nat)
+  let txDepth ← IO.mkRef (0 : Nat)
+  let poisoned ← IO.mkRef none
+  let seenPlans ← IO.mkRef ({} : Std.HashSet String)
+  let logSample ← IO.mkRef (0 : Nat)
+  return {
+    raw := raw
+    queryName := queryName
+    logConfig := logConfig
+    logWrites := logWrites
+    txDepth := txDepth
+    poisoned := poisoned
+    readOnly := readOnly
+    openConfig := openConfig
+    seenPlans := seenPlans
+    logSample := logSample
+  }
+
+/-- Mark the connection unusable: a `ROLLBACK` failed, so the open
+    transaction state is unknown and no later verb may run. -/
+def Conn.poison (conn : Conn) (why : String) : IO Unit :=
+  conn.poisoned.set (some why)
 
 /-- The database monad: a connection, typed errors, IO. -/
 abbrev DbM := ReaderT Conn (ExceptT DbError IO)
+
+private def requireWritable (verb : String) : DbM Unit := fun conn =>
+  ExceptT.mk do
+    if conn.readOnly then return .error (.readOnly verb) else return .ok ()
+
+
 
 def DbM.run (conn : Conn) (act : DbM α) : IO (Except DbError α) :=
   (act conn).run
 
 /-- Run a SQLite IO action, converting failures via `onErr`. -/
 private def sqliteWith (onErr : IO.Error → DbError) (act : SQLite → IO α) : DbM α :=
-  fun conn => ExceptT.mk <|
-    try (.ok <$> act conn.raw) catch e => pure (.error (onErr e))
+  fun conn => ExceptT.mk do
+    match ← conn.poisoned.get with
+    | some why => return .error (.poisoned why)
+    | none =>
+      try (.ok <$> act conn.raw) catch e => pure (.error (onErr e))
 
 private def sqlite (act : SQLite → IO α) : DbM α :=
   sqliteWith (fun e => .sqlite (toString e)) act
@@ -185,10 +282,37 @@ private def readStored (α : Type) [Entity α] (stmt : SQLite.Stmt) :
 def DbM.ofExcept (r : Except DbError α) : DbM α :=
   fun _ => ExceptT.mk (pure r)
 
-/-- Append to `_leandb_log`. Best-effort: the log never fails an operation. -/
+/-- Append to `_leandb_log`. Best-effort: the log never fails an operation.
+    Policy (`LogVerbs`, sampling) is applied here so the default `.all` /
+    `sampleEvery = 1` path is byte-identical to 0.3.x. -/
 private def logOp (verb detail : String) (ok : Bool) (error : Option String) (rows : Nat)
     (plan : Option String) : DbM Unit := fun conn => ExceptT.mk do
   if conn.logConfig.maxEntries == some 0 then return .ok ()
+  let cfg := conn.logConfig
+  let should ←
+    match cfg.verbs with
+    | .none => pure false
+    | .failuresOnly => pure (!ok)
+    | .failuresAndPlans =>
+        if !ok then pure true
+        else match plan with
+          | none => pure false
+          | some p =>
+              let seen ← conn.seenPlans.get
+              if seen.contains p then pure false
+              else
+                conn.seenPlans.set (seen.insert p)
+                pure true
+    | .all =>
+        if !ok then pure true
+        else if cfg.registeredOnly then
+          pure (← conn.queryName.get).isSome
+        else if cfg.sampleEvery <= 1 then pure true
+        else do
+          let n := (← conn.logSample.get) + 1
+          conn.logSample.set (if n >= cfg.sampleEvery then 0 else n)
+          pure (n >= cfg.sampleEvery)
+  unless should do return .ok ()
   try
     let query ← conn.queryName.get
     let stmt ← conn.raw.prepare
@@ -249,21 +373,41 @@ Reads cost one engine-internal statement per child table per fetch —
 `WHERE parent IN (…)` over the fetched parents, chunked — never one per
 row. Writes run inside a transaction. -/
 
-/-- Run `act` inside `BEGIN … COMMIT`; any failure rolls back and re-raises
-    the typed error. Used by the verbs that write more than one row. -/
+/-- Run `act` inside `BEGIN DEFERRED … COMMIT`; any failure rolls back and
+    re-raises the typed error. Reentrant: a nested call (a read burst
+    inside a write, or `selectP` snapshotting via `fetchAll`) joins the
+    open transaction instead of issuing a second `BEGIN`. -/
 private def transaction (act : DbM α) : DbM α := fun conn => ExceptT.mk do
   let exec (sql : String) : IO (Except DbError Unit) :=
     try conn.raw.exec sql; pure (.ok ()) catch e => pure (.error (.sqlite (toString e)))
-  match ← exec "BEGIN" with
-  | .error e => return .error e
-  | .ok () =>
-    let r ← try (act conn).run catch e => pure (.error (.sqlite (toString e)))
+  match ← conn.poisoned.get with
+  | some why => return .error (.poisoned why)
+  | none =>
+  let depth ← conn.txDepth.get
+  if depth > 0 then
+    return ← (act conn).run
+  conn.txDepth.set (depth + 1)
+  -- A ROLLBACK that itself fails leaves the transaction state unknown:
+  -- the connection is poisoned and refuses every later verb (#72).
+  let rollback (e : DbError) : IO (Except DbError α) := do
+    match ← exec "ROLLBACK" with
+    | .ok () => return .error e
+    | .error re =>
+        conn.poison s!"ROLLBACK failed after {e.code}: {re.message}"
+        return .error (.poisoned s!"ROLLBACK failed after {e.code}: {re.message}")
+  let finish (r : Except DbError α) : IO (Except DbError α) := do
+    conn.txDepth.set depth
     match r with
     | .ok a =>
         match ← exec "COMMIT" with
         | .ok () => return .ok a
-        | .error e => discard <| exec "ROLLBACK"; return .error e
-    | .error e => discard <| exec "ROLLBACK"; return .error e
+        | .error e => rollback e
+    | .error e => rollback e
+  match ← exec "BEGIN DEFERRED" with
+  | .error e => conn.txDepth.set depth; return .error e
+  | .ok () =>
+    let r ← try (act conn).run catch e => pure (.error (.sqlite (toString e)))
+    finish r
 
 /-- How many parent ids one child fetch names: SQLite's default parameter
     limit is far above this, and the statement text stays small. -/
@@ -335,6 +479,7 @@ private def insertChildren [Entity α] (link : ChildLink α) (id : Int64) (a : �
     child lists writes its own row and then every child row, in one
     transaction. -/
 def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert" (Entity.tableName α) (fun _ => 1) do
+  requireWritable "insert"
   let spec := Entity.spec α
   let links := Entity.children (α := α)
   let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
@@ -352,8 +497,9 @@ def insert (α : Type) [Entity α] (a : α) : DbM (Stored α) := withLog "insert
     return ⟨⟨id⟩, a⟩
   if links.isEmpty then act else transaction act
 
-/-- Fetch one row by typed identity. -/
-def get [Entity α] (id : Id α) : DbM (Option (Stored α)) := do
+/-- Fetch one row by typed identity. Parent row and child lists share one
+    deferred snapshot so a concurrent writer cannot tear them. -/
+def get [Entity α] (id : Id α) : DbM (Option (Stored α)) := transaction do
   let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} WHERE id = ?"
   let row ← sqlite fun db => do
     let stmt ← db.prepare sql
@@ -365,8 +511,9 @@ def get [Entity α] (id : Id α) : DbM (Option (Stored α)) := do
       let rows ← attachChildren α #[← liftExcept r]
       return rows[0]?
 
-/-- Every row of `α`'s table, in id order. -/
-def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
+/-- Every row of `α`'s table, in id order. Parent rows and child lists
+    share one deferred snapshot. -/
+def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := transaction do
   let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} ORDER BY id"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
@@ -383,6 +530,7 @@ def fetchAll (α : Type) [Entity α] : DbM (Array (Stored α)) := do
     wholesale (`DELETE … WHERE parent = ?`, then re-inserted), in the same
     transaction. -/
 def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog "update" (Entity.tableName α) (fun _ => 1) do
+  requireWritable "update"
   let spec := Entity.spec α
   let links := Entity.children (α := α)
   let cas : DbM Unit := do
@@ -426,6 +574,7 @@ def update [Entity α] (old : Stored α) (new : α) : DbM (Stored α) := withLog
     rows go with it (the child FK cascades: they are part of its value),
     while any other table's `Ref` to it still restricts. -/
 def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.tableName α) (fun _ => 1) do
+  requireWritable "delete"
   let table := Entity.tableName α
   let changed ← sqliteWith (constraintError table (.restricted table id.toInt64)) fun db => do
     let stmt ← db.prepare s!"DELETE FROM {quoteId table} WHERE id = ?"
@@ -438,24 +587,33 @@ def delete [Entity α] (id : Id α) : DbM Unit := withLog "delete" (Entity.table
     table is aliased `t0` and every index of the predicate renders as
     `t0` — only conjuncts over `α`'s own columns may reach here
     (`Pred.forTable`), and a quantifier among them needs the alias to
-    correlate its subquery with the outer row. Callers pass an opaque-free
-    tree (`Pred.approx`). -/
+    name its own table. -/
 def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts)
-    (limit : Option Nat := none) : DbM (Array (Stored α)) := do
-  if pred.isTrivial && limit.isNone then return ← fetchAll α
+    (limit : Option Nat := none) (order : Array (Order ts) := #[])
+    (window : Window := {}) : DbM (Array (Stored α)) := transaction do
+  if let .error e := window.check then throw e
+  let cap := window.limit <|> limit
+  if pred.isTrivial && cap.isNone && window.offset == 0 && order.isEmpty then
+    return ← fetchAll α
   let (whereSql, binds) := pred.render fun _ => "t0"
-  -- a caller-supplied cap ships to SQL as a bound parameter, so the
-  -- fetch (and the child-list attachment under it) is bounded by the
-  -- cap, not by the table (issue: `rows --limit` never reached SQL)
-  let limitBind : Array LeanDb.Col := match limit with
-    | some n => #[LeanDb.Col.int (Int64.ofNat n)]
-    | none => #[]
-  let limitSql := match limit with | some _ => " LIMIT ?" | none => ""
-  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql} ORDER BY id{limitSql}"
+  let orderSql :=
+    if order.isEmpty then " ORDER BY id"
+    else
+      let keys := order.toList.map fun o => s!"{quoteId o.column} {o.dir.sql}"
+      s!" ORDER BY {String.intercalate ", " keys}, id ASC"
+  let mut tail := ""
+  let mut extra : Array LeanDb.Col := #[]
+  if let some n := cap then
+    tail := tail ++ " LIMIT ?"
+    extra := extra.push (.int (Int64.ofNat n))
+  if window.offset != 0 then
+    tail := tail ++ " OFFSET ?"
+    extra := extra.push (.int (Int64.ofNat window.offset))
+  let sql := s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 WHERE {whereSql}{orderSql}{tail}"
   let rows ← sqlite fun db => do
     let stmt ← db.prepare sql
     bindCols stmt 1 binds
-    bindCols stmt (binds.size + 1) limitBind
+    bindCols stmt (binds.size + 1) extra
     let mut out := #[]
     repeat
       if ← stmt.step then out := out.push (← readStored α stmt) else break
@@ -468,8 +626,11 @@ def fetchFiltered (α : Type) [Entity α] {ts : List Type} (pred : Pred ts)
 def dbSource : Source DbM := ⟨fun _ α _ => fetchAll α⟩
 
 /-- The live database narrowed by a pushed plan's per-table conjuncts. -/
-def plannedSource {ts : List Type} (pushed : Pred ts) : Source DbM :=
-  ⟨fun i α _ => fetchFiltered α (pushed.forTable i)⟩
+def plannedSource {ts : List Type} (pushed : Pred ts)
+    (order : Array (Order ts) := #[]) (window : Window := {}) : Source DbM :=
+  ⟨fun i α _ =>
+    if i == 0 then fetchFiltered α (pushed.forTable i) none order window
+    else fetchFiltered α (pushed.forTable i)⟩
 
 /-- Joined execution: one SQL statement over all involved tables with the
     whole pushed predicate (join conditions included) as `WHERE`. Used
@@ -510,11 +671,13 @@ def selectJoined (ts : List Type) [RowsOf ts] (pushed : Pred ts)
     otherwise — and `where'` is applied to what comes back. The one path
     under both `select` and `selectP`, so they cannot diverge. -/
 private def runPlanned (ts : List Type) [RowsOf ts] (pushed : Pred ts)
-    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : DbM (Array (Rows ts)) :=
+    (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts))
+    (order : Array (Order ts) := #[]) (window : Window := {}) : DbM (Array (Rows ts)) :=
   if pushed.hasJoin then
     selectJoined ts pushed where' sortBy
   else
-    selectSpec ts (plannedSource pushed) where' sortBy
+    selectSpec ts (plannedSource pushed order window)
+      where' (if order.isEmpty then sortBy else .preserve)
 
 private def selectDetail (ts : List Type) [RowsOf ts] (p : Pred ts) : String :=
   s!"{String.intercalate "×" ((RowsOf.specs ts).map (·.name))} | {p.describe}"
@@ -612,10 +775,17 @@ where
     lambda-always-runs invariant holds literally: `finishRows` filters by
     `p.denote`, and pushdown (`p.approx`) can only narrow the fetch. -/
 def selectP (ts : List Type) [RowsOf ts] (p : Pred ts)
-    (sortBy : SortBy (Rows ts) := .preserve) : DbM (Array (Rows ts)) :=
-  withLog "select" (selectDetail ts p) (·.size) (plan := some (planJson ts p)) do
-    let snap ← p.snapshot
-    runPlanned ts p.approx (p.denote snap) sortBy
+    (sortBy : SortBy (Rows ts) := .preserve)
+    (order : Array (Order ts) := #[]) (window : Window := {}) : DbM (Array (Rows ts)) :=
+  withLog "select" (selectDetail ts p) (·.size) (plan := some (planJson ts p)) <|
+    transaction do
+      if let .error e := window.check then throw e
+      if window.limit.isSome && order.isEmpty then
+        match sortBy with
+        | .preserve => pure ()
+        | _ => throw (.sqlite "limit requires a pushed order")
+      let snap ← p.snapshot
+      runPlanned ts p.approx (p.denote snap) sortBy order window
 
 /-- `select` with pushdown disabled — the executable reference, for
     differential testing against the planned path. -/
@@ -666,6 +836,77 @@ def ensureColumns (db : SQLite) (table : String) (cols : List (String × String)
   for (name, decl) in cols do
     unless present.contains name do
       db.exec s!"ALTER TABLE {quoteId table} ADD COLUMN {quoteId name} {decl}"
+
+/-! ### Restore safety primitives
+
+Shared by the CLI session (`Cli.replaceFile`) and `Runtime.Service.restore`:
+validate the source before anything destructive, copy it bounded. -/
+
+/-- The 16-byte magic string every SQLite 3 file begins with. -/
+def Restore.magic : ByteArray := "SQLite format 3\u0000".toUTF8
+
+/-- Do these leading bytes carry the SQLite 3 magic header? -/
+def Restore.headerOk (bytes : ByteArray) : Bool :=
+  bytes.size >= Restore.magic.size &&
+    (List.range Restore.magic.size).all fun i => bytes[i]! == Restore.magic[i]!
+
+/-- Validate a restore source before anything destructive happens: the
+    magic header refuses text files and directories cheaply, then the
+    source must open as a database and pass `PRAGMA quick_check`. -/
+def Restore.validate (src : System.FilePath) : IO (Except DbError Unit) := do
+  let head ← try
+      let h ← IO.FS.Handle.mk src .read
+      let bytes ← h.read Restore.magic.size.toUSize
+      pure bytes
+    catch e => return .error (.migrate s!"restore source cannot be read: {src} ({e})")
+  unless Restore.headerOk head do
+    return .error (.migrate s!"restore source is not a SQLite database: {src}")
+  try
+    let db ← SQLite.open src
+    let stmt ← db.prepare "PRAGMA quick_check"
+    if ← stmt.step then
+      let verdict ← stmt.columnText 0
+      if verdict == "ok" then return .ok ()
+      return .error (.migrate s!"restore source failed quick_check: {src} ({verdict})")
+    return .error (.migrate s!"restore source failed quick_check: {src}")
+  catch e =>
+    return .error (.migrate s!"restore source is not a valid SQLite database: {src} ({e})")
+
+/-- Bounded-memory file copy: 1 MiB reads, so the source's size never
+    sets the process's memory use. -/
+def Restore.copyChunked (src dest : System.FilePath) : IO Unit := do
+  let chunk : USize := 1024 * 1024
+  let input ← IO.FS.Handle.mk src .read
+  let output ← IO.FS.Handle.mk dest .write
+  repeat
+    let bytes ← input.read chunk
+    if bytes.isEmpty then break
+    output.write bytes
+
+/-- Replace the instance file at `path` with `src`: validate first, copy
+    under a temporary name, rename into place so no reader sees a
+    half-written file, and take stale `-wal`/`-shm`/`-journal` siblings
+    with the old file. The caller reopens after the swap. -/
+def Restore.swapFile (path src : System.FilePath) : IO (Except DbError Unit) := do
+  unless ← src.pathExists do
+    return .error (.migrate s!"restore source does not exist: {src}")
+  match ← Restore.validate src with
+  | .error e => return .error e
+  | .ok () => pure ()
+  try
+    let tmp : System.FilePath := path.toString ++ ".restore"
+    try
+      Restore.copyChunked src tmp
+    catch e =>
+      try IO.FS.removeFile tmp catch _ => pure ()
+      throw e
+    for suffix in ["-wal", "-shm", "-journal"] do
+      let side : System.FilePath := path.toString ++ suffix
+      if ← side.pathExists then IO.FS.removeFile side
+    IO.FS.rename tmp path
+    return .ok ()
+  catch e =>
+    return .error (.sqlite s!"restore failed: {e}")
 
 /-- Columns the journal gained after 0.2.0: the versions a migration moved
     between, the backup taken before it, and a free-form note. -/
@@ -723,22 +964,42 @@ FROM _leandb_migrations ORDER BY idx DESC LIMIT ?"
     or applied. A server holds a connection opened this way so it can
     answer `version`/`migrate` on a drifted instance; `Conn.verify` is the
     step that admits the base's verbs. -/
-def openDbRaw (path : System.FilePath) (logConfig : LogConfig := {}) : IO (Except DbError Conn) := do
-  let logConfig ← match logConfig.ofSettings (← IO.getEnv "LEANDB_LOG_MAX")
-      (← IO.getEnv "LEANDB_LOG_IMPACT_LIMIT") with
+def openDbRaw (path : System.FilePath) (logConfig : LogConfig := {})
+    (openConfig : OpenConfig := {}) (readOnly : Bool := false) :
+    IO (Except DbError Conn) := do
+  let logConfig ← match logConfig.ofSettings
+      (← IO.getEnv "LEANDB_LOG_MAX")
+      (← IO.getEnv "LEANDB_LOG_IMPACT_LIMIT")
+      (← IO.getEnv "LEANDB_LOG_VERBS")
+      (← IO.getEnv "LEANDB_LOG_SAMPLE")
+      (← IO.getEnv "LEANDB_LOG_BATCH") with
     | .ok config => pure config
     | .error m => return .error (.sqlite s!"invalid log configuration: {m}")
+  -- Invalid env values fail *before* the database is opened.
+  let openConfig ← match ← openConfig.ofEnv with
+    | .ok c => pure c
+    | .error m => return .error (.sqlite s!"invalid open configuration: {m}")
   try
-    let db ← SQLite.open path
+    let db ←
+      if readOnly then
+        SQLite.openWith path .readonly
+      else
+        SQLite.open path
     db.exec "PRAGMA foreign_keys = ON"
+    unless readOnly do
+      db.exec "PRAGMA journal_mode = WAL"
+    openConfig.apply db
+    if readOnly then
+      db.exec "PRAGMA query_only = ON"
     db.exec metaDdl
-    db.exec logDdl
-    db.exec migrationsDdl
-    ensureColumns db "_leandb_migrations" journalColumns
-    ensureColumns db "_leandb_log" logColumns
-    db.exec "CREATE INDEX IF NOT EXISTS _leandb_log_select_id ON _leandb_log(id DESC) WHERE verb = 'select' AND plan IS NOT NULL"
-    if let some keep := logConfig.maxEntries then discard <| pruneLogRaw db keep
-    return .ok (← Conn.ofRaw db logConfig)
+    unless readOnly do
+      db.exec logDdl
+      db.exec migrationsDdl
+      ensureColumns db "_leandb_migrations" journalColumns
+      ensureColumns db "_leandb_log" logColumns
+      db.exec "CREATE INDEX IF NOT EXISTS _leandb_log_select_id ON _leandb_log(id DESC) WHERE verb = 'select' AND plan IS NOT NULL"
+      if let some keep := logConfig.maxEntries then discard <| pruneLogRaw db keep
+    return .ok (← Conn.ofRaw db logConfig openConfig readOnly)
   catch e =>
     return .error (.sqlite (toString e))
 
@@ -772,9 +1033,11 @@ AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_leandb\\_%' ESC
           return .error (.migrate s!"the file already carries tables (first: {String.quote existing}) \
 but records no LeanDB schema: it was not created by this base. Adopt it with \
 `leandb import-sqlite` instead of opening it as this base's instance")
+    -- Extra user tables / virtual tables / triggers in a fingerprinted
+    -- instance are tolerated and ignored by the fingerprint (LDB-11).
     for spec in specs do
       db.exec spec.ddl
-    -- Drift scan: stored closed-world values must still be in the vocabulary.
+      for sql in spec.indexDdl do db.exec sql
     -- CHECK guards new writes; this guards data written under an older world.
     for spec in specs do
       for c in spec.columns do
@@ -804,8 +1067,9 @@ but records no LeanDB schema: it was not created by this base. Adopt it with \
 /-- Open (creating if absent) an instance for the given schema: `openDbRaw`
     then `Conn.verify`. Refuses to open an instance whose fingerprint
     disagrees with the code's. -/
-def openDb (path : System.FilePath) (specs : List TableSpec) (logConfig : LogConfig := {}) : IO (Except DbError Conn) := do
-  match ← openDbRaw path logConfig with
+def openDb (path : System.FilePath) (specs : List TableSpec) (logConfig : LogConfig := {})
+    (openConfig : OpenConfig := {}) : IO (Except DbError Conn) := do
+  match ← openDbRaw path logConfig openConfig with
   | .error e => return .error e
   | .ok conn =>
       match ← conn.verify specs with
@@ -869,6 +1133,211 @@ def scanLogFootprints (conn : Conn) (limit : Nat) : IO LogFootprintScan := do
 /-- Logged selects, newest first: `(query name, footprint columns)`. -/
 def logFootprints (conn : Conn) (limit : Nat) : IO (Array (Option String × List (String × String))) := do
   return (← scanLogFootprints conn limit).entries
+
+
+/-! ## LDB-06: `count` / `exists`
+
+When the predicate has no residual, these render `COUNT(*)` / `EXISTS`.
+Otherwise they fetch and reduce in Lean and the plan log records that. -/
+
+def countP [RowsOf ts] (p : Pred ts) : DbM Nat :=
+  withLog "count" (selectDetail ts p) (fun _ => 1) (plan := some (planJson ts p)) do
+    if p.hasOpaque then
+      return (← selectP ts p).size
+    let specs := RowsOf.specs ts
+    let spec ← match specs with
+      | [spec] => pure spec
+      | _ => return (← selectP ts p).size
+    let (whereSql, binds) := p.approx.render fun _ => "t0"
+    sqlite fun db => do
+      let stmt ← db.prepare
+        s!"SELECT COUNT(*) FROM {quoteId spec.name} AS t0 WHERE {whereSql}"
+      bindCols stmt 1 binds
+      if ← stmt.step then return (← stmt.columnInt64 0).toNatClampNeg else return 0
+
+def count [RowsOf ts] (p : Rows ts → Bool) (plan : PlanFor p := by leandb_plan) : DbM Nat :=
+  countP plan.plan
+
+def existsP [RowsOf ts] (p : Pred ts) : DbM Bool :=
+  withLog "exists" (selectDetail ts p) (fun _ => 1) (plan := some (planJson ts p)) do
+    if p.hasOpaque then
+      return !(← selectP ts p (window := { limit := some 1 })).isEmpty
+    let specs := RowsOf.specs ts
+    let spec ← match specs with
+      | [spec] => pure spec
+      | _ => return !(← selectP ts p (window := { limit := some 1 })).isEmpty
+    let (whereSql, binds) := p.approx.render fun _ => "t0"
+    sqlite fun db => do
+      let stmt ← db.prepare
+        s!"SELECT EXISTS(SELECT 1 FROM {quoteId spec.name} AS t0 WHERE {whereSql})"
+      bindCols stmt 1 binds
+      if ← stmt.step then return (← stmt.columnInt64 0) != 0 else return false
+
+def exists? [RowsOf ts] (p : Rows ts → Bool) (plan : PlanFor p := by leandb_plan) : DbM Bool :=
+  existsP plan.plan
+
+/-! ## LDB-07: field-level `patch` -/
+
+structure Assignment (α : Type) [Entity α] where
+  field : Entity.Field α
+  encoded : Col
+
+def Assignment.of [Entity α] (f : Entity.Field α) (v : Entity.fieldTy f) : Assignment α :=
+  ⟨f, (Entity.codec f).toCol v⟩
+
+structure Patch (α : Type) [Entity α] where
+  sets : Array (Assignment α)
+
+inductive PatchResult where
+  | updated | notFound | guardFailed
+  deriving Repr, DecidableEq
+
+def patch [Entity α] (id : Id α) (p : Patch α) (guard : Pred [α] := .tt) :
+    DbM PatchResult := withLog "patch" (Entity.tableName α) (fun _ => 1) do
+  requireWritable "patch"
+  let spec := Entity.spec α
+  if p.sets.isEmpty then
+    match ← get id with
+    | some _ => return .updated
+    | none => return .notFound
+  let sets := String.intercalate ", " (p.sets.toList.map fun a =>
+    s!"{quoteId (Entity.fieldName a.field)} = ?")
+  let (whereSql, binds) := guard.render fun _ => "t0"
+  let sql := s!"UPDATE {quoteId spec.name} AS t0 SET {sets} WHERE t0.id = ? AND {whereSql}"
+  let changed ← sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
+    let stmt ← db.prepare sql
+    bindCols stmt 1 (p.sets.map (·.encoded))
+    stmt.bindInt64 (Int32.ofNat (p.sets.size + 1)) id.toInt64
+    bindCols stmt (p.sets.size + 2) binds
+    stmt.exec
+    db.changes
+  if changed != 0 then return .updated
+  match ← get id with
+  | some _ => return .guardFailed
+  | none => return .notFound
+
+/-! ## LDB-08: `insertMany` and `scan` -/
+
+def insertMany (α : Type) [Entity α] (rows : Array α) : DbM (Array (Stored α)) :=
+  withLog "insertMany" (Entity.tableName α) (·.size) do
+    requireWritable "insertMany"
+    if rows.isEmpty then return #[]
+    let spec := Entity.spec α
+    let links := Entity.children (α := α)
+    let names := String.intercalate ", " (spec.columns.toList.map (quoteId ·.name))
+    let sql := if spec.columns.isEmpty then
+      s!"INSERT INTO {quoteId spec.name} DEFAULT VALUES"
+    else
+      s!"INSERT INTO {quoteId spec.name} ({names}) VALUES ({placeholders spec.columns.size})"
+    transaction do
+      let out ← sqliteWith (constraintError spec.name (.missingRef spec.name)) fun db => do
+        let stmt ← db.prepare sql
+        let mut out : Array (Stored α) := Array.mkEmpty rows.size
+        for a in rows do
+          stmt.reset
+          stmt.clearBindings
+          unless spec.columns.isEmpty do bindCols stmt 1 (Entity.encode a)
+          stmt.exec
+          let id ← db.lastInsertRowId
+          out := out.push ⟨⟨id⟩, a⟩
+        return out
+      if !links.isEmpty then
+        for s in out do
+          for link in links do insertChildren link s.id.toInt64 s.val
+      return out
+
+/-- Keyset-paginated walk over `id`. Each chunk is its own deferred
+    snapshot so a concurrent writer is not starved. `f` returns `false`
+    to stop. -/
+partial def scan [Entity α] (p : Pred [α]) (chunk : Nat := 500)
+    (f : Array (Stored α) → DbM Bool) : DbM Unit :=
+  withLog "scan" (Entity.tableName α) (fun _ => 1) do
+    if chunk == 0 || chunk >= Int64.maxValue.toNatClampNeg then
+      throw (.sqlite "scan chunk is out of range")
+    let rec go (last : Option Int64) : DbM Unit := do
+      let window : Window := { limit := some chunk }
+      let rows ← match last with
+        | none => fetchFiltered α p none #[{ column := "id", dir := .asc }] window
+        | some id =>
+            let (whereSql, binds) := p.render fun _ => "t0"
+            transaction do
+              let rows ← sqlite fun db => do
+                let stmt ← db.prepare
+                  s!"SELECT {columnList α} FROM {quoteId (Entity.tableName α)} AS t0 \
+WHERE ({whereSql}) AND t0.id > ? ORDER BY t0.id ASC LIMIT ?"
+                bindCols stmt 1 binds
+                stmt.bindInt64 (Int32.ofNat (binds.size + 1)) id
+                stmt.bindInt64 (Int32.ofNat (binds.size + 2)) (Int64.ofNat chunk)
+                let mut out := #[]
+                repeat
+                  if ← stmt.step then out := out.push (← readStored α stmt) else break
+                return out
+              attachChildren α (← rows.mapM liftExcept)
+      if rows.isEmpty then return
+      unless (← f rows) do return
+      if rows.size < chunk then return
+      go (rows.back?.map (·.id.toInt64))
+    go none
+
+/-! ## LDB-11: FTS5 auxiliary search -/
+
+def Auxiliary.ddl : Auxiliary → List String
+  | .fts5 name content columns tokenizer =>
+      let cols := String.intercalate ", " (columns.toList ++ [s!"tokenize='{tokenizer}'"])
+      let fts := s!"CREATE VIRTUAL TABLE IF NOT EXISTS {quoteIdent name} USING fts5({cols})"
+      -- content-sync triggers: insert/update/delete on the content table
+      let colList := String.intercalate ", " (columns.toList.map quoteIdent)
+      let newList := String.intercalate ", " (columns.toList.map fun c => s!"new.{quoteIdent c}")
+      let ins := s!"CREATE TRIGGER IF NOT EXISTS {quoteIdent (name ++ "_ai")} AFTER INSERT ON {quoteIdent content} BEGIN \
+INSERT INTO {quoteIdent name}(rowid, {colList}) VALUES (new.id, {newList}); END"
+      let del := s!"CREATE TRIGGER IF NOT EXISTS {quoteIdent (name ++ "_ad")} AFTER DELETE ON {quoteIdent content} BEGIN \
+INSERT INTO {quoteIdent name}({quoteIdent name}, rowid) VALUES ('delete', old.id); END"
+      let upd := s!"CREATE TRIGGER IF NOT EXISTS {quoteIdent (name ++ "_au")} AFTER UPDATE ON {quoteIdent content} BEGIN \
+INSERT INTO {quoteIdent name}({quoteIdent name}, rowid) VALUES ('delete', old.id); \
+INSERT INTO {quoteIdent name}(rowid, {colList}) VALUES (new.id, {newList}); END"
+      [fts, ins, del, upd]
+
+def applyAuxiliary (db : SQLite) (aux : List Auxiliary) : IO Unit := do
+  for a in aux do
+    for sql in a.ddl do db.exec sql
+
+/-- Ranked FTS5 search: `query` is a bound `MATCH` parameter, never
+    interpolated. Returns `(id, bm25)` in rank order. -/
+def searchP [Entity α] (aux : Auxiliary) (query : String) (window : Window := {}) :
+    DbM (Array (Stored α × Float)) :=
+  withLog "search" (Entity.tableName α) (·.size) do
+    if let .error e := window.check then throw e
+    let .fts5 name content _ _ := aux
+    unless content == Entity.tableName α do
+      throw (.sqlite s!"searchP content table {content} is not {Entity.tableName α}")
+    let mut tail := ""
+    let mut extra : Array Col := #[]
+    if let some n := window.limit then
+      tail := tail ++ " LIMIT ?"; extra := extra.push (.int (Int64.ofNat n))
+    if window.offset != 0 then
+      tail := tail ++ " OFFSET ?"; extra := extra.push (.int (Int64.ofNat window.offset))
+    let sql := s!"SELECT {columnList α}, bm25({quoteId name}) FROM {quoteId (Entity.tableName α)} \
+JOIN {quoteId name} ON {quoteId name}.rowid = {quoteId (Entity.tableName α)}.id \
+WHERE {quoteId name} MATCH ? ORDER BY bm25({quoteId name}){tail}"
+    transaction do
+      let raw ← sqlite fun db => do
+        let stmt ← db.prepare sql
+        stmt.bindText 1 query
+        bindCols stmt 2 extra
+        let mut out : Array (Except DbError (Stored α) × Float) := #[]
+        repeat
+          if ← stmt.step then
+            let row ← readStored α stmt
+            let rank ← stmt.columnDouble (Int32.ofNat ((Entity.fields (α := α)).size + 1))
+            out := out.push (row, rank)
+          else break
+        return out
+      raw.mapM fun (r, rank) => do
+        let s ← liftExcept r
+        let rows ← attachChildren α #[s]
+        match rows[0]? with
+        | some s => return (s, rank)
+        | none => throw (.sqlite "searchP: attached row missing")
 
 /-- Open, run, and report — the whole lifecycle for scripts and tests. -/
 def withDb (path : System.FilePath) (specs : List TableSpec) (act : DbM α) :

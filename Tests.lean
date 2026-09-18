@@ -1,5 +1,6 @@
 import LeanDb
 import Std.Http.Test.Helpers
+import TestsLdb01
 
 /-! Engine tests: codecs, deriving, the dependent select against a real
 SQLite file, CAS staleness, FK restriction. Fixture types live here — the
@@ -59,6 +60,18 @@ private def testCodecs : IO Unit := do
     "UInt32 maximum must decode"
   check ((fromCol (α := UInt32) (.int 4294967296)).isOk == false)
     "UInt32 size must not wrap to zero"
+  -- JSON true/false is a Bool, not a silent 0/1 for every INTEGER (#37)
+  let age := columnSpec "age" Nat
+  check ((Col.fromJson age (Lean.Json.bool false)).isOk == false)
+    "JSON false is refused on a Nat INTEGER column"
+  check ((Col.fromJson age (Lean.Json.bool true)).isOk == false)
+    "JSON true is refused on a Nat INTEGER column"
+  let on := columnSpec "on" Bool
+  check (on.boolCodec) "the Bool column is marked as a bool codec"
+  check ((Col.fromJson on (Lean.Json.bool true)).toOption == some (.int 1))
+    "JSON true is accepted on a Bool column"
+  check ((Col.fromJson on (Lean.Json.bool false)).toOption == some (.int 0))
+    "JSON false is accepted on a Bool column"
 
 private def testDerivedSpec : IO Unit := do
   check (Entity.tableName Author == "author") "table name snake_case"
@@ -76,7 +89,19 @@ private def testDerivedSpec : IO Unit := do
   check (missingFk.isOk == false) "schema rejects a reference to an omitted table"
   let duplicate := validateSchema [Entity.spec Author, Entity.spec Author]
   check (duplicate.isOk == false) "schema rejects duplicate table names"
-  let reserved : TableSpec := ⟨"_leandb_user", #[]⟩
+  let sameName : TableSpec :=
+    ⟨"author", #[{ name := "other", sqlType := .text, nullable := false, fkTable := none }], #[]⟩
+  match collidingTable? [Entity.spec Author, sameName] with
+  | some (a, b) =>
+      check (a.toLower == "author" && b.toLower == "author")
+        "unequal specs that share a name collide"
+  | none => throw <| IO.userError "FAIL: colliding author specs must be reported"
+  check ((collidingTable? [Entity.spec Author, Entity.spec Author]).isNone)
+    "the same spec listed twice is not an unequal collision"
+  let upper : TableSpec := { sameName with name := "Author" }
+  check ((collidingTable? [Entity.spec Author, upper]).isSome)
+    "case-folded table names collide"
+  let reserved : TableSpec := ⟨"_leandb_user", #[], #[]⟩
   check ((validateSchema [reserved]).isOk == false) "schema rejects the internal table prefix"
   -- LEP-0002 stage 1: field symbols
   check (Entity.fields (α := Author) == #[.name, .age]) "one symbol per field, in order"
@@ -190,7 +215,7 @@ private def testRealLiterals : IO Unit := do
   -- a tiny REAL default must survive the DDL, not collapse to 0.000000
   let tiny : TableSpec :=
     ⟨"tiny", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
-                 dflt := some (.real 1e-300) }]⟩
+                 dflt := some (.real 1e-300) }], #[]⟩
   let ddl := tiny.ddl
   let some lit := (renderRealExact 1e-300).toOption
     | throw <| IO.userError "FAIL: 1e-300 must render exactly"
@@ -215,7 +240,7 @@ private def testRealLiterals : IO Unit := do
   -- non-finite REAL defaults are refused loudly, not rendered as inf/NaN
   let bad (v : Float) : TableSpec :=
     ⟨"bad", #[{ name := "ratio", sqlType := .real, nullable := false, fkTable := none,
-                dflt := some (.real v) }]⟩
+                dflt := some (.real v) }], #[]⟩
   match validateSchema [bad (1.0/0.0)] with
   | .error (.schemaInvalid msg) =>
       check ((msg.splitOn "bad.ratio").length == 2) s!"refusal must name table and column, got {msg}"
@@ -1083,9 +1108,9 @@ private def col (name : String) (ty : SqlType) (nullable : Bool := false)
 
 private def testMigrations : IO Unit := do
   if ← migDbPath.pathExists then IO.FS.removeFile migDbPath
-  let v1 : TableSpec := ⟨"author", #[col "name" .text]⟩
-  let v2 : TableSpec := ⟨"author", #[col "name" .text, col "nick" .text (nullable := true)]⟩
-  let vBad : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer]⟩
+  let v1 : TableSpec := ⟨"author", #[col "name" .text], #[]⟩
+  let v2 : TableSpec := ⟨"author", #[col "name" .text, col "nick" .text (nullable := true)], #[]⟩
+  let vBad : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer], #[]⟩
   -- create at v1 and put a row in
   discard <| expectOk (← withDb migDbPath [v1] (pure ())) "create at v1"
   let db ← SQLite.open migDbPath
@@ -1101,7 +1126,7 @@ private def testMigrations : IO Unit := do
   -- ...but a NOT NULL column WITH a default backfills existing rows
   let vDef : TableSpec := ⟨"author",
     #[col "name" .text, col "nick" .text (nullable := true),
-      col "score" .integer (dflt := some (.int 7))]⟩
+      col "score" .integer (dflt := some (.int 7))], #[]⟩
   discard <| expectOk (← migrate migDbPath [vDef] (apply := true)) "defaulted NOT NULL add"
   let dbv ← SQLite.open migDbPath
   let stv ← dbv.prepare "SELECT score FROM author WHERE name = 'Ada'"
@@ -1113,10 +1138,10 @@ private def testMigrations : IO Unit := do
     "destructive with flag"
   -- closed-world rebuild: grow, then a shrink that data refuses
   if ← migDbPath.pathExists then IO.FS.removeFile migDbPath
-  let small := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b"])]⟩
+  let small := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b"])], #[]⟩
   let grown : TableSpec :=
-    ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b", "c"])]⟩
-  let shrunk : TableSpec := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a"])]⟩
+    ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a", "b", "c"])], #[]⟩
+  let shrunk : TableSpec := ⟨"todo", #[col "title" .text, col "status" .text (enum := some #["a"])], #[]⟩
   discard <| expectOk (← withDb migDbPath [small] (pure ())) "create small world"
   let db2 ← SQLite.open migDbPath
   db2.exec "INSERT INTO todo (title, status) VALUES ('x', 'b')"
@@ -1142,7 +1167,7 @@ private def quoteDbPath : System.FilePath := ".lake" / "leandb_test_quote.sqlite
 private def testSqlQuoting : IO Unit := do
   if ← quoteDbPath.pathExists then IO.FS.removeFile quoteDbPath
   let quoted : TableSpec := ⟨"odd\"table",
-    #[col "odd\"column" .text (enum := some #["it's"])]⟩
+    #[col "odd\"column" .text (enum := some #["it's"])], #[]⟩
   discard <| expectOk (← withDb quoteDbPath [quoted] (pure ()))
     "quoted SQL identifiers and enum values"
   let db ← SQLite.open quoteDbPath
@@ -1521,7 +1546,7 @@ private def testShapedColumns : IO Unit := do
   let ddl := (Entity.spec Gadget).ddl
   check (ddl == "CREATE TABLE IF NOT EXISTS \"gadget\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL, \"shape\" TEXT NOT NULL, \"extra\" TEXT)")
     s!"shape is not DDL, got {ddl}"
-  let shapeless : TableSpec := ⟨"gadget", cols.map fun c => { c with shape := none }⟩
+  let shapeless : TableSpec := ⟨"gadget", cols.map fun c => { c with shape := none }, #[]⟩
   check (fingerprint [shapeless] == toString (hash shapeless.ddl))
     "a shape-less schema fingerprints exactly its DDL, as before B2"
   check (fingerprint [Entity.spec Author] == toString (hash (Entity.spec Author).ddl))
@@ -1538,7 +1563,7 @@ private def testShapedColumns : IO Unit := do
 
 private def reshaped (shape : String) : TableSpec :=
   ⟨"gadget", (Entity.columns Gadget).map fun c =>
-    if c.name == "shape" then { c with shape := some shape } else c⟩
+    if c.name == "shape" then { c with shape := some shape } else c, #[]⟩
 
 private def shapeDbPath : System.FilePath := ".lake" / "leandb_test_shape.sqlite"
 
@@ -1589,7 +1614,7 @@ private def testShapeMigration : IO Unit := do
       check ((e.splitOn "type changed from `Nat` to `String`").length == 2)
         s!"refusal names the type change, got {e}"
   -- shape declared where the stored schema had none: nothing to compare, restamp
-  let unshaped : TableSpec := ⟨"gadget", (Entity.columns Gadget).map fun c => { c with shape := none }⟩
+  let unshaped : TableSpec := ⟨"gadget", (Entity.columns Gadget).map fun c => { c with shape := none }, #[]⟩
   match planMigration [unshaped] [old] with
   | .ok plan =>
       check (plan.steps.length == 2 && plan.steps.all (· matches .restampShape ..))
@@ -1732,7 +1757,7 @@ private def testCodec : IO Unit := do
   match (fromCol (.int 0) : Except String (EnumSet Big)) with
   | .error m => check (m == "closed world has 63 variants; EnumSet supports at most 62") s!"63-variant message, got {m}"
   | .ok _ => throw <| IO.userError "FAIL: a 63-variant world decoded"
-  expectErr (validateSchema [⟨"big", #[columnSpec "s" (EnumSet Big)]⟩]) "schema"
+  expectErr (validateSchema [⟨"big", #[columnSpec "s" (EnumSet Big)], #[]⟩]) "schema"
     "a 63-variant EnumSet column is refused by validateSchema"
   check ((validateSchema [Entity.spec Tagged]).isOk) "a 3-variant world is fine"
   -- the column spec and its DDL
@@ -1743,7 +1768,7 @@ private def testCodec : IO Unit := do
     s!"tagged DDL golden, got {(Entity.spec Tagged).ddl}"
   -- the fingerprint hashes the names: a rename leaves the DDL alone but not the fingerprint
   let renamed : TableSpec := ⟨"tagged", (Entity.columns Tagged).map fun c =>
-    if c.name == "tags" then { c with enumSet := some #["x", "y", "w"] } else c⟩
+    if c.name == "tags" then { c with enumSet := some #["x", "y", "w"] } else c, #[]⟩
   check (renamed.ddl == (Entity.spec Tagged).ddl) "a renamed variant has the same DDL"
   check (fingerprint [renamed] != fingerprint [Entity.spec Tagged]) "…and a different fingerprint"
   -- an Option (EnumSet _) column is nullable and keeps the world
@@ -1874,7 +1899,7 @@ private def migPath : System.FilePath := ".lake" / "leandb_test_enumset_mig.sqli
 /-- `tagged(name, tags)` with `tags` an `EnumSet` over `vs`. -/
 private def world (vs : Array String) : TableSpec :=
   ⟨"tagged", #[col "name" .text,
-    { name := "tags", sqlType := .integer, nullable := false, fkTable := none, enumSet := some vs }]⟩
+    { name := "tags", sqlType := .integer, nullable := false, fkTable := none, enumSet := some vs }], #[]⟩
 
 private def testMigration : IO Unit := do
   if ← migPath.pathExists then IO.FS.removeFile migPath
@@ -2137,7 +2162,7 @@ private def testDerived : IO Unit := do
   | .error (.decode "box" "*" _) => pure ()
   | r => throw <| IO.userError s!"FAIL: wrong result for a short row: {repr (r.toOption.map (·.label))}"
   -- the group is not DDL and not fingerprint material
-  let ungrouped : TableSpec := ⟨"box", (Entity.columns Box).map fun c => { c with group := none }⟩
+  let ungrouped : TableSpec := ⟨"box", (Entity.columns Box).map fun c => { c with group := none }, #[]⟩
   check (fingerprint [Entity.spec Box] == fingerprint [ungrouped]) "group is not part of the fingerprint"
   check (fingerprint [Entity.spec Box] == toString (hash (Entity.spec Box).ddl)) "an inline schema fingerprints its DDL"
   -- entities without inline fields: nothing moved (value pinned before this change)
@@ -2256,7 +2281,7 @@ private def migPath : System.FilePath := ".lake" / "leandb_test_inline_mig.sqlit
 
 /-- `Box` before `pad` existed. -/
 private def boxV1 : TableSpec :=
-  ⟨"box", (Entity.columns Box).filter fun c => c.group != some "pad"⟩
+  ⟨"box", (Entity.columns Box).filter fun c => c.group != some "pad", #[]⟩
 
 private def testMigration : IO Unit := do
   -- adding an inline field is one addColumn per sub-column
@@ -2383,7 +2408,7 @@ private def sameItems (a b : List Item) : Bool :=
   a.length == b.length && (a.zip b).all fun (x, y) => sameItem x y
 
 private def link : ChildLink Order := (Entity.children (α := Order)).headD
-  { field := "?", table := "?", spec := ⟨"?", #[]⟩, rows := fun _ => #[]
+  { field := "?", table := "?", spec := ⟨"?", #[], #[]⟩, rows := fun _ => #[]
     attach := fun _ a => .ok a, attachRecomputing := fun _ a => .ok a }
 
 private def testDerived : IO Unit := do
@@ -2445,7 +2470,7 @@ private def testDerived : IO Unit := do
   | .error (.decode "order_items" "*" _) => pure ()
   | r => throw <| IO.userError s!"FAIL: a short child row was not refused: {repr (r.toOption.map (·.total))}"
   -- cascade is DDL, so it is fingerprint material; the default (no cascade) changes nothing
-  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }⟩
+  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }, #[]⟩
   check (fingerprint (Entity.specs Order) != fingerprint [Entity.spec Order, restricted]) "cascade is part of the fingerprint"
   check (fingerprint schema == "13729757873300583215")
     s!"author+book fingerprint unchanged by stage D, got {fingerprint schema}"
@@ -2723,7 +2748,7 @@ private def testMigration : IO Unit := do
         s!"removing a child list plans a destructive dropTable, got {plan.steps.map (·.describe)}"
   | .error e => throw <| IO.userError s!"FAIL: planMigration remove: {e}"
   -- cascade is a DDL change: switching it is a rebuild of the child table
-  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }⟩
+  let restricted : TableSpec := ⟨"order_items", (Entity.columns Order.Items).map fun c => { c with cascade := false }, #[]⟩
   match planMigration [Entity.spec Order, restricted] (Entity.specs Order) with
   | .ok plan => check ((plan.steps.map (·.describe)).any (·.startsWith "rebuild table \"order_items\"")) "cascade change rebuilds the child"
   | .error e => throw <| IO.userError s!"FAIL: planMigration cascade: {e}"
@@ -2733,7 +2758,7 @@ private def testMigration : IO Unit := do
       discard <| insert Order (order "c" [item "a" 1, item "b" 2])
       discard <| insert Order (order "d" [item "e" 3])) "seed at v1"
   let v2 : List TableSpec := childSchema.map fun t =>
-    if t.name == "order" then ⟨"order", t.columns.map fun c => if c.name == "customer" then { c with nullable := true } else c⟩ else t
+    if t.name == "order" then ⟨"order", t.columns.map fun c => if c.name == "customer" then { c with nullable := true } else c, #[]⟩ else t
   let (_, report?) ← expectOk (← migrate migPath v2 (apply := true)) "rebuild the parent"
   check (((report?.map (·.applied)).getD []).any (·.startsWith "rebuild table \"order\"")) "the parent was rebuilt"
   let db ← SQLite.open migPath
@@ -2754,6 +2779,15 @@ end ChildD
 
 /-! ## Base descriptor: derived schema order and instance resolution -/
 
+/-- Two entities whose derived table names collide: `UserProfile` and
+    `userProfile` both become `user_profile` (`tableNameOf`). -/
+structure UserProfile where
+  n : String
+  deriving Repr, LeanDb.Entity
+structure userProfile where
+  n : Nat
+  deriving Repr, LeanDb.Entity
+
 private def testBaseSpecs : IO Unit := do
   -- an already-ordered list comes back unchanged, so fingerprints do not move
   check (orderSpecs schema == schema) "orderSpecs keeps a dependency-ordered list"
@@ -2768,15 +2802,40 @@ private def testBaseSpecs : IO Unit := do
   check (b.specs.map (·.name) == ["author", "book"]) "Base.specs derives the schema"
   check (fingerprint b.specs == fingerprint schema) "Base.specs fingerprint equals the hand-written schema"
   check (b.defaultInstance == ("data" / "t.sqlite")) "default instance path"
-  -- `--db` anywhere in argv wins and is stripped
-  match ← Instance.resolve b ["rows", "--db", "/tmp/x.sqlite", "book"] with
+  -- `--db` only before the verb is consumed; after the verb it is argv
+  match ← Instance.resolve b ["--db", "/tmp/x.sqlite", "rows", "book"] with
   | .ok (inst, args) =>
-      check (inst.path == "/tmp/x.sqlite" && args == ["rows", "book"]) "--db resolves and strips"
+      check (inst.path == "/tmp/x.sqlite" && args == ["rows", "book"]) "--db before the verb resolves and strips"
       check (inst.backups == ("/tmp" / "backups")) "backups dir next to the instance"
   | .error m => throw <| IO.userError s!"FAIL: --db: {m}"
+  match ← Instance.resolve b ["rows", "--db", "/tmp/x.sqlite", "book"] with
+  | .ok (inst, args) =>
+      check (args == ["rows", "--db", "/tmp/x.sqlite", "book"])
+        "--db after the verb is not stripped"
+      check (inst.path == b.defaultInstance) "a mid-argv --db does not choose the instance"
+  | .error m => throw <| IO.userError s!"FAIL: mid-argv --db: {m}"
+  match ← Instance.resolve b ["--db", "/tmp/x.sqlite", "--", "rows", "--db", "literal"] with
+  | .ok (inst, args) =>
+      check (inst.path == "/tmp/x.sqlite" && args == ["rows", "--db", "literal"])
+        "-- ends options; a later --db is a positional argument"
+  | .error m => throw <| IO.userError s!"FAIL: --db with --: {m}"
   match ← Instance.resolve b ["--db"] with
   | .ok _ => throw <| IO.userError "FAIL: --db without a path must be refused"
   | .error _ => pure ()
+  -- a usage error must not create the instance file (#29)
+  let usagePath : System.FilePath := ".lake" / "leandb_test_usage_nocreate.sqlite"
+  if ← usagePath.pathExists then IO.FS.removeFile usagePath
+  let code ← Cli.run b ["--db", usagePath.toString, "query", "missing"]
+  check (code == 3) "unknown query is a usage error"
+  check (!(← usagePath.pathExists)) "a usage error must not create the instance file"
+  -- UserProfile and userProfile both derive table `user_profile` (#38)
+  let collide : Base := { name := "c", tables := [CliTable.of UserProfile, CliTable.of userProfile] }
+  match collide.check with
+  | .error e =>
+      check (e.code == "schema") "colliding table names are a schema error"
+      check ((e.message.splitOn "user_profile").length > 1)
+        s!"the collision names the table, got {e.message}"
+  | .ok () => throw <| IO.userError "FAIL: UserProfile vs userProfile must be refused"
 
 /-! ## Sessions: a drifted instance is served, gated, and admitted after migrate -/
 
@@ -2788,7 +2847,7 @@ private def testSession : IO Unit := do
   if ← backups.pathExists then IO.FS.removeDirAll backups
   -- an instance shaped by an older code: `author` had an extra nullable column
   let older : TableSpec := ⟨"author", #[col "name" .text, col "age" .integer,
-    col "nick" .text (nullable := true)]⟩
+    col "nick" .text (nullable := true)], #[]⟩
   discard <| expectOk (← withDb sessDbPath [older] (pure ())) "create older"
   (← SQLite.open sessDbPath).exec "INSERT INTO author (name, age, nick) VALUES ('Ada', 36, 'A')"
   let b : Base := { name := "s", tables := [CliTable.of Author] }
@@ -2868,13 +2927,13 @@ private def testRestoreSafety : IO Unit := do
   let dir : System.FilePath := ".lake" / "leandb_test_restore_dir"
   unless ← dir.pathExists do IO.FS.createDir dir
   -- the magic check, pure: text, a truncated header, the real magic
-  check (!Cli.Restore.headerOk "definitely not sqlite".toUTF8) "magic check rejects text"
-  check (!Cli.Restore.headerOk "SQLite format 3".toUTF8) "magic check rejects a truncated header"
-  check (Cli.Restore.headerOk Cli.Restore.magic) "magic check accepts the magic"
+  check (!Restore.headerOk "definitely not sqlite".toUTF8) "magic check rejects text"
+  check (!Restore.headerOk "SQLite format 3".toUTF8) "magic check rejects a truncated header"
+  check (Restore.headerOk Restore.magic) "magic check accepts the magic"
   discard <| expectOk (← withDb restoreDbPath [Entity.spec Probe] (pure ()))
     "create the restore probe"
   let head ← IO.FS.readBinFile restoreDbPath
-  check (Cli.Restore.headerOk (head.extract 0 16)) "a real instance carries the magic header"
+  check (Restore.headerOk (head.extract 0 16)) "a real instance carries the magic header"
   let b : Base := { name := "r", tables := [CliTable.of Probe] }
   let inst := Instance.ofPath restoreDbPath
   let sess ← expectOk (← Cli.Session.open b inst) "open the probe"
@@ -3052,10 +3111,10 @@ private def testAdoptAffinity : IO Unit := do
   if ← adoptDbPath.pathExists then IO.FS.removeFile adoptDbPath
   let colX : ColumnSpec := { name := "x", sqlType := .integer, nullable := false, fkTable := none }
   let colT : ColumnSpec := { name := "t", sqlType := .text, nullable := false, fkTable := none }
-  let v0 : List TableSpec := [⟨"t", #[colX, colT]⟩]
+  let v0 : List TableSpec := [⟨"t", #[colX, colT], #[]⟩]
   -- V1: one more column, nullable — a mechanical, non-destructive step
   let colZ : ColumnSpec := { name := "z", sqlType := .text, nullable := true, fkTable := none }
-  let v1 : List TableSpec := [⟨"t", #[colX, colT, colZ]⟩]
+  let v1 : List TableSpec := [⟨"t", #[colX, colT, colZ], #[]⟩]
   let mig : Migration :=
     { fromFingerprint := (fingerprint v0), toFingerprint := (fingerprint v1), snapshot := v1 }
   let chain : Chain := { origin := v0, migrations := [mig] }
@@ -3244,7 +3303,7 @@ private def testHttpBodyLimits : IO Unit := do
     return Lean.Json.mkObj [("ok", .bool true)])
   let handler := Http.handleRequestWithLimit 8 (.bearer "test-token") resolve
   let config := Http.serverConfig 8
-  let reqPrefix := "POST /rpc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+  let reqPrefix := "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\n"
   let auth := "Authorization: Bearer test-token\r\n"
   let run := fun (name raw status : String) (cfg : Std.Http.Config) => do
     Std.Http.Internal.Test.checkClose name raw handler
@@ -3263,6 +3322,28 @@ private def testHttpBodyLimits : IO Unit := do
   run "handler body budget" (reqPrefix ++ auth ++ "Content-Length: 9\r\n\r\n[\"help\"] ") "413" (Http.serverConfig 32)
   run "auth before JSON parsing" (reqPrefix ++ "Content-Length: 8\r\n\r\nnot-json") "401" config
   check ((← calls.get) == 1) "rejected requests never dispatched"
+  -- Host / Origin / Content-Type (#40)
+  check (Http.isLoopbackHost "127.0.0.1" && Http.isLoopbackHost "localhost")
+    "loopback names"
+  check (!Http.isLoopbackHost "0.0.0.0" && !Http.isLoopbackHost "evil.example")
+    "non-loopback names"
+  check (Http.hostAllowed "127.0.0.1" "localhost:7411") "Host localhost is loopback"
+  check (!Http.hostAllowed "127.0.0.1" "evil.example") "a foreign Host is refused"
+  check (Http.originAllowed "127.0.0.1" none) "missing Origin is allowed"
+  check (Http.originAllowed "127.0.0.1" (some "http://127.0.0.1:9")) "loopback Origin"
+  check (!Http.originAllowed "127.0.0.1" (some "http://evil.example")) "foreign Origin"
+  check (Http.isJsonContentType "application/json") "plain JSON type"
+  check (Http.isJsonContentType "application/json; charset=utf-8") "JSON with charset"
+  check (!Http.isJsonContentType "text/plain") "text/plain is not JSON"
+  let openHandler := Http.handleRequestWithLimit 64 .open resolve
+  let openCfg := Http.serverConfig 64
+  let runOpen := fun (name raw status : String) => do
+    Std.Http.Internal.Test.checkClose name raw openHandler
+      (fun bytes => Std.Http.Internal.Test.assertStatus bytes s!"HTTP/1.1 {status}") openCfg
+  runOpen "foreign host" "POST /rpc HTTP/1.1\r\nHost: evil.example\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n[\"help\"]" "403"
+  runOpen "foreign origin" "POST /rpc HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n[\"help\"]" "403"
+  runOpen "missing content-type" "POST /rpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\nConnection: close\r\n\r\n[\"help\"]" "415"
+  check ((← calls.get) == 1) "Host/Origin/Content-Type refusals never dispatch"
 
 private def testCliLimits : IO Unit := do
   check ((Cli.limitOf "50").toOption == some 50) "ordinary limit parses"
@@ -3351,6 +3432,18 @@ private def testStdioLineCap : IO Unit := do
   let r ← Cli.LineReader.new (IO.FS.Stream.ofBuffer buf) 4
   check ((← r.next) matches .line "abcd") "a line at the budget reads"
 
+private def walDbPath : System.FilePath := ".lake" / "leandb_test_wal.sqlite"
+
+private def testWalOpen : IO Unit := do
+  if ← walDbPath.pathExists then IO.FS.removeFile walDbPath
+  let conn ← expectOk (← openDb walDbPath schema) "open sets WAL"
+  let stmt ← conn.raw.prepare "PRAGMA journal_mode"
+  discard <| stmt.step
+  check (((← stmt.columnText 0).toLower) == "wal") "open enables WAL"
+  let timeout ← conn.raw.prepare "PRAGMA busy_timeout"
+  discard <| timeout.step
+  check ((← timeout.columnInt64 0) == 5000) "open sets busy_timeout"
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
@@ -3360,6 +3453,7 @@ def main : IO UInt32 := do
   testModuleNameOk
   testStdioLineCap
   testHttpBodyLimits
+  testWalOpen
   testLogPolicy
   testCodecs
   testBaseSpecs
@@ -3399,5 +3493,6 @@ def main : IO UInt32 := do
   testOptionalParamEndToEnd
   InlineC.run
   ChildD.run
+  TestsLdb01.run
   IO.println "all engine tests passed"
   return 0

@@ -191,14 +191,29 @@ def Entity.fieldOfName? (α : Type) [Entity α] (s : String) : Option (Entity.Fi
 /-- A `Ref β` (= `Id β`) column is a foreign key onto `β`'s table. -/
 instance [Entity β] : RefTarget (Id β) := ⟨some (Entity.tableName β)⟩
 
-def Entity.spec (α : Type) [Entity α] : TableSpec :=
-  ⟨Entity.tableName α, Entity.columns α⟩
+/-- Declared indexes for an entity (LDB-03). The low-priority default is
+    empty; a more specific `instance : Indexes α` wins. -/
+class Indexes (α : Type) where
+  indexes : Array IndexSpec
+
+instance (priority := low) {α : Type} : Indexes α := ⟨#[]⟩
+
+def Entity.spec (α : Type) [Entity α] [Indexes α] : TableSpec :=
+  { name := Entity.tableName α, columns := Entity.columns α,
+    indexes := Indexes.indexes α }
 
 /-- Every table an entity contributes: its own, then its child tables
-    (LEP-0003 D) in field order. A base with child lists lists `specs`;
-    `spec` stays the parent's alone. -/
-def Entity.specs (α : Type) [Entity α] : List TableSpec :=
-  Entity.spec α :: (Entity.children (α := α)).map (·.spec)
+    (LEP-0003 D) in field order. Child tables get `(parent, position)
+    UNIQUE` automatically. -/
+def Entity.specs (α : Type) [Entity α] [Indexes α] : List TableSpec :=
+  let parent := Entity.spec α
+  let kids := (Entity.children (α := α)).map fun l =>
+    let ix : IndexSpec := { unique := true, columns := #["parent", "position"] }
+    { l.spec with indexes :=
+        if l.spec.indexes.any (fun i => i.columns == #["parent", "position"]) then
+          l.spec.indexes
+        else l.spec.indexes.push ix }
+  parent :: kids
 
 /-- The generated child entity's name for a parent's child-list field:
     `Kernel.Ins` for `Kernel.ins` — the field capitalized, because the
@@ -277,9 +292,45 @@ def TableSpec.ddlNamed (t : TableSpec) (name : String) (ifNotExists : Bool := tr
     are part of the parent's value. -/
 def TableSpec.ddl (t : TableSpec) : String := t.ddlNamed t.name
 
+/-- `CREATE [UNIQUE] INDEX` statements for this table's declared indexes. -/
+def TableSpec.indexDdl (t : TableSpec) : Array String :=
+  t.indexes.map fun ix =>
+    let cols := String.intercalate ", " (ix.columns.toList.map quoteIdent)
+    let kind := if ix.unique then "UNIQUE INDEX" else "INDEX"
+    let where? := match ix.partialWhere with
+      | some w => s!" WHERE {w}"
+      | none => ""
+    s!"CREATE {kind} IF NOT EXISTS {quoteIdent (ix.resolvedName t.name)} ON {quoteIdent t.name} ({cols}){where?}"
+
+/-- Table DDL plus every index, joined for fingerprinting. -/
+def TableSpec.fullDdl (t : TableSpec) : String :=
+  String.intercalate ";\n" (t.ddl :: t.indexDdl.toList)
+
+/-- Two table names collide: same spelling, or the same letters ignoring
+    case (SQLite's default folding, and `tableNameOf`'s snake_case). -/
+private def namesCollide (a b : String) : Bool :=
+  a == b || a.toLower == b.toLower
+
+/-- A later spec that shares a name with an earlier one but is not the
+    same table — the silent-dedup case (`UserProfile` vs `userProfile`,
+    or a user entity claiming a child-table name). Equal repeats (parent
+    listed with its own child `CliTable`) are not a collision. -/
+def collidingTable? (specs : List TableSpec) : Option (String × String) := Id.run do
+  let mut seen : List TableSpec := []
+  for s in specs do
+    if let some prev := seen.find? (fun p => namesCollide p.name s.name) then
+      unless prev == s do
+        return some (prev.name, s.name)
+    else
+      seen := s :: seen
+  return none
+
 /-- Validate cross-table invariants that individual derived `Entity`
     instances cannot see. This runs before opening or migrating a file. -/
 def validateSchema (specs : List TableSpec) : Except DbError Unit := do
+  if let some (a, b) := collidingTable? specs then
+    throw (.schemaInvalid s!"table {String.quote b} collides with {String.quote a} \
+(duplicate or case-folded name); the second entity would have been silently dropped")
   let tableNames := specs.map (·.name)
   unless tableNames.eraseDups.length == tableNames.length do
     throw (.schemaInvalid "table names must be unique")
@@ -303,6 +354,13 @@ def validateSchema (specs : List TableSpec) : Except DbError Unit := do
         if vs.size > EnumSet.maxVariants then
           throw (.schemaInvalid s!"{spec.name}.{col.name}: closed world has {vs.size} variants; \
 EnumSet supports at most {EnumSet.maxVariants}")
+    for ix in spec.indexes do
+      if ix.columns.isEmpty then
+        throw (.schemaInvalid s!"table {String.quote spec.name} declares an index with no columns")
+      for col in ix.columns do
+        unless col == "id" || columnNames.contains col do
+          throw (.schemaInvalid s!"table {String.quote spec.name}: index {ix.resolvedName spec.name} \
+names unknown column {String.quote col}")
 
 /-- Schema fingerprint: a hash of the rendered DDL of every table, in
     declaration order, followed by the declared shape of every JSON
@@ -312,7 +370,7 @@ EnumSet supports at most {EnumSet.maxVariants}")
     bit *means*). A schema without either hashes exactly its DDL, as it
     always has. Checked against `_leandb_meta` at open. -/
 def fingerprint (specs : List TableSpec) : String :=
-  let ddl := String.intercalate ";\n" (specs.map (·.ddl))
+  let ddl := String.intercalate ";\n" (specs.map (·.fullDdl))
   let shapes := specs.flatMap fun t => t.columns.toList.filterMap fun c =>
     (c.shape.map fun s => s!"{t.name}.{c.name}={s}") <|>
       (c.enumSet.map fun vs => s!"{t.name}.{c.name}={JsonShape.closed vs}")

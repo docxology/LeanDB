@@ -1,7 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-09-18
 
+Public transaction combinator, runtime service, and the LeanGD engine
+surface (LDB-01 … LDB-11).
+
+- **LDB-01.** `transaction` / `withTransaction` / `untrackedSqlite` and
+  `LeanDb.Runtime.Service` land on mainline: `BEGIN IMMEDIATE` at depth 0,
+  savepoints when nested, typed `.abort`, poisoned connections after a
+  failed `ROLLBACK`, serialized `withConnection` that converts host
+  exceptions, `drain`/`resume`/`snapshot`/`restore`/`close`.
+- **LDB-02.** `OpenConfig` (`synchronous`, `cache_size`, `mmap_size`,
+  `wal_autocheckpoint`, allowlisted `extraPragmas`) plus `LEANDB_*`
+  environment overrides. Defaults stay `synchronous=FULL` / 5s busy
+  timeout.
+- **LDB-03.** `Indexes α` declares indexes and composite UNIQUE
+  constraints; they appear in DDL, `schema` JSON, the fingerprint, and
+  `migrate` add/drop plans. Child tables get `(parent, position) UNIQUE`.
+- **LDB-04.** `selectP` takes a pushed `Order` and `Window` (`LIMIT` /
+  `OFFSET`); a Lean-side sort plus a limit is refused. Tie-break is
+  `, id ASC`.
+- **LDB-05.** `LogConfig.verbs` (`all` / `failuresAndPlans` /
+  `failuresOnly` / `none`) and `sampleEvery`; CLI default remains `.all`.
+- **LDB-06.** `count` / `countP` / `exists?` / `existsP` push
+  `COUNT(*)` / `EXISTS` when the predicate has no residual.
+- **LDB-07.** Typed `patch` with a `Pred` guard; `PatchResult` is
+  `.updated` / `.notFound` / `.guardFailed`.
+- **LDB-08.** `insertMany` and keyset `scan`.
+- **LDB-09.** `Runtime.Config.readers` and `Service.withReader`; write
+  verbs on a read-only connection return `DbError.readOnly`.
+- **LDB-10.** `deriving instance LeanDb.ClosedEnum` / `DbJson` / `Inline`
+  works post-hoc on LeanDB-free domain types.
+- **LDB-11.** Extra tables in a fingerprinted instance are tolerated;
+  `Base.auxiliary` declares FTS5 objects; `searchP` binds `MATCH`.
+
+Also in this release:
+
+- JSON `true`/`false` is accepted only on `Bool` columns; a `Nat`/`Int64`
+  INTEGER no longer silently stores 0/1.
+- Declared tables that share a name (or the same name after case folding)
+  but are not the same spec are refused at open, instead of one entity
+  being silently dropped.
+- `--db <path>` is taken only before the verb (`--` ends options). A
+  usage error no longer creates the instance file.
+- Reads take a deferred snapshot (parent + child lists, and `selectP`'s
+  snapshot + pushdown). Open sets `journal_mode=WAL` and `busy_timeout`.
+- HTTP: tokenless servers are loopback-only; Host/Origin are pinned on a
+  loopback bind; JSON-body routes require `Content-Type: application/json`.
 - `restore` (and `migrate rollback`, which shares the code path) validates
   its source before touching the instance: a non-SQLite source is refused
   by the SQLite magic header plus `PRAGMA quick_check`, the copy streams
@@ -9,6 +54,9 @@
   and the session connection is swapped only after the renamed file opens
   cleanly. A failed restore no longer destroys the instance file or leaves
   the session silently serving an empty in-memory database.
+
+## Unreleased
+
 
 ## 0.3.1 - 2026-09-14
 

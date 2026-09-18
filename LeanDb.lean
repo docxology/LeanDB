@@ -5,6 +5,8 @@ import LeanDb.Select
 import LeanDb.Pred
 import LeanDb.PlanElab
 import LeanDb.Db
+import LeanDb.Transaction
+import LeanDb.Runtime
 import LeanDb.Json
 import LeanDb.Migrate
 import LeanDb.Render

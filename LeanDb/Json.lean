@@ -40,8 +40,10 @@ def Col.fromJson (spec : ColumnSpec) (j : Json) : Except String Col :=
       if spec.nullable then .ok .null
       else .error s!"{spec.name}: null not allowed"
   | Json.bool b =>
-      -- Bool columns store as INTEGER 0/1; accept JSON booleans for them
-      if spec.sqlType == .integer && spec.enumSet.isNone then .ok (.int (if b then 1 else 0))
+      -- only an actual Bool codec accepts JSON booleans; a Nat/Int64
+      -- INTEGER must not silently coerce true/false to 1/0
+      if spec.boolCodec && spec.sqlType == .integer && spec.enumSet.isNone then
+        .ok (.int (if b then 1 else 0))
       else .error s!"{spec.name}: boolean not allowed for a {spec.sqlType.render} column"
   | Json.arr items =>
       match spec.enumSet with
@@ -118,9 +120,32 @@ def ColumnSpec.toJson (c : ColumnSpec) : Json :=
     ++ (c.group.map fun g => ("group", Json.str g)).toList
     ++ (if c.cascade then [("cascade", Json.bool true)] else [])
 
+def IndexSpec.toJson (ix : IndexSpec) : Json :=
+  Json.mkObj <|
+    [("unique", Json.bool ix.unique),
+     ("columns", Json.arr (ix.columns.map Json.str))]
+    ++ (ix.partialWhere.map fun w => ("where", Json.str w)).toList
+    ++ (ix.name.map fun n => ("name", Json.str n)).toList
+
+def IndexSpec.fromJson? (j : Json) : Except String IndexSpec := do
+  let unique ← match j.getObjVal? "unique" with
+    | .ok v => v.getBool?
+    | .error _ => pure false
+  let cols ← (← j.getObjVal? "columns" >>= (·.getArr?)).mapM (·.getStr?)
+  let partialWhere ← match j.getObjVal? "where" with
+    | .ok v => some <$> v.getStr?
+    | .error _ => pure none
+  let name ← match j.getObjVal? "name" with
+    | .ok v => some <$> v.getStr?
+    | .error _ => pure none
+  return { unique, columns := cols, partialWhere, name }
+
 def TableSpec.toJson (t : TableSpec) : Json :=
-  Json.mkObj [("name", Json.str t.name),
-    ("columns", Json.arr (t.columns.map (·.toJson)))]
+  Json.mkObj <|
+    [("name", Json.str t.name),
+     ("columns", Json.arr (t.columns.map (·.toJson)))]
+    ++ (if t.indexes.isEmpty then [] else
+      [("indexes", Json.arr (t.indexes.map (·.toJson)))])
 
 def SqlType.fromJson? (j : Json) : Except String SqlType := do
   match ← j.getStr? with
@@ -175,7 +200,10 @@ def ColumnSpec.fromJson? (j : Json) : Except String ColumnSpec := do
 def TableSpec.fromJson? (j : Json) : Except String TableSpec := do
   let name ← j.getObjVal? "name" >>= (·.getStr?)
   let cols ← j.getObjVal? "columns" >>= (·.getArr?)
-  return ⟨name, ← cols.mapM ColumnSpec.fromJson?⟩
+  let indexes ← match j.getObjVal? "indexes" with
+    | .ok v => (← v.getArr?).mapM IndexSpec.fromJson?
+    | .error _ => pure #[]
+  return { name, columns := ← cols.mapM ColumnSpec.fromJson?, indexes }
 
 /-- Serialize/parse a whole schema — how an instance remembers the shape
     it was last migrated to. -/

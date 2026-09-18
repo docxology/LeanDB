@@ -38,9 +38,9 @@ inductive MigStep where
   | dropTable (name : String)
   /-- Rebuild `spec.name` under the new spec, copying `copyCols`. -/
   | rebuildTable (spec : TableSpec) (copyCols : List String)
-  /-- A JSON column's declared shape changed additively: no SQL, every
-      stored value still decodes; the step exists to be journaled. -/
   | restampShape (table col : String)
+  | addIndex (table : String) (ix : IndexSpec)
+  | dropIndex (table : String) (ix : IndexSpec)
   deriving Repr
 
 def MigStep.describe : MigStep → String
@@ -51,13 +51,15 @@ def MigStep.describe : MigStep → String
   | .rebuildTable spec cols =>
       s!"rebuild table \"{spec.name}\" (copying {cols.length} columns)"
   | .restampShape t c => s!"restamp shape of \"{t}\".\"{c}\""
+  | .addIndex t ix => s!"add index \"{ix.resolvedName t}\""
+  | .dropIndex t ix => s!"drop index \"{ix.resolvedName t}\""
 
 def MigStep.destructive : MigStep → Bool
   | .dropColumn .. | .dropTable .. => true
   | _ => false
 
 def MigStep.sql : MigStep → List String
-  | .createTable spec => [spec.ddl]
+  | .createTable spec => spec.ddl :: spec.indexDdl.toList
   | .addColumn t c => [s!"ALTER TABLE {quoteIdent t} ADD COLUMN {c.ddlFragment}"]
   | .dropColumn t c => [s!"ALTER TABLE {quoteIdent t} DROP COLUMN {quoteIdent c}"]
   | .dropTable t => [s!"DROP TABLE {quoteIdent t}"]
@@ -68,7 +70,11 @@ def MigStep.sql : MigStep → List String
         s!"INSERT INTO {quoteIdent tmp} ({cols}) SELECT {cols} FROM {quoteIdent spec.name}",
         s!"DROP TABLE {quoteIdent spec.name}",
         s!"ALTER TABLE {quoteIdent tmp} RENAME TO {quoteIdent spec.name}" ]
+      ++ spec.indexDdl.toList
   | .restampShape .. => []
+  | .addIndex t ix =>
+      ({ name := t, columns := #[], indexes := #[ix] } : TableSpec).indexDdl.toList
+  | .dropIndex t ix => [s!"DROP INDEX IF EXISTS {quoteIdent (ix.resolvedName t)}"]
 
 /-! ## Shapes
 
@@ -341,6 +347,13 @@ default — existing rows have no value for it. Make it `Option`, or give it a \
               throw s!"table \"{spec.name}\": new column \"{c.name}\" must be nullable or \
 carry a default (rebuild)"
           steps := steps ++ [.rebuildTable spec copyCols]
+        if changed.isEmpty then
+          for ix in spec.indexes do
+            unless oldSpec.indexes.any (· == ix) do
+              steps := steps ++ [.addIndex spec.name ix]
+          for ix in oldSpec.indexes do
+            unless spec.indexes.any (· == ix) do
+              steps := steps ++ [.dropIndex spec.name ix]
   -- dropped tables
   for oldSpec in old do
     if (new.find? (·.name == oldSpec.name)).isNone then

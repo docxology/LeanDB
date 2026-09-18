@@ -115,7 +115,7 @@ An instance is one SQLite file. The same base can open several instances.
 For example, development and production can use different files.
 The CLI chooses the file in this order:
 
-1. `--db <path>`.
+1. `--db <path>` before the verb (`--` ends options).
 2. The `LEANDB_DB` environment variable.
 3. The base's default path, normally `data/<name>.sqlite`.
 

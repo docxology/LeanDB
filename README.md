@@ -126,7 +126,7 @@ lake build
 ```
 
 The generated package includes types, queries, and tests.
-Use `--db <path>` or `LEANDB_DB` to choose an instance.
+Use `--db <path>` before the verb, or `LEANDB_DB`, to choose an instance.
 
 ## Import a SQLite database
 
@@ -178,7 +178,10 @@ before starting the server to change this limit. The startup JSON reports
 Oversized bodies receive HTTP `413`. The limit applies while receiving both
 Content-Length and chunked requests, before JSON parsing or database dispatch.
 Authentication still runs before the handler reads a body; `/healthz` remains
-available without a token.
+available without a token. Tokenless HTTP is **loopback-dev-only**: binding
+a non-loopback address without `--auth-token` / `$LEANDB_TOKEN` is refused
+at startup. On a loopback bind, `Host`/`Origin` must also be loopback, and
+JSON-body routes require `Content-Type: application/json`.
 
 ### Audit log storage and migration impact
 

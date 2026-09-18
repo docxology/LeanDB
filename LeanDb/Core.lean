@@ -114,6 +114,11 @@ inductive DbError where
   | sqlite (message : String)
   /-- A remote client transport failed before a typed server response arrived. -/
   | transport (message : String)
+  /-- A failed `ROLLBACK` left the connection's transaction state unknown:
+      every later verb is refused until the connection is reopened. -/
+  | poisoned (message : String)
+  /-- A write verb ran on a connection opened read-only (LDB-09). -/
+  | readOnly (verb : String)
   deriving Repr
 
 def DbError.code : DbError → String
@@ -130,6 +135,8 @@ def DbError.code : DbError → String
   | .unknownLineage .. => "unknown_lineage"
   | .sqlite .. => "sqlite"
   | .transport .. => "transport"
+  | .poisoned .. => "poisoned"
+  | .readOnly .. => "read_only"
 
 def DbError.message : DbError → String
   | .decode table field msg => s!"{table}.{field}: {msg}"
@@ -149,6 +156,8 @@ def DbError.message : DbError → String
 it was not created by this base's history (restore a known version, or migrate by hand)"
   | .sqlite msg => msg
   | .transport msg => msg
+  | .poisoned msg => s!"connection poisoned: {msg}"
+  | .readOnly verb => s!"{verb}: connection is read-only"
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
 
@@ -195,6 +204,12 @@ class ColCodec (α : Type) where
       column and a JSON column whose shape is `String` are different
       things, and only the latter is part of the fingerprint. -/
   shape : Option String := none
+  /-- `true` only for the `Bool` codec (and `Option Bool`). INTEGER
+      columns otherwise look identical at the spec layer; JSON `true`/`false`
+      is accepted only when this is set, so `insert {"qty": false}` on a
+      `Nat` cannot silently store 0. Not DDL and not part of the
+      fingerprint or schema JSON. -/
+  boolCodec : Bool := false
 
 export ColCodec (toCol fromCol)
 
@@ -212,6 +227,7 @@ class SqlOrd (α : Type) : Prop where
   toCol a := toCol (enc a)
   fromCol c := do dec (← fromCol c)
   shape := ColCodec.shape β
+  boolCodec := false
 
 private def expected (want : String) (got : Col) : Except String α :=
   .error s!"expected {want}, found {got.describe}"
@@ -247,8 +263,15 @@ instance : ColCodec UInt16 := ColCodec.via (β := Int64) (fun n => Int64.ofNat n
             else .error s!"UInt16 out of range: {v}")
 instance : SqlOrd UInt16 where
 
-instance : ColCodec Bool := ColCodec.via (β := Int64) (fun b => if b then 1 else 0)
-  (fun | 0 => .ok false | 1 => .ok true | v => .error s!"expected 0 or 1, found {v}")
+instance : ColCodec Bool where
+  sqlType := .integer
+  toCol b := .int (if b then 1 else 0)
+  fromCol
+    | .int 0 => .ok false
+    | .int 1 => .ok true
+    | .int v => .error s!"expected 0 or 1, found {v}"
+    | c => expected "INTEGER" c
+  boolCodec := true
 instance : SqlOrd Bool where
 
 instance : ColCodec String where
@@ -277,6 +300,7 @@ instance [ColCodec α] : ColCodec (Option α) where
   sqlType := ColCodec.sqlType α
   nullable := true
   shape := ColCodec.shape α
+  boolCodec := ColCodec.boolCodec α
   toCol
     | none => .null
     | some a => toCol a
@@ -527,7 +551,18 @@ structure ColumnSpec where
       engine; every other `Ref` column RESTRICTs. DDL and the fingerprint
       see it; `schema` JSON carries it. -/
   cascade : Bool := false
-  deriving Repr, BEq, Inhabited
+  /-- Live decode hint: this INTEGER column is a `Bool`. Not serialized
+      in `schema_json` and not part of `BEq` — stored schemas from older
+      engines stay identical, and `migrate` must not see a phantom change. -/
+  boolCodec : Bool := false
+  deriving Repr, Inhabited
+
+instance : BEq ColumnSpec where
+  beq a b :=
+    a.name == b.name && a.sqlType == b.sqlType && a.nullable == b.nullable &&
+    a.fkTable == b.fkTable && a.enum == b.enum && a.enumSet == b.enumSet &&
+    a.dflt == b.dflt && a.shape == b.shape && a.group == b.group &&
+    a.cascade == b.cascade
 
 /-- The single way a `ColumnSpec` is made: from a field's type. -/
 def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
@@ -543,11 +578,87 @@ def columnSpec (name : String) (α : Type) (dflt : Option Col := none)
   shape := ColCodec.shape α
   group := group
   cascade := cascade
+  boolCodec := ColCodec.boolCodec α
+
+/-- A declared index or composite UNIQUE (LDB-03). -/
+structure IndexSpec where
+  unique : Bool := false
+  columns : Array String
+  partialWhere : Option String := none
+  name : Option String := none
+  deriving Repr, BEq
+
+def IndexSpec.resolvedName (table : String) (ix : IndexSpec) : String :=
+  match ix.name with
+  | some n => n
+  | none =>
+      (if ix.unique then "uq_" else "ix_") ++ table ++ "_" ++
+        String.intercalate "_" ix.columns.toList
 
 structure TableSpec where
   name : String
   columns : Array ColumnSpec
+  indexes : Array IndexSpec := #[]
   deriving Repr, BEq
+
+/-- An auxiliary object next to the fingerprinted schema (LDB-11). -/
+inductive Auxiliary where
+  | fts5 (name : String) (contentTable : String) (columns : Array String)
+      (tokenizer : String := "unicode61")
+  deriving Repr, BEq
+
+/-- SQLite `PRAGMA synchronous` (LDB-02). Default `.full` matches today. -/
+inductive Synchronous where
+  | off | normal | full | extra
+  deriving Repr, DecidableEq
+
+def Synchronous.toSql : Synchronous → String
+  | .off => "OFF"
+  | .normal => "NORMAL"
+  | .full => "FULL"
+  | .extra => "EXTRA"
+
+def Synchronous.ofString? : String → Option Synchronous
+  | "off" | "OFF" | "0" => some .off
+  | "normal" | "NORMAL" | "1" => some .normal
+  | "full" | "FULL" | "2" => some .full
+  | "extra" | "EXTRA" | "3" => some .extra
+  | _ => none
+
+/-- Open-time pragmas (LDB-02). Defaults are byte-identical to 0.3.x. -/
+structure OpenConfig where
+  busyTimeoutMs : Nat := 5000
+  synchronous : Synchronous := .full
+  cacheSizeKiB : Option Nat := none
+  mmapBytes : Option Nat := none
+  walAutocheckpoint : Option Nat := none
+  tempStoreMemory : Bool := false
+  extraPragmas : List (String × String) := []
+  deriving Repr
+
+def OpenConfig.allowedPragmas : List String :=
+  ["optimize", "analysis_limit", "secure_delete", "threads", "recursive_triggers",
+   "cache_spill", "hard_heap_limit", "soft_heap_limit"]
+
+def OpenConfig.checkExtra (c : OpenConfig) : Except String Unit := do
+  for (name, _) in c.extraPragmas do
+    unless OpenConfig.allowedPragmas.contains name.toLower do
+      throw s!"PRAGMA {name} is not allowlisted (allowed: {OpenConfig.allowedPragmas})"
+
+/-- Audit-log verb policy (LDB-05). `.all` is the CLI default. -/
+inductive LogVerbs where
+  | all
+  | failuresAndPlans
+  | failuresOnly
+  | none
+  deriving Repr, DecidableEq
+
+def LogVerbs.ofString? : String → Option LogVerbs
+  | "all" => some .all
+  | "failuresAndPlans" | "failures_and_plans" => some .failuresAndPlans
+  | "failuresOnly" | "failures_only" => some .failuresOnly
+  | "none" => some .none
+  | _ => none
 
 /-- Decode one column, attaching table/field context to failures. -/
 def decodeField (table field : String) (α : Type) [ColCodec α] (c : Col) : Except DbError α :=

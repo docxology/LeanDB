@@ -107,7 +107,7 @@ private def usageJson (b : Base) (inst : Instance) : Json :=
       Json.str "serve  (JSON-lines over stdio, persistent connection)",
       Json.str "serve --http <port> [--bind <host>] [--auth-token <t>]  (HTTP/1.1; every route is sugar over the CLI; $LEANDB_TOKEN also sets the token)",
       Json.str "serve --mcp  (Model Context Protocol over stdio; tools derived from tables and queries)",
-      Json.str "--db <path>  (any command; else $LEANDB_DB, else the base default)"])),
+      Json.str "--db <path>  (before the verb, or `$LEANDB_DB`, else the base default; `--` ends options)"])),
     ("tables", Json.arr (b.tables.map (Json.str ·.name)).toArray),
     ("queries", Json.arr (b.queries.map fun q =>
       Json.mkObj [("name", Json.str q.name),
@@ -245,11 +245,13 @@ private def gateOf (b : Base) (conn : Conn) : IO (Option DbError) := do
   | .error e => return some e
 
 def Session.open (b : Base) (inst : Instance) : IO (Except DbError Session) := do
+  if let .error e := b.check then return .error e
   if let some parent := inst.path.parent then
     IO.FS.createDirAll parent
-  match ← openDbRaw inst.path b.log with
+  match ← openDbRaw inst.path b.log b.openConfig with
   | .error e => return .error e
   | .ok conn =>
+      try applyAuxiliary conn.raw b.auxiliary catch e => return .error (.sqlite (toString e))
       let gate ← IO.mkRef (← gateOf b conn)
       return .ok { conn := ← IO.mkRef conn, gate }
 
@@ -279,76 +281,17 @@ destroyed user data and left the session silently serving an empty
 in-memory database; `restore /dev/zero` read the whole source into
 memory. -/
 
-/-- The 16-byte magic string every SQLite 3 file begins with. -/
-def Restore.magic : ByteArray := "SQLite format 3\u0000".toUTF8
-
-/-- Do these leading bytes carry the SQLite 3 magic header? -/
-def Restore.headerOk (bytes : ByteArray) : Bool :=
-  bytes.size >= Restore.magic.size &&
-    (List.range Restore.magic.size).all fun i => bytes[i]! == Restore.magic[i]!
-
-/-- Validate a restore source before anything destructive happens: the
-    magic header refuses text files and directories cheaply, then the
-    source must open as a database and pass `PRAGMA quick_check`. -/
-private def Restore.validate (src : System.FilePath) : IO (Except DbError Unit) := do
-  let head ← try
-      let h ← IO.FS.Handle.mk src .read
-      let bytes ← h.read Restore.magic.size.toUSize
-      pure bytes
-    catch e => return .error (.migrate s!"restore source cannot be read: {src} ({e})")
-  unless Restore.headerOk head do
-    return .error (.migrate s!"restore source is not a SQLite database: {src}")
-  try
-    let db ← SQLite.open src
-    let stmt ← db.prepare "PRAGMA quick_check"
-    if ← stmt.step then
-      let verdict ← stmt.columnText 0
-      if verdict == "ok" then return .ok ()
-      return .error (.migrate s!"restore source failed quick_check: {src} ({verdict})")
-    return .error (.migrate s!"restore source failed quick_check: {src}")
-  catch e =>
-    return .error (.migrate s!"restore source is not a valid SQLite database: {src} ({e})")
-
-/-- Bounded-memory file copy: 1 MiB reads, so the source's size never
-    sets the process's memory use. -/
-private def Restore.copyChunked (src dest : System.FilePath) : IO Unit := do
-  let chunk : USize := 1024 * 1024
-  let input ← IO.FS.Handle.mk src .read
-  let output ← IO.FS.Handle.mk dest .write
-  repeat
-    let bytes ← input.read chunk
-    if bytes.isEmpty then break
-    output.write bytes
-
 /-- Replace the instance file with `src` and reopen. Validation runs
-    BEFORE anything destructive; the copy lands under a temporary name
-    and is renamed into place so no reader ever sees a half-written file,
-    and stale `-wal`/`-shm` siblings go with the old file. The old
-    connection stays open until the rename has succeeded and the new
-    file has opened cleanly; a failure past the swap sets the gate (so
-    verbs are refused loudly instead of silently hitting an empty
-    database) and reopens the instance file. Assumes this process is the
-    only writer. -/
+    BEFORE anything destructive (`Restore.swapFile`); the old connection
+    stays open until the rename has succeeded and the new file has opened
+    cleanly. A failure past the swap sets the gate (so verbs are refused
+    loudly instead of silently hitting an empty database) and reopens the
+    instance file. Assumes this process is the only writer. -/
 private def replaceFile (b : Base) (inst : Instance) (sess : Session) (src : System.FilePath) :
     IO (Except DbError Unit) := do
-  unless ← src.pathExists do
-    return .error (.migrate s!"restore source does not exist: {src}")
-  match ← Restore.validate src with
+  match ← Restore.swapFile inst.path src with
   | .error e => return .error e
-  | .ok () => pure ()
-  try
-    let tmp : System.FilePath := inst.path.toString ++ ".restore"
-    try
-      Restore.copyChunked src tmp
-    catch e =>
-      try IO.FS.removeFile tmp catch _ => pure ()
-      throw e
-    for suffix in ["-wal", "-shm", "-journal"] do
-      let side : System.FilePath := inst.path.toString ++ suffix
-      if ← side.pathExists then IO.FS.removeFile side
-    IO.FS.rename tmp inst.path
-  catch e =>
-    return .error (.sqlite s!"restore failed: {e}")
+  | .ok () =>
   match ← openDbRaw inst.path b.log with
   | .ok conn =>
       sess.conn.set conn
@@ -412,7 +355,8 @@ private def rowCount (conn : Conn) (table : String) : IO Nat := do
 
 private def stepTable : MigStep → Option String
   | .createTable spec => some spec.name
-  | .addColumn t _ | .dropColumn t _ | .dropTable t | .restampShape t _ => some t
+  | .addColumn t _ | .dropColumn t _ | .dropTable t | .restampShape t _
+  | .addIndex t _ | .dropIndex t _ => some t
   | .rebuildTable spec _ => some spec.name
 
 /-- One pending migration as `status` reports it: its steps with row
@@ -701,7 +645,10 @@ where
     (`usage`, or a `DbError` code) from which exit codes derive. -/
 def _root_.LeanDb.Base.handle (b : Base) (inst : Instance) (sess : Session) : List String → IO Json
   | [] | ["help"] | ["--help"] => return usageJson b inst
-  | ["schema"] => return schemaJson b.name b.specs
+  | ["schema"] =>
+      match b.check with
+      | .error e => return e.toJson
+      | .ok () => return schemaJson b.name b.specs
   | ["version"] => return versionJson b (some (← instanceInfoOn (← sess.conn.get)))
   | "migrate" :: rest => migrateJson b inst sess rest
   | ["backup"] => backupJson b inst sess
@@ -869,12 +816,29 @@ def runOn (b : Base) (inst : Instance) (args : List String) : IO UInt32 := do
       IO.println (usageJson b inst).compress
       return 0
   | ["schema"] =>
-      IO.println (schemaJson b.name b.specs).compress
-      return 0
+      match b.check with
+      | .error e => IO.eprintln e.toJson.compress; return e.exitCode
+      | .ok () =>
+          IO.println (schemaJson b.name b.specs).compress
+          return 0
   | ["version"] =>
       IO.println (versionJson b (← instanceInfo inst.path)).compress
       return 0
   | args =>
+      -- usage errors must not create the instance file: resolve the
+      -- verb first, and only open a session when it is a real command
+      let operator :=
+        match args with
+        | "migrate" :: _ => true
+        | ["backup"] => true
+        | ["restore", _] => true
+        | _ => false
+      if !operator then
+        match command b args with
+        | .error m =>
+            IO.eprintln (usageErr m).compress
+            return 3
+        | .ok _ => pure ()
       match ← Session.open b inst with
       | .error e =>
           IO.eprintln e.toJson.compress

@@ -38,6 +38,40 @@ def SortBy.ord : SortBy ρ → ρ → ρ → Ordering
   | .desc s, a, b => (s.ord a b).swap
   | .andThen s t, a, b => (s.ord a b).then (t.ord a b)
 
+
+/-- Sort direction for a pushed `ORDER BY` (LDB-04). -/
+inductive Dir where
+  | asc | desc
+  deriving Repr, DecidableEq
+
+def Dir.sql : Dir → String
+  | .asc => "ASC"
+  | .desc => "DESC"
+
+/-- A pushed order key: a column of the first table (name + direction).
+    Multi-table `selectP` appends `, id ASC` per table for determinism. -/
+structure Order (ts : List Type) where
+  column : String
+  dir : Dir := .asc
+  deriving Repr
+
+/-- `LIMIT`/`OFFSET` window (LDB-04). `limit` is range-checked before
+    bind so it cannot wrap at Int64. -/
+structure Window where
+  limit : Option Nat := none
+  offset : Nat := 0
+  deriving Repr
+
+def Window.isTrivial (w : Window) : Bool :=
+  w.limit.isNone && w.offset == 0
+
+def Window.check (w : Window) : Except DbError Unit := do
+  if w.offset >= Int64.maxValue.toNatClampNeg then
+    throw (.sqlite "window offset is out of range")
+  if let some n := w.limit then
+    if n >= Int64.maxValue.toNatClampNeg then
+      throw (.sqlite "window limit is out of range")
+
 /-- A place rows come from: the real database, or an in-memory fixture in
     tests. Loading is by entity, never by string; the index says which
     position in the `select` table list is being loaded, so a plan's
@@ -107,8 +141,11 @@ private def compareIds : List Int64 → List Int64 → Ordering
 def finishRows (ts : List Type) [RowsOf ts] (rows : Array (Rows ts))
     (where' : Rows ts → Bool) (sortBy : SortBy (Rows ts)) : Array (Rows ts) :=
   let rows := rows.filter where'
-  rows.qsort fun a b =>
-    ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT
+  match sortBy with
+  | .preserve => rows
+  | _ =>
+      rows.qsort fun a b =>
+        ((sortBy.ord a b).then (compareIds (RowsOf.ids (ts := ts) a) (RowsOf.ids (ts := ts) b))).isLT
 
 /-- The meaning of `select`, in four lines: product, filter, sort — with
     the deterministic id tiebreak. Everything the engine does must equal

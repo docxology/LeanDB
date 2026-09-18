@@ -1,5 +1,5 @@
 name = "leandb"
-version = "0.3.1"
+version = "0.4.0"
 defaultTargets = ["LeanDb"]
 
 # Pinned and verified against lean4 v4.33.0; bump in lockstep with
@@ -11,6 +11,14 @@ rev = "0be4df908d1a8e75b58961041e2b4973692623df"
 
 [[lean_lib]]
 name = "LeanDb"
+
+
+# Per-ticket test modules (TestsLdbNN) the `leandb_tests` exe imports.
+[[lean_lib]]
+name = "TestsLdb01"
+
+[[lean_lib]]
+name = "FixturePortable"
 
 [[lean_exe]]
 name = "leandb_tests"
