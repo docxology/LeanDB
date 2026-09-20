@@ -13,10 +13,6 @@
 
 FROM ubuntu:24.04 AS build
 ARG BASE=tickets
-# BASE reaches RUN/COPY paths, so validate it before use: only example
-# directory names are allowed (no injection, no ../.. traversal).
-RUN case "${BASE}" in ''|*[!a-z0-9_]*) echo "invalid BASE: '${BASE}'" >&2; exit 1;; esac \
-    && test -d "examples/${BASE}" || { echo "unknown BASE: '${BASE}' (no examples/${BASE} directory)" >&2; exit 1; }
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl git ca-certificates build-essential \
@@ -29,6 +25,10 @@ WORKDIR /src
 COPY lean-toolchain lakefile.toml lake-manifest.json LeanDb.lean Main.lean ./
 COPY LeanDb ./LeanDb
 COPY examples ./examples
+# BASE reaches RUN/COPY paths, so validate it before use: only example
+# directory names are allowed (no injection, no ../.. traversal).
+RUN case "${BASE}" in ''|*[!a-z0-9_]*) echo "invalid BASE: '${BASE}'" >&2; exit 1;; esac \
+    && test -d "examples/${BASE}" || { echo "unknown BASE: '${BASE}' (no examples/${BASE} directory)" >&2; exit 1; }
 RUN cd examples/${BASE} && lake build ${BASE}
 
 FROM ubuntu:24.04
