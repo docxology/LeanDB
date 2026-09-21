@@ -3805,6 +3805,34 @@ private def testNextLineCap : IO Unit := do
     let h ← IO.FS.Handle.mk p .read
     check ((← Client.nextLine h) matches .undecodable) "bad bytes after a valid prefix poison the line"
   finally IO.FS.removeFile p
+/-! ## Scaffold: reserved modules and TOML emission (issues #69, #70) -/
+
+private def testScaffoldReservedModule : IO Unit := do
+  check (Scaffold.moduleOf "main" == "Main") "main mangles to Main"
+  -- `leandb new main` used to mangle to module `Main`, collapsing the
+  -- lib-root aggregate and the CLI entrypoint onto one `Main.lean` and
+  -- emitting a self-importing package (#69).
+  for s in ["main", "option", "json", "int", "lean_db", "stored", "sql_type"] do
+    check (!Scaffold.validName s) s!"a name mangling to a reserved module is refused: {s}"
+  for s in ["price_watch", "note_store", "a1", "x"] do
+    check (Scaffold.validName s) s!"an ordinary snake_case name stays valid: {s}"
+
+private def testTomlString : IO Unit := do
+  check (Scaffold.tomlString "plain" == "\"plain\"") "a plain string is just quoted"
+  check (Scaffold.tomlString "" == "\"\"") "the empty string is still quoted"
+  check (Scaffold.tomlString "a\"b" == "\"a\\\"b\"") "a double quote is escaped"
+  check (Scaffold.tomlString "a\\b" == "\"a\\\\b\"") "a backslash is escaped"
+  check (Scaffold.tomlString "a\tb\nc\rd" == "\"a\\tb\\nc\\rd\"") "the short escapes"
+  check (Scaffold.tomlString "a\x01b" == "\"a\\u0001b\"") "control characters use \\uXXXX"
+  check (Scaffold.tomlString "a\x0bb" == "\"a\\u000bb\"") "vertical tab has no short escape"
+  check (Scaffold.tomlString "\x7f" == "\"\\u007f\"") "DEL is escaped, never raw"
+  let nasty := "http://x\x01y\"z\\q\n\t\x0b\x7fé"
+  let rendered := Scaffold.tomlString nasty
+  check (!(rendered.toList.any fun c => c.toNat < 0x20 || c.toNat == 0x7f))
+    "no raw control bytes survive"
+  check ((rendered.splitOn "\\x").length == 1) "no Lean-style \\x escapes survive"
+  check ((rendered.splitOn "\\u").length == 4) "every escaped control char is \\uXXXX"
+  check (Import.tomlString nasty == rendered) "the importer's escaper agrees with the scaffold's"
 
 def main : IO UInt32 := do
   testCliLimits
@@ -3816,6 +3844,8 @@ def main : IO UInt32 := do
   testStdioLineCap
   testStdioInvalidUtf8
   testStdioShortReads
+  testScaffoldReservedModule
+  testTomlString
   testHttpBodyLimits
   testWalOpen
   testLogPolicy
