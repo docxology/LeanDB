@@ -2,6 +2,7 @@ import LeanDb
 import Std.Http.Test.Helpers
 import TestsLdb01
 import TestsLdb12
+import TestsLdb15
 
 /-! Engine tests: codecs, deriving, the dependent select against a real
 SQLite file, CAS staleness, FK restriction. Fixture types live here — the
@@ -4857,5 +4858,6 @@ def main : IO UInt32 := do
   TestsLdb12.run
   TestsLdb01.run
   testStringPredicates
+  TestsLdb15.run
   IO.println "all engine tests passed"
   return 0
