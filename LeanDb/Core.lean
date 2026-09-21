@@ -119,6 +119,9 @@ inductive DbError where
   | poisoned (message : String)
   /-- A write verb ran on a connection opened read-only (LDB-09). -/
   | readOnly (verb : String)
+  /-- A restore/rollback swap was refused because another process holds
+      the instance's write lock (#76). -/
+  | busy (message : String)
   deriving Repr
 
 def DbError.code : DbError → String
@@ -137,6 +140,7 @@ def DbError.code : DbError → String
   | .transport .. => "transport"
   | .poisoned .. => "poisoned"
   | .readOnly .. => "read_only"
+  | .busy .. => "busy"
 
 def DbError.message : DbError → String
   | .decode table field msg => s!"{table}.{field}: {msg}"
@@ -157,6 +161,7 @@ it was not created by this base's history (restore a known version, or migrate b
   | .sqlite msg => msg
   | .transport msg => msg
   | .poisoned msg => s!"connection poisoned: {msg}"
+  | .busy msg => msg
   | .readOnly verb => s!"{verb}: connection is read-only"
 
 instance : ToString DbError := ⟨fun e => s!"[{e.code}] {e.message}"⟩
