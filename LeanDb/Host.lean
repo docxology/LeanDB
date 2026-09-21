@@ -20,9 +20,12 @@ structure Child where
   lock : Std.Mutex Unit
   fingerprint : String
 
-/-- `name=path/to/exe[,arg,…]` → spawn and handshake-free connect (the
-    host trusts what the base reports). -/
-def spawn (spec : String) : IO (Except String Child) := do
+/-- `name=path/to/exe[,arg,…]` → spawn and handshake the child: it must
+    answer `version` within `deadlineMs` (default `handshakeDeadlineMs`)
+    or the host kills it and reports a diagnostic naming the failed spec —
+    a silent base, or one stalled mid-banner-line, must not wedge the host
+    pre-bind (#62 facet 2). -/
+def spawn (spec : String) (deadlineMs : Nat := handshakeDeadlineMs) : IO (Except String Child) := do
   match spec.splitOn "=" with
   | name :: rest =>
       let rest := String.intercalate "=" rest
@@ -38,9 +41,12 @@ def spawn (spec : String) : IO (Except String Child) := do
           try
             let child ← IO.Process.spawn cfg
             let client := Client.ofProcess child
-            match ← client.rpc ["version"] with
-            | .error e => client.close; return .error s!"{name}: could not query {exe}: {e}"
-            | .ok v =>
+            match ← client.rpcBounded ["version"] deadlineMs with
+            | none =>
+                client.close
+                return .error s!"{name}: no handshake from {exe} within {deadlineMs} ms — killed the silent (or mid-line stalled) child from spec {spec}"
+            | some (.error e) => client.close; return .error s!"{name}: could not query {exe}: {e}"
+            | some (.ok v) =>
                 let fp := (v.getObjValAs? String "code_fingerprint").toOption.getD ""
                 return .ok { name, client := { client with fingerprint := fp }, lock := ← Std.Mutex.new (), fingerprint := fp }
           catch e =>
@@ -83,7 +89,7 @@ def run (args : List String) : IO UInt32 := do
         match ← spawn spec with
         | .ok c => children := children.push c
         | .error m =>
-            IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"), ("message", Json.str m)]).compress
+            IO.eprintln (Json.mkObj [("ok", Json.bool false), ("code", Json.str "usage"), ("message", Json.str s!"{m} (host port {port})")]).compress
             return 3
       let list := Json.mkObj [("ok", Json.bool true), ("bases", Json.arr (children.map fun c =>
         Json.mkObj [("name", Json.str c.name), ("fingerprint", Json.str c.fingerprint)]))]

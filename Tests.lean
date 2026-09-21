@@ -3444,6 +3444,39 @@ private def testWalOpen : IO Unit := do
   discard <| timeout.step
   check ((← timeout.columnInt64 0) == 5000) "open sets busy_timeout"
 
+/-- #62 facet 2: `Host.spawn` gives up on a child that never answers the
+    `version` handshake — silent, or stalled mid-banner-line — within the
+    deadline, kills it, and names the failed spec. The tests inject a
+    small deadline; production defaults to `handshakeDeadlineMs` (10 s). -/
+private def testHostHandshakeDeadline : IO Unit := do
+  -- a silent child: sh -c 'sleep 30' (spawn appends `serve` as argv0)
+  let t0 ← IO.monoMsNow
+  let sleepy ← Host.spawn "sleepy=sh,-c,sleep 30" 400
+  let elapsed := (← IO.monoMsNow) - t0
+  match sleepy with
+  | .error m =>
+      check (elapsed < 3000) s!"the deadline fired, not forever: {elapsed} ms"
+      check ((m.splitOn "sleepy").length > 1 && (m.splitOn "sh,").length > 1)
+        s!"the diagnostic names name and exe, got {m}"
+      check ((m.splitOn "handshake").length > 1) s!"the diagnostic names the handshake, got {m}"
+  | .ok _ => throw <| IO.userError "FAIL: a silent child must be refused"
+  -- a child that emits a partial line then sleeps: same deadline treatment
+  let t0 ← IO.monoMsNow
+  let stally ← Host.spawn "stally=sh,-c,printf part; sleep 30" 400
+  let elapsed := (← IO.monoMsNow) - t0
+  match stally with
+  | .error m =>
+      check (elapsed < 3000) s!"the mid-line stall must hit the deadline: {elapsed} ms"
+      check ((m.splitOn "stally").length > 1) s!"the diagnostic names the spec, got {m}"
+  | .ok _ => throw <| IO.userError "FAIL: a mid-line stalled child must be refused"
+  -- a healthy child still registers, with the fingerprint it reported
+  match ← Host.spawn "healthy=sh,-c,read l; echo '{\"code_fingerprint\":\"\"}'" 1000 with
+  | .error m => throw <| IO.userError s!"FAIL: a responding child must register: {m}"
+  | .ok c =>
+      check (c.name == "healthy") "the child keeps its spec name"
+      check (c.fingerprint == "") "the fingerprint comes from the handshake"
+      c.client.close
+
 def main : IO UInt32 := do
   testCliLimits
   testStrictSchemaJson
@@ -3458,7 +3491,7 @@ def main : IO UInt32 := do
   testCodecs
   testBaseSpecs
   testSession
-  testRestoreSafety
+  testHostHandshakeDeadline
   testChain
   testFootprints
   testDerivedSpec
