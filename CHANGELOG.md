@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **LDB-14.** Pushed string predicates: `Pred.prefix` renders
+  `LIKE ? ESCAPE '\'` with the pattern escaped (`\`, `%`, `_`) and bound,
+  `Pred.contains` renders `instr(c, ?) > 0` (byte-exact), and
+  `Pred.icontains` renders `instr(lower(c), lower(?)) > 0` — ASCII-only
+  case folding on both sides. The reifier accepts
+  `String.startsWith`/`String.contains` (and the `toLower` pair) on a
+  column. `prefix`'s SQL is a widening (SQLite's `LIKE` folds ASCII
+  case), so it is accepted wherever a plan may be widened but never
+  shipped from `countP`/`existsP`; negated string leaves render
+  `NOT LIKE`/`= 0`, the under-approximation `NOT EXISTS` needs.
+  `IndexSpec.collate := some .nocase` declares a `COLLATE NOCASE` index,
+  which is what lets SQLite use the `(tenant, username)` index for a
+  pushed `prefix`; it is DDL, schema-JSON and fingerprint material.
+
 ## 0.4.0 - 2026-09-18
 
 Public transaction combinator, runtime service, and the LeanGD engine
