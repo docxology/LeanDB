@@ -40,19 +40,12 @@ def parseSpec (spec : String) : Except String (String × String × List String) 
   | name :: rest =>
       match splitCommas (String.intercalate "=" rest) with
       | exe :: args =>
-          let name := String.intercalate "," (splitCommas name)
-          if name.isEmpty || exe.isEmpty then
-            .error s!"expected name=exe[,args], got {spec}"
-          else .ok (name, exe, args)
-      | [] => .error s!"expected name=exe[,args], got {spec}"
-  | [] => .error s!"expected name=exe[,args], got {spec}"
-
-/-- `name=path/to/exe[,arg,…]` → spawn and handshake-free connect (the
-    host trusts what the base reports). No handshake deadline yet (issue
-    #62, facet 2, open): the `version` read below blocks until the child
-    writes or closes, so a base that spawns silent wedges the host
-    pre-bind. -/
-def spawn (spec : String) : IO (Except String Child) := do
+/-- `name=path/to/exe[,arg,…]` → spawn and handshake the child: it must
+    answer `version` within `deadlineMs` (default `handshakeDeadlineMs`)
+    or the host kills it and reports a diagnostic naming the failed spec —
+    a silent base, or one stalled mid-banner-line, must not wedge the host
+    pre-bind (#62 facet 2). -/
+def spawn (spec : String) (deadlineMs : Nat := handshakeDeadlineMs) : IO (Except String Child) := do
   match parseSpec spec with
   | .error m => return .error m
   | .ok (name, exe, args) =>
@@ -65,9 +58,12 @@ def spawn (spec : String) : IO (Except String Child) := do
       try
         let child ← IO.Process.spawn cfg
         let client := Client.ofProcess child
-        match ← client.rpc ["version"] with
-        | .error e => client.close; return .error s!"{name}: could not query {exe}: {e}"
-        | .ok v =>
+        match ← client.rpcBounded ["version"] deadlineMs with
+        | none =>
+            client.close
+            return .error s!"{name}: no handshake from {exe} within {deadlineMs} ms — killed the silent (or mid-line stalled) child from spec {spec}"
+        | some (.error e) => client.close; return .error s!"{name}: could not query {exe}: {e}"
+        | some (.ok v) =>
             let fp := (v.getObjValAs? String "code_fingerprint").toOption.getD ""
             return .ok { name, client := { client with fingerprint := fp }, lock := ← Std.Mutex.new (), fingerprint := fp }
       catch e =>
