@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **LDB-12.** `DbJson.via encode parse`: a JSON codec for a nested type
+  with proof fields, through its data representation `σ` — `encode`
+  erases the proofs, `parse` re-decides them, and the shape the
+  fingerprint, `schema` and `migrate` see is `σ`'s. A stored value that
+  fails `parse` decodes as `DbError.decode` naming the table and field.
+  The derive's proof-field errors name `DbJson.via` as the way out.
+
 ## 0.4.0 - 2026-09-18
 
 Public transaction combinator, runtime service, and the LeanGD engine
