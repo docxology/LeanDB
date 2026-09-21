@@ -373,10 +373,15 @@ Reads cost one engine-internal statement per child table per fetch —
 `WHERE parent IN (…)` over the fetched parents, chunked — never one per
 row. Writes run inside a transaction. -/
 
-/-- Run `act` inside `BEGIN DEFERRED … COMMIT`; any failure rolls back and
-    re-raises the typed error. Reentrant: a nested call (a read burst
-    inside a write, or `selectP` snapshotting via `fetchAll`) joins the
-    open transaction instead of issuing a second `BEGIN`. -/
+/-- Run `act` inside a savepoint; any failure rolls back to it and
+    re-raises the typed error. At the top level the savepoint starts the
+    transaction (deferred, exactly the `BEGIN DEFERRED` this replaced)
+    and its `RELEASE` commits, so the span the caller sees is unchanged.
+    Reentrant: a nested call — a read burst inside a write, `selectP`
+    snapshotting via `fetchAll`, or a verb inside a custom migration
+    step already inside `Migration.applyOn`'s transaction (#75) — opens
+    its own savepoint, so its failure rolls back only its own scope and
+    leaves the enclosing transaction intact. -/
 private def transaction (act : DbM α) : DbM α := fun conn => ExceptT.mk do
   let exec (sql : String) : IO (Except DbError Unit) :=
     try conn.raw.exec sql; pure (.ok ()) catch e => pure (.error (.sqlite (toString e)))
@@ -384,30 +389,44 @@ private def transaction (act : DbM α) : DbM α := fun conn => ExceptT.mk do
   | some why => return .error (.poisoned why)
   | none =>
   let depth ← conn.txDepth.get
-  if depth > 0 then
-    return ← (act conn).run
+  let savepoint := s!"_leandb_tx_{depth}"
+  -- `SAVEPOINT` outside a transaction opens one; inside one it nests.
+  -- The depth ladder (`txDepth`) keeps the names unique, including
+  -- against the public write combinator's savepoints (`Transaction.lean`).
+  match ← exec s!"SAVEPOINT {savepoint}" with
+  | .error e => return .error e
+  | .ok () =>
   conn.txDepth.set (depth + 1)
-  -- A ROLLBACK that itself fails leaves the transaction state unknown:
-  -- the connection is poisoned and refuses every later verb (#72).
-  let rollback (e : DbError) : IO (Except DbError α) := do
-    match ← exec "ROLLBACK" with
-    | .ok () => return .error e
+  -- Roll the innermost scope back. A rollback that itself fails leaves
+  -- the transaction state unknown: the connection is poisoned and
+  -- refuses every later verb (#72).
+  let undo : IO (Option DbError) := do
+    let r ←
+      match ← exec s!"ROLLBACK TO SAVEPOINT {savepoint}" with
+      | .error e => pure (.error e)
+      | .ok () => exec s!"RELEASE SAVEPOINT {savepoint}"
+    match r with
+    | .ok () => return none
     | .error re =>
-        conn.poison s!"ROLLBACK failed after {e.code}: {re.message}"
-        return .error (.poisoned s!"ROLLBACK failed after {e.code}: {re.message}")
+        let why := s!"rollback of {savepoint} failed: {re.message}"
+        conn.poison why
+        return some (.poisoned why)
   let finish (r : Except DbError α) : IO (Except DbError α) := do
     conn.txDepth.set depth
     match r with
     | .ok a =>
-        match ← exec "COMMIT" with
+        match ← exec s!"RELEASE SAVEPOINT {savepoint}" with
         | .ok () => return .ok a
-        | .error e => rollback e
-    | .error e => rollback e
-  match ← exec "BEGIN DEFERRED" with
-  | .error e => conn.txDepth.set depth; return .error e
-  | .ok () =>
-    let r ← try (act conn).run catch e => pure (.error (.sqlite (toString e)))
-    finish r
+        | .error e =>
+            match ← undo with
+            | some pe => return .error pe
+            | none => return .error e
+    | .error e =>
+        match ← undo with
+        | some pe => return .error pe
+        | none => return .error e
+  let r ← try (act conn).run catch e => pure (.error (.sqlite (toString e)))
+  finish r
 
 /-- How many parent ids one child fetch names: SQLite's default parameter
     limit is far above this, and the statement text stays small. -/
